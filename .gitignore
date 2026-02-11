@@ -1,0 +1,6 @@
+/target/
+/log/
+/error/
+error
+niri-main/
+*.log

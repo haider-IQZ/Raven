@@ -1,0 +1,27 @@
+[package]
+name = "raven"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+smithay = { git = "https://github.com/Smithay/smithay/", default-features = false, features = [
+  "backend_winit",
+  "backend_drm",
+  "backend_gbm",
+  "backend_udev",
+  "backend_libinput",
+  "backend_session_libseat",
+  "backend_egl",
+  "use_system_lib",
+  "desktop",
+  "renderer_glow",
+  "renderer_gl",
+  "renderer_multi",
+  "wayland_frontend",
+] }
+smithay-drm-extras = { git = "https://github.com/Smithay/smithay/" }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+bitflags = "2.10"
+xcursor = "0.3"
