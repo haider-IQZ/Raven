@@ -1,65 +1,180 @@
 # Raven
 
-Minimal Wayland compositor built with Rust and [Smithay](https://github.com/Smithay/smithay).
+Raven is a tiling Wayland compositor written in Rust using [Smithay](https://github.com/Smithay/smithay).
 
-## Development
+It supports both:
+- Nested mode (inside an existing Wayland/X11 session via Winit)
+- Standalone mode on real hardware (DRM/KMS + libinput + libseat)
+
+Project status: alpha.
+
+## Features
+
+- Master/stack tiling layout with configurable gaps and border size
+- 10 workspaces with built-in `Main+1..0` switching and `Main+Shift+1..0` move
+- Fullscreen toggle, focus cycling, close focused window
+- Layer-shell integration (Waybar, launchers, notifications) with reserved space handling
+- Runtime config reload (`Main+Shift+R` by default)
+- Lua config at `~/.config/raven/config.lua`
+- Hyprland-style config compatibility (subset)
+- Per-output monitor configuration (mode, refresh, scale, transform, position, enable/disable)
+- Wallpaper restore flow (external command, default `waypaper --restore`) with optional legacy `swww` mode
+- `no_csd` mode with server decoration preference + environment/spawn overrides
+- Foreign toplevel management (`zwlr_foreign_toplevel_management_v1`)
+- Ext workspace protocol (`ext_workspace_v1`)
+- WLR screencopy protocol support
+
+## Quick Start (Nix)
 
 ```bash
 nix develop
 cargo run
 ```
 
-Or spawn a program directly:
+Run nested explicitly:
+
+```bash
+cargo run -- --winit
+```
+
+Spawn an app on startup:
 
 ```bash
 cargo run -- foot
 ```
 
-## Keybindings
+Debug logs:
 
-- Defaults come from `~/.config/raven/config.lua` (`main_key` + `keybinds` list)
-- Workspace shortcuts are built in with your `main_key`:
-  - `Main+1..0` - Switch workspace (0 = workspace 10)
-  - `Main+Shift+1..0` - Send focused window to workspace (0 = workspace 10)
-- `Main+Click` drag for moving windows is also tied to `main_key`
+```bash
+RUST_LOG=debug cargo run
+```
+
+## Requirements (non-Nix)
+
+If you are not using `nix develop`, Raven expects at minimum:
+- Rust toolchain (`cargo`, `rustc`)
+- A working Wayland/DRM graphics stack for Smithay backends
+- `lua` in `PATH` (Raven evaluates `config.lua` via the `lua` binary)
+
+## Runtime Behavior
+
+- Raven auto-selects backend:
+  - Uses Winit when `WAYLAND_DISPLAY` or `DISPLAY` is present.
+  - Uses DRM/KMS when running from a bare TTY.
+- Logs are written to `log/raven.log`.
+- `swww-daemon` output is written to `log/swww-daemon.log` (when used).
 
 ## Configuration
 
-- Config path: `~/.config/raven/config.lua` (or `$XDG_CONFIG_HOME/raven/config.lua`)
-- If missing, Raven auto-creates a default file on startup
-- If file exists but is empty, Raven auto-writes the default config
-- Reload config at runtime with `Main+Shift+R` by default
-- Supports two keybind styles:
+### Location
+
+- `~/.config/raven/config.lua` (or `$XDG_CONFIG_HOME/raven/config.lua`)
+- If missing: Raven creates a default config automatically.
+- If empty: Raven writes the default config automatically.
+
+### Default Style
+
+```lua
+return {
+  general = {
+    modkey = "Super",
+    terminal = "foot",
+    launcher = "fuzzel",
+    focus_follow_mouse = true,
+    no_csd = true,
+    gap_size = 8,
+    border_size = 0,
+  },
+
+  keybindings = {
+    { combo = "Main+Q", action = "exec", command = "foot" },
+    { combo = "Main+D", action = "exec", command = "fuzzel" },
+    { combo = "Main+C", action = "close_window" },
+    { combo = "Main+F", action = "fullscreen" },
+    { combo = "Main+J", action = "focus_next" },
+    { combo = "Main+K", action = "focus_prev" },
+    { combo = "Main+Shift+R", action = "reload_config" },
+  },
+
+  monitors = {
+    ["eDP-1"] = {
+      mode = "1920x1080@120.030",
+      scale = 2,
+      transform = "normal",
+      position = { x = 0, y = 0 },
+    },
+  },
+
+  autostart = { "waybar", "mako" },
+
+  wallpaper = {
+    enabled = false,
+    restore_command = "waypaper --restore",
+  },
+}
+```
+
+### Supported Config Shapes
+
+- Structured Lua style:
+  - `general`, `keybindings`, `monitors`, `autostart`, `wallpaper`
+- String keybind list style:
   - `keybinds = { "Super+X exec firefox", ... }`
-  - `keys()` + `bind("Mod4 Shift", "Return", spawn(terminal))`
-- Preferred section style is supported:
-  - `general = { ... }`
-  - `keybindings = { { combo = "Main+X", action = "exec", command = "firefox" }, ... }`
-  - `window_rules = { ... }` (currently parsed but not applied)
-- `autostart = { "waybar", "mako", ... }` runs once at compositor startup
-- `monitors = { ... }` configures per-output mode/refresh/position/scale/transform
-  - Example:
-    - `monitors = { ["eDP-1"] = { mode = "1920x1080@120.030", scale = 2, transform = "normal", position = { x = 1280, y = 0 } } }`
-  - Configure outputs by name; you can find active output names in `log/raven.log` (`Output initialized ...`)
-  - `off = true` disables an output; Raven keeps at least one output enabled to avoid black screen
-- `wallpaper = { enabled = true, restore_command = "waypaper --restore" }` restores wallpaper via any external tool
-- Default `waypaper --restore` is auto-bootstrapped with `swww-daemon` by Raven
-- Legacy `swww` mode still works if `restore_command` is empty and `wallpaper.image` is set
-  - Example:
-    - `wallpaper = { enabled = true, restore_command = "", image = "~/Pictures/wall.jpg", resize = "crop", transition_type = "simple", transition_duration = 0.7 }`
-- `general.focus_follow_mouse = true/false` controls keyboard focus on pointer hover
-- Also accepts Hyprland-like `bind = $mod, X, exec, firefox` lines (subset)
-- Hypr-style `exec-once = ...` lines are imported as `autostart` commands
-- Supported actions: `exec`, `terminal`, `launcher`, `close_window`, `fullscreen`, `focus_next`, `focus_prev`, `reload_config`, `quit`
-- Hypr-style actions supported: `exec`, `killactive`, `movefocus`, `workspace`, `movetoworkspace`, `quit`
-- `resize_left`, `resize_right`, and `swap_master` parse but are not implemented yet
-- External wallpaper command mode requires the configured tool in `PATH` (default: `waypaper`)
-- Legacy `swww` mode requires `swww` and `swww-daemon` in `PATH`
-- Runtime logs are written to `log/raven.log` in the project root
-- `swww-daemon` stderr/stdout is captured in `log/swww-daemon.log`
+- Function helper style:
+  - `keys()` with `bind("Mod4", "j", focus_next)` and `spawn(...)`
+- Hyprland-like style (subset):
+  - `bind = ...`, `exec-once = ...`, `general { ... }`, `input { ... }`
 
-## Roadmap
+### Keybind Actions
 
-1. Discuss codebase layout and architecture
-2. Implement core features (tiling, workspaces, etc.)
-3. Expand configuration system
+Supported actions:
+- `exec <command>`
+- `terminal`
+- `launcher`
+- `close` / `close_window`
+- `fullscreen`
+- `focus_next`
+- `focus_prev` / `focus_previous`
+- `reload_config`
+- `quit`
+- `workspace <1..10>`
+- `movetoworkspace <1..10>`
+
+Parsed but currently unimplemented:
+- `resize_left`
+- `resize_right`
+- `swap_master`
+
+## Monitor Configuration Notes
+
+- Configure outputs by connector name (for example `eDP-1`, `HDMI-A-1`, `DP-1`).
+- You can define monitors as:
+  - Keyed table: `monitors = { ["eDP-1"] = { ... } }`
+  - Array form: `monitors = { { name = "eDP-1", ... } }`
+- Use either:
+  - `mode = "<width>x<height>@<refresh>"` (or without refresh)
+  - Or explicit `width` + `height` (+ optional `refresh_hz`)
+- Use `off = true` (or `enabled = false`) to disable an output.
+- Check `log/raven.log` for output initialization lines to confirm names.
+
+## Wallpaper Configuration Notes
+
+- Recommended mode: set `wallpaper.restore_command` (default `waypaper --restore`).
+- Legacy mode: set `restore_command = ""` and provide `image`, `resize`, `transition_type`, `transition_duration`.
+- Requires the corresponding external tools in `PATH` (`waypaper`, or `swww`/`swww-daemon` for legacy mode).
+
+## Limitations
+
+- `window_rules` exists in the default template but is not applied yet.
+- Some parsed actions are placeholders (`resize_left`, `resize_right`, `swap_master`).
+- This project is still alpha; expect behavior changes.
+
+## Development Notes
+
+- Main entrypoint: `src/main.rs`
+- Compositor state and runtime logic: `src/state.rs`
+- Config loading and parsing: `src/config.rs`
+- Input handling: `src/input.rs`
+- Backends:
+  - Nested: `src/backend/winit.rs`
+  - DRM/KMS: `src/backend/udev.rs`
