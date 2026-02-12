@@ -75,6 +75,7 @@ pub fn init_winit(event_loop: &mut EventLoop<Raven>, state: &mut Raven) -> Resul
                 let size = winit_backend.window_size();
                 let damage = Rectangle::from_size(size);
 
+                state.flush_interactive_frame_updates();
                 let pending_screencopy = state.pending_screencopy.take();
 
                 {

@@ -17,6 +17,7 @@ Project status: alpha.
 - Runtime config reload (`Main+Shift+R` by default)
 - Lua config at `~/.config/raven/config.lua`
 - Hyprland-style config compatibility (subset)
+- Window rules (`class`/`app_id`/`title` match with workspace/floating/fullscreen/focus actions)
 - Per-output monitor configuration (mode, refresh, scale, transform, position, enable/disable)
 - Wallpaper restore flow (external command, default `waypaper --restore`) with optional legacy `swww` mode
 - `no_csd` mode with server decoration preference + environment/spawn overrides
@@ -64,6 +65,12 @@ If you are not using `nix develop`, Raven expects at minimum:
 - Logs are written to `log/raven.log`.
 - `swww-daemon` output is written to `log/swww-daemon.log` (when used).
 
+### CLI Commands
+
+When running inside a Raven session:
+- `raven clients` prints a Hyprland-style client list (class/app_id, title, workspace, mapped, floating, fullscreen, focused).
+- `raven reload` triggers runtime config reload through IPC.
+
 ## Configuration
 
 ### Location
@@ -91,6 +98,7 @@ return {
     { combo = "Main+D", action = "exec", command = "fuzzel" },
     { combo = "Main+C", action = "close_window" },
     { combo = "Main+F", action = "fullscreen" },
+    { combo = "Main+V", action = "toggle_floating" },
     { combo = "Main+J", action = "focus_next" },
     { combo = "Main+K", action = "focus_prev" },
     { combo = "Main+Shift+R", action = "reload_config" },
@@ -125,6 +133,20 @@ return {
 - Hyprland-like style (subset):
   - `bind = ...`, `exec-once = ...`, `general { ... }`, `input { ... }`
 
+### Window Rules
+
+Window rules support:
+- matchers: `class`, `app_id`, `title`
+- actions: `workspace`, `floating`, `fullscreen`, `focus`, `width`, `height`
+
+Example:
+
+```lua
+window_rules = {
+  { class = "mpv", floating = true, width = 1280, height = 720 },
+}
+```
+
 ### Keybind Actions
 
 Supported actions:
@@ -133,6 +155,7 @@ Supported actions:
 - `launcher`
 - `close` / `close_window`
 - `fullscreen`
+- `toggle_floating`
 - `focus_next`
 - `focus_prev` / `focus_previous`
 - `reload_config`
@@ -165,7 +188,6 @@ Parsed but currently unimplemented:
 
 ## Limitations
 
-- `window_rules` exists in the default template but is not applied yet.
 - Some parsed actions are placeholders (`resize_left`, `resize_right`, `swap_master`).
 - This project is still alpha; expect behavior changes.
 

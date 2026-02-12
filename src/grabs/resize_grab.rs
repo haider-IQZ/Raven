@@ -39,6 +39,7 @@ impl From<xdg_toplevel::ResizeEdge> for ResizeEdge {
 #[derive(Debug)]
 pub struct ResizeSurfaceGrab {
     start_data: PointerGrabStartData<Raven>,
+    resize_button: u32,
     window: Window,
 
     edges: ResizeEdge,
@@ -63,6 +64,7 @@ impl ResizeSurfaceGrab {
         });
 
         Self {
+            resize_button: start_data.button,
             start_data,
             window,
             edges,
@@ -134,18 +136,15 @@ impl PointerGrab<Raven> for ResizeSurfaceGrab {
             max_size.h
         };
 
+        let previous_size = self.last_window_size;
         self.last_window_size = Size::from((
             new_window_width.clamp(min_width, max_width),
             new_window_height.clamp(min_height, max_height),
         ));
 
-        let xdg = self.window.toplevel().unwrap();
-        xdg.with_pending_state(|state| {
-            state.states.set(xdg_toplevel::State::Resizing);
-            state.size = Some(self.last_window_size);
-        });
-
-        xdg.send_pending_configure();
+        if self.last_window_size != previous_size {
+            data.queue_interactive_resize(&self.window, self.last_window_size);
+        }
     }
 
     fn relative_motion(
@@ -169,13 +168,10 @@ impl PointerGrab<Raven> for ResizeSurfaceGrab {
     ) {
         handle.button(data, event);
 
-        // The button is a button code as defined in the
-        // Linux kernel's linux/input-event-codes.h header file, e.g. BTN_LEFT.
-        const BTN_LEFT: u32 = 0x110;
-
-        if !handle.current_pressed().contains(&BTN_LEFT) {
+        if !handle.current_pressed().contains(&self.resize_button) {
             // No more buttons are pressed, release the grab.
             handle.unset_grab(self, data, event.serial, event.time, true);
+            data.clear_pending_interactive_resize(&self.window);
 
             let xdg = self.window.toplevel().unwrap();
             xdg.with_pending_state(|state| {
@@ -287,7 +283,9 @@ impl PointerGrab<Raven> for ResizeSurfaceGrab {
         &self.start_data
     }
 
-    fn unset(&mut self, _data: &mut Raven) {}
+    fn unset(&mut self, data: &mut Raven) {
+        data.clear_pending_interactive_resize(&self.window);
+    }
 }
 
 /// State of the resize operation.

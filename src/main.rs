@@ -6,7 +6,13 @@ use smithay::reexports::{
     },
     wayland_server::Display,
 };
-use std::{backtrace::Backtrace, fs, path::PathBuf};
+use std::{
+    backtrace::Backtrace,
+    fs,
+    io::{Read, Write},
+    os::unix::net::UnixStream,
+    path::PathBuf,
+};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 fn main() -> Result<()> {
@@ -18,13 +24,21 @@ fn main() -> Result<()> {
         eprintln!("panic: {panic_info}\n{backtrace}");
     }));
 
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(command) = args.get(1).map(String::as_str)
+        && matches!(command, "clients" | "reload")
+    {
+        let output = run_ipc_command(command)?;
+        print!("{output}");
+        return Ok(());
+    }
+
     let mut event_loop: EventLoop<Raven> =
         EventLoop::try_new().map_err(|e| CompositorError::EventLoop(e.to_string()))?;
 
     let display = Display::new().map_err(|e| CompositorError::Backend(e.to_string()))?;
     let mut state = Raven::new(display, event_loop.handle(), event_loop.get_signal())?;
 
-    let args: Vec<String> = std::env::args().collect();
     let force_winit = args.iter().any(|a| a == "--winit");
 
     if force_winit || is_nested() {
@@ -59,6 +73,79 @@ fn main() -> Result<()> {
         .map_err(|e| CompositorError::EventLoop(e.to_string()))?;
 
     Ok(())
+}
+
+fn run_ipc_command(command: &str) -> Result<String> {
+    let socket_path = ipc_socket_path_from_env()?;
+    let mut stream = UnixStream::connect(&socket_path).map_err(|err| {
+        CompositorError::Backend(format!(
+            "failed to connect to Raven ipc socket {}: {err}",
+            socket_path.display()
+        ))
+    })?;
+
+    stream
+        .write_all(command.as_bytes())
+        .map_err(|err| CompositorError::Backend(format!("failed to send ipc command: {err}")))?;
+    stream.shutdown(std::net::Shutdown::Write).map_err(|err| {
+        CompositorError::Backend(format!("failed to finalize ipc command write: {err}"))
+    })?;
+
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .map_err(|err| CompositorError::Backend(format!("failed to read ipc response: {err}")))?;
+
+    if response.is_empty() {
+        return Err(CompositorError::Backend(
+            "empty response from compositor ipc".to_owned(),
+        ));
+    }
+
+    Ok(response)
+}
+
+fn ipc_socket_path_from_env() -> Result<PathBuf> {
+    let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR").ok_or_else(|| {
+        CompositorError::Backend("XDG_RUNTIME_DIR is not set".to_owned())
+    })?;
+
+    let runtime_dir_path = PathBuf::from(runtime_dir);
+    if let Ok(wayland_display) = std::env::var("WAYLAND_DISPLAY") {
+        let path = runtime_dir_path.join(format!("raven-{wayland_display}.sock"));
+        if path.exists() {
+            return Ok(path);
+        }
+    }
+
+    let mut candidates = Vec::new();
+    let entries = std::fs::read_dir(&runtime_dir_path).map_err(|err| {
+        CompositorError::Backend(format!(
+            "failed to scan runtime dir {}: {err}",
+            runtime_dir_path.display()
+        ))
+    })?;
+
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let name = file_name.to_string_lossy();
+        if name.starts_with("raven-wayland-") && name.ends_with(".sock") {
+            let candidate = runtime_dir_path.join(name.as_ref());
+            if candidate.exists() {
+                candidates.push(candidate);
+            }
+        }
+    }
+
+    match candidates.len() {
+        1 => Ok(candidates.remove(0)),
+        0 => Err(CompositorError::Backend(
+            "Raven ipc socket not found (is Raven running?)".to_owned(),
+        )),
+        _ => Err(CompositorError::Backend(
+            "multiple Raven sessions detected; set WAYLAND_DISPLAY to select one".to_owned(),
+        )),
+    }
 }
 
 fn init_backtrace_defaults() {

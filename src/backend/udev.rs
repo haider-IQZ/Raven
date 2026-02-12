@@ -764,6 +764,8 @@ fn device_removed(state: &mut Raven, node: DrmNode) {
 
 /// Render a surface for the given device and CRTC
 fn render_surface(state: &mut Raven, node: DrmNode, crtc: crtc::Handle) {
+    state.flush_interactive_frame_updates();
+
     let udev = state.udev_data.as_mut().unwrap();
     let Some(device) = udev.backends.get_mut(&node) else {
         return;

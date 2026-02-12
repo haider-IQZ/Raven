@@ -15,11 +15,12 @@ use smithay::{
             Display, DisplayHandle,
             backend::{ClientData, ClientId, DisconnectReason},
             protocol::wl_surface::WlSurface,
+            Resource,
         },
     },
     utils::{Clock, Logical, Monotonic, Point, SERIAL_COUNTER, Serial},
     wayland::{
-        compositor::{CompositorClientState, CompositorState},
+        compositor::{CompositorClientState, CompositorState, with_states},
         dmabuf::DmabufState,
         fractional_scale::FractionalScaleManagerState,
         output::OutputManagerState,
@@ -27,7 +28,7 @@ use smithay::{
         shell::{
             kde::decoration::KdeDecorationState,
             wlr_layer::{Layer as WlrLayer, WlrLayerShellState},
-            xdg::{XdgShellState, decoration::XdgDecorationState},
+            xdg::{XdgShellState, XdgToplevelSurfaceData, decoration::XdgDecorationState},
         },
         shm::ShmState,
         socket::ListeningSocketSource,
@@ -35,8 +36,11 @@ use smithay::{
     },
 };
 use std::{
+    collections::HashSet,
     ffi::OsString,
     fs::OpenOptions,
+    io::{Read, Write},
+    os::unix::net::{UnixListener, UnixStream},
     path::PathBuf,
     process::{Command, Stdio},
     sync::{
@@ -49,7 +53,7 @@ use std::{
 
 use crate::{
     CompositorError,
-    config::{self, RuntimeConfig, WallpaperConfig},
+    config::{self, RuntimeConfig, WallpaperConfig, WindowRule},
     layout::{GapConfig, LayoutBox, LayoutType},
     protocols::{
         ext_workspace::ExtWorkspaceManagerState,
@@ -59,6 +63,28 @@ use crate::{
 };
 
 pub const WORKSPACE_COUNT: usize = 10;
+
+#[derive(Clone, Copy, Debug)]
+pub struct NewWindowRuleDecision {
+    pub workspace_index: usize,
+    pub floating: bool,
+    pub fullscreen: bool,
+    pub focus: bool,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+}
+
+#[derive(Clone, Debug)]
+struct PendingInteractiveMove {
+    window: Window,
+    location: Point<i32, Logical>,
+}
+
+#[derive(Clone, Debug)]
+struct PendingInteractiveResize {
+    window: Window,
+    size: smithay::utils::Size<i32, Logical>,
+}
 
 pub struct Raven {
     pub display_handle: DisplayHandle,
@@ -93,9 +119,14 @@ pub struct Raven {
 
     pub pointer_location: Point<f64, Logical>,
     pub pending_screencopy: Option<Screencopy>,
+    pending_interactive_moves: Vec<PendingInteractiveMove>,
+    pending_interactive_resizes: Vec<PendingInteractiveResize>,
     pub current_workspace: usize,
     pub workspaces: Vec<Vec<Window>>,
     pub fullscreen_windows: Vec<Window>,
+    pub floating_windows: Vec<Window>,
+    pub pending_floating_recenter_ids: HashSet<u32>,
+    pub pending_window_rule_recheck_ids: HashSet<u32>,
     pub autostart_started: bool,
     pub wallpaper_task_inflight: Arc<AtomicBool>,
 
@@ -162,6 +193,10 @@ impl Raven {
         let space = Space::default();
 
         let socket_name = init_wayland_listener(display, &loop_handle);
+        match init_ipc_listener(&loop_handle, &socket_name) {
+            Ok(path) => tracing::info!(path = %path.display(), "ipc listener initialized"),
+            Err(err) => tracing::warn!("failed to initialize ipc listener: {err}"),
+        }
 
         // TODO: Get a brain
         let layout = LayoutType::from_str("tiling").unwrap().new();
@@ -200,9 +235,14 @@ impl Raven {
 
             pointer_location: Point::from((0.0, 0.0)),
             pending_screencopy: None,
+            pending_interactive_moves: Vec::new(),
+            pending_interactive_resizes: Vec::new(),
             current_workspace: 0,
             workspaces: vec![Vec::new(); WORKSPACE_COUNT],
             fullscreen_windows: Vec::new(),
+            floating_windows: Vec::new(),
+            pending_floating_recenter_ids: HashSet::new(),
+            pending_window_rule_recheck_ids: HashSet::new(),
             autostart_started: false,
             wallpaper_task_inflight: Arc::new(AtomicBool::new(false)),
 
@@ -245,6 +285,15 @@ impl Raven {
             return Ok(());
         }
 
+        let tiled_windows: Vec<smithay::desktop::Window> = windows
+            .iter()
+            .filter(|window| !self.floating_windows.contains(window))
+            .cloned()
+            .collect();
+        if tiled_windows.is_empty() {
+            return Ok(());
+        }
+
         let gaps = GapConfig {
             outer_horizontal: self.config.gaps_outer_horizontal,
             outer_vertical: self.config.gaps_outer_vertical,
@@ -265,7 +314,7 @@ impl Raven {
         };
 
         let geometries = self.layout.arrange(
-            &windows,
+            &tiled_windows,
             layout_geo.size.w as u32,
             layout_geo.size.h as u32,
             &gaps,
@@ -274,7 +323,7 @@ impl Raven {
             smartgaps_enabled,
         );
 
-        for (window, geom) in windows.into_iter().zip(geometries.into_iter()) {
+        for (window, geom) in tiled_windows.into_iter().zip(geometries.into_iter()) {
             let loc = Point::<i32, Logical>::from((
                 layout_geo.loc.x + geom.x_coordinate,
                 layout_geo.loc.y + geom.y_coordinate,
@@ -378,10 +427,514 @@ impl Raven {
     }
 
     pub fn add_window_to_current_workspace(&mut self, window: Window) {
-        let workspace = &mut self.workspaces[self.current_workspace];
+        self.add_window_to_workspace(self.current_workspace, window);
+    }
+
+    pub fn add_window_to_workspace(&mut self, workspace_index: usize, window: Window) {
+        let Some(workspace) = self.workspaces.get_mut(workspace_index) else {
+            tracing::warn!("attempted to add window to invalid workspace index {workspace_index}");
+            return;
+        };
         if !workspace.contains(&window) {
             workspace.push(window);
         }
+    }
+
+    pub fn set_window_floating(&mut self, window: &Window, floating: bool) {
+        if floating {
+            if !self.floating_windows.contains(window) {
+                self.floating_windows.push(window.clone());
+            }
+        } else {
+            self.floating_windows.retain(|candidate| candidate != window);
+        }
+    }
+
+    pub fn is_window_floating(&self, window: &Window) -> bool {
+        self.floating_windows.contains(window)
+    }
+
+    fn active_output_for_pointer(&self) -> Option<smithay::output::Output> {
+        self.space
+            .outputs()
+            .find(|output| {
+                self.space
+                    .output_geometry(output)
+                    .is_some_and(|geo| geo.to_f64().contains(self.pointer_location))
+            })
+            .cloned()
+            .or_else(|| self.space.outputs().next().cloned())
+    }
+
+    fn default_floating_location(&self, window: &Window) -> (i32, i32) {
+        self.active_output_for_pointer()
+            .as_ref()
+            .and_then(|output| {
+                let mut layer_map = layer_map_for_output(output);
+                layer_map.arrange();
+                let work_geo = layer_map.non_exclusive_zone();
+                if work_geo.size.w > 0 && work_geo.size.h > 0 {
+                    Some(work_geo)
+                } else {
+                    self.space.output_geometry(output)
+                }
+            })
+            .map(|geometry| {
+                let window_geo = window.geometry();
+                let window_width = window_geo.size.w.clamp(1, geometry.size.w);
+                let window_height = window_geo.size.h.clamp(1, geometry.size.h);
+                let x = geometry.loc.x + (geometry.size.w - window_width) / 2;
+                let y = geometry.loc.y + (geometry.size.h - window_height) / 2;
+                (x, y)
+            })
+            .unwrap_or((80, 80))
+    }
+
+    pub fn initial_map_location_for_window(&self, window: &Window) -> (i32, i32) {
+        if self.is_window_floating(window) {
+            self.default_floating_location(window)
+        } else {
+            (0, 0)
+        }
+    }
+
+    pub fn queue_interactive_move(&mut self, window: &Window, location: Point<i32, Logical>) {
+        if let Some(pending) = self
+            .pending_interactive_moves
+            .iter_mut()
+            .find(|pending| pending.window == *window)
+        {
+            pending.location = location;
+            return;
+        }
+        self.pending_interactive_moves.push(PendingInteractiveMove {
+            window: window.clone(),
+            location,
+        });
+    }
+
+    pub fn clear_pending_interactive_move(&mut self, window: &Window) {
+        self.pending_interactive_moves
+            .retain(|pending| pending.window != *window);
+    }
+
+    pub fn queue_interactive_resize(
+        &mut self,
+        window: &Window,
+        size: smithay::utils::Size<i32, Logical>,
+    ) {
+        if let Some(pending) = self
+            .pending_interactive_resizes
+            .iter_mut()
+            .find(|pending| pending.window == *window)
+        {
+            pending.size = size;
+            return;
+        }
+        self.pending_interactive_resizes.push(PendingInteractiveResize {
+            window: window.clone(),
+            size,
+        });
+    }
+
+    pub fn clear_pending_interactive_resize(&mut self, window: &Window) {
+        self.pending_interactive_resizes
+            .retain(|pending| pending.window != *window);
+    }
+
+    pub fn flush_interactive_frame_updates(&mut self) {
+        let pending_moves = std::mem::take(&mut self.pending_interactive_moves);
+        for pending in pending_moves {
+            self.space.map_element(pending.window, pending.location, false);
+        }
+
+        let pending_resizes = std::mem::take(&mut self.pending_interactive_resizes);
+        for pending in pending_resizes {
+            let Some(toplevel) = pending.window.toplevel() else {
+                continue;
+            };
+            toplevel.with_pending_state(|state| {
+                state.states.set(xdg_toplevel::State::Resizing);
+                state.size = Some(pending.size);
+            });
+            toplevel.send_pending_configure();
+        }
+    }
+
+    fn surface_app_id_and_title(surface: &WlSurface) -> (Option<String>, Option<String>) {
+        with_states(surface, |states| {
+            let role = states
+                .data_map
+                .get::<XdgToplevelSurfaceData>()
+                .expect("xdg toplevel role data missing")
+                .lock()
+                .expect("xdg toplevel role lock poisoned");
+
+            let app_id = role
+                .app_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned);
+            let title = role
+                .title
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned);
+            (app_id, title)
+        })
+    }
+
+    pub fn queue_window_rule_recheck_for_surface(&mut self, surface: &WlSurface) {
+        if self.should_defer_window_rules_for_surface(surface) {
+            self.pending_window_rule_recheck_ids
+                .insert(surface.id().protocol_id());
+        }
+    }
+
+    pub fn queue_floating_recenter_for_surface(&mut self, surface: &WlSurface) {
+        self.pending_floating_recenter_ids
+            .insert(surface.id().protocol_id());
+    }
+
+    pub fn clear_floating_recenter_for_surface(&mut self, surface: &WlSurface) {
+        self.pending_floating_recenter_ids
+            .remove(&surface.id().protocol_id());
+    }
+
+    pub fn clear_window_rule_recheck_for_surface(&mut self, surface: &WlSurface) {
+        self.pending_window_rule_recheck_ids
+            .remove(&surface.id().protocol_id());
+    }
+
+    fn should_defer_window_rules_for_surface(&self, surface: &WlSurface) -> bool {
+        if self.config.window_rules.is_empty() {
+            return false;
+        }
+
+        let (app_id, title) = Self::surface_app_id_and_title(surface);
+        for rule in &self.config.window_rules {
+            if (rule.class.is_some() || rule.app_id.is_some()) && app_id.is_none() {
+                return true;
+            }
+            if rule.title.is_some() && title.is_none() {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    pub fn resolve_window_rules_for_surface(
+        &self,
+        surface: &WlSurface,
+    ) -> NewWindowRuleDecision {
+        let (app_id, title) = Self::surface_app_id_and_title(surface);
+
+        let mut decision = NewWindowRuleDecision {
+            workspace_index: self.current_workspace,
+            floating: false,
+            fullscreen: false,
+            focus: true,
+            width: None,
+            height: None,
+        };
+
+        for rule in &self.config.window_rules {
+            if !rule.matches(app_id.as_deref(), title.as_deref()) {
+                continue;
+            }
+            Self::apply_window_rule_to_decision(rule, &mut decision);
+        }
+
+        decision
+    }
+
+    fn apply_window_rule_to_decision(rule: &WindowRule, decision: &mut NewWindowRuleDecision) {
+        if let Some(workspace_index) = rule.workspace {
+            decision.workspace_index = workspace_index;
+        }
+        if let Some(floating) = rule.floating {
+            decision.floating = floating;
+        }
+        if let Some(fullscreen) = rule.fullscreen {
+            decision.fullscreen = fullscreen;
+        }
+        if let Some(focus) = rule.focus {
+            decision.focus = focus;
+        }
+        if let Some(width) = rule.width {
+            decision.width = Some(width);
+        }
+        if let Some(height) = rule.height {
+            decision.height = Some(height);
+        }
+    }
+
+    pub fn apply_window_rule_size_to_window(
+        &self,
+        window: &Window,
+        decision: &NewWindowRuleDecision,
+    ) {
+        let (Some(width), Some(height)) = (decision.width, decision.height) else {
+            return;
+        };
+
+        let width = width.clamp(1, i32::MAX as u32) as i32;
+        let height = height.clamp(1, i32::MAX as u32) as i32;
+
+        let Some(toplevel) = window.toplevel() else {
+            return;
+        };
+        toplevel.with_pending_state(|state| {
+            state.size = Some((width, height).into());
+        });
+    }
+
+    fn workspace_index_for_window(&self, window: &Window) -> Option<usize> {
+        self.workspaces
+            .iter()
+            .position(|workspace| workspace.contains(window))
+    }
+
+    fn move_window_to_workspace_internal(
+        &mut self,
+        window: &Window,
+        target_workspace: usize,
+    ) -> Result<(), CompositorError> {
+        if target_workspace >= self.workspaces.len() {
+            return Err(CompositorError::Backend(format!(
+                "invalid workspace index {target_workspace}"
+            )));
+        }
+
+        let source_workspace = self.workspace_index_for_window(window);
+
+        match source_workspace {
+            Some(source_workspace) if source_workspace == target_workspace => {}
+            Some(source_workspace) => {
+                self.workspaces[source_workspace].retain(|candidate| candidate != window);
+                if !self.workspaces[target_workspace].contains(window) {
+                    self.workspaces[target_workspace].push(window.clone());
+                }
+
+                if source_workspace == self.current_workspace {
+                    self.space.unmap_elem(window);
+                }
+                if target_workspace == self.current_workspace {
+                    let loc = self.initial_map_location_for_window(window);
+                    self.space.map_element(window.clone(), loc, false);
+                }
+            }
+            None => {
+                self.add_window_to_workspace(target_workspace, window.clone());
+                if target_workspace == self.current_workspace {
+                    let loc = self.initial_map_location_for_window(window);
+                    self.space.map_element(window.clone(), loc, false);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn maybe_apply_deferred_window_rules(&mut self, surface: &WlSurface) {
+        let surface_id = surface.id().protocol_id();
+        if !self.pending_window_rule_recheck_ids.contains(&surface_id) {
+            return;
+        }
+
+        let Some(window) = self.window_for_surface(surface) else {
+            self.pending_window_rule_recheck_ids.remove(&surface_id);
+            return;
+        };
+
+        let (app_id, title) = Self::surface_app_id_and_title(surface);
+        if app_id.is_none() && title.is_none() {
+            return;
+        }
+
+        let decision = self.resolve_window_rules_for_surface(surface);
+        if let Err(err) = self.move_window_to_workspace_internal(&window, decision.workspace_index) {
+            tracing::warn!("failed to move window after deferred rule resolution: {err}");
+        }
+        self.apply_window_rule_size_to_window(&window, &decision);
+        if let Some(toplevel) = window.toplevel()
+            && toplevel.is_initial_configure_sent()
+        {
+            toplevel.send_pending_configure();
+        }
+
+        let was_floating = self.is_window_floating(&window);
+        self.set_window_floating(&window, decision.floating);
+        if decision.floating && self.is_window_mapped(&window) {
+            let loc = self.initial_map_location_for_window(&window);
+            // Re-center when metadata arrives and after first commit size settles.
+            // This mirrors niri-style "center in working area" behavior more closely.
+            self.space.map_element(window.clone(), loc, !was_floating);
+            self.queue_floating_recenter_for_surface(surface);
+        }
+
+        if decision.fullscreen && !self.fullscreen_windows.contains(&window) {
+            let existing = self.fullscreen_windows.clone();
+            for fullscreen_window in &existing {
+                self.set_window_fullscreen_state(fullscreen_window, false);
+            }
+            self.fullscreen_windows.clear();
+            self.fullscreen_windows.push(window.clone());
+            self.set_window_fullscreen_state(&window, true);
+        }
+
+        if let Err(err) = self.apply_layout() {
+            tracing::warn!("failed to apply layout after deferred rule resolution: {err}");
+        }
+
+        if decision.focus && decision.workspace_index == self.current_workspace {
+            self.set_keyboard_focus(Some(surface.clone()), SERIAL_COUNTER.next_serial());
+        }
+
+        self.pending_window_rule_recheck_ids.remove(&surface_id);
+    }
+
+    pub fn maybe_recenter_floating_window_after_commit(&mut self, surface: &WlSurface) {
+        let surface_id = surface.id().protocol_id();
+        if !self.pending_floating_recenter_ids.contains(&surface_id) {
+            return;
+        }
+
+        let Some(window) = self.window_for_surface(surface) else {
+            self.pending_floating_recenter_ids.remove(&surface_id);
+            return;
+        };
+        if !self.is_window_floating(&window) || !self.is_window_mapped(&window) {
+            self.pending_floating_recenter_ids.remove(&surface_id);
+            return;
+        }
+
+        let size = window.geometry().size;
+        if size.w <= 1 || size.h <= 1 {
+            // Wait for the first commit with a real window size.
+            return;
+        }
+
+        let loc = self.initial_map_location_for_window(&window);
+        self.space.map_element(window, loc, false);
+        self.pending_floating_recenter_ids.remove(&surface_id);
+    }
+
+    fn write_ipc_response(stream: &mut UnixStream, message: &str) {
+        if let Err(err) = stream.write_all(message.as_bytes()) {
+            tracing::warn!("failed to write ipc response: {err}");
+        }
+    }
+
+    pub fn handle_ipc_stream(&mut self, mut stream: UnixStream) {
+        let mut request = String::new();
+        if let Err(err) = stream.read_to_string(&mut request) {
+            Self::write_ipc_response(
+                &mut stream,
+                &format!("error: failed to read request: {err}\n"),
+            );
+            return;
+        }
+
+        match request.trim() {
+            "clients" => {
+                let output = self.render_clients_report();
+                Self::write_ipc_response(&mut stream, &output);
+            }
+            "reload" => match self.reload_config() {
+                Ok(()) => Self::write_ipc_response(&mut stream, "ok\n"),
+                Err(err) => Self::write_ipc_response(&mut stream, &format!("error: {err}\n")),
+            },
+            "" => {
+                Self::write_ipc_response(
+                    &mut stream,
+                    "error: empty command (supported: clients, reload)\n",
+                );
+            }
+            other => {
+                Self::write_ipc_response(
+                    &mut stream,
+                    &format!("error: unsupported command `{other}` (supported: clients, reload)\n"),
+                );
+            }
+        }
+    }
+
+    fn render_clients_report(&self) -> String {
+        let focused_surface = self
+            .seat
+            .get_keyboard()
+            .and_then(|keyboard| keyboard.current_focus());
+
+        let mut seen_surfaces = HashSet::new();
+        let mut windows = Vec::new();
+        for window in self
+            .workspaces
+            .iter()
+            .flatten()
+            .chain(self.space.elements())
+        {
+            let Some(toplevel) = window.toplevel() else {
+                continue;
+            };
+            let surface = toplevel.wl_surface();
+            if seen_surfaces.insert(surface.clone()) {
+                windows.push(window.clone());
+            }
+        }
+
+        if windows.is_empty() {
+            return "No clients.\n".to_owned();
+        }
+
+        let mut out = String::new();
+        for (index, window) in windows.iter().enumerate() {
+            let Some(toplevel) = window.toplevel() else {
+                continue;
+            };
+            let wl_surface = toplevel.wl_surface().clone();
+
+            let (app_id, title) = with_states(&wl_surface, |states| {
+                let role = states
+                    .data_map
+                    .get::<XdgToplevelSurfaceData>()
+                    .expect("xdg toplevel role data missing")
+                    .lock()
+                    .expect("xdg toplevel role lock poisoned");
+                (role.app_id.clone(), role.title.clone())
+            });
+
+            let workspace = self
+                .workspaces
+                .iter()
+                .position(|ws| ws.contains(window))
+                .map(|idx| idx + 1)
+                .unwrap_or(self.current_workspace + 1);
+
+            let class = app_id.as_deref().unwrap_or("<unknown>");
+            let title = title.as_deref().unwrap_or("<untitled>");
+            let focused = focused_surface.as_ref() == Some(&wl_surface);
+            let mapped = self.is_window_mapped(window);
+            let floating = self.is_window_floating(window);
+            let fullscreen = self.fullscreen_windows.contains(window);
+            let surface_id = format!("{:?}", wl_surface.id());
+
+            out.push_str(&format!("Client {}:\n", index + 1));
+            out.push_str(&format!("  surface: {surface_id}\n"));
+            out.push_str(&format!("  class: {class}\n"));
+            out.push_str(&format!("  title: {title}\n"));
+            out.push_str(&format!("  workspace: {workspace}\n"));
+            out.push_str(&format!("  mapped: {mapped}\n"));
+            out.push_str(&format!("  floating: {floating}\n"));
+            out.push_str(&format!("  fullscreen: {fullscreen}\n"));
+            out.push_str(&format!("  focused: {focused}\n"));
+            out.push('\n');
+        }
+
+        out
     }
 
     fn is_window_mapped(&self, window: &Window) -> bool {
@@ -455,6 +1008,7 @@ impl Raven {
         }
         self.fullscreen_windows
             .retain(|candidate| candidate != window);
+        self.floating_windows.retain(|candidate| candidate != window);
     }
 
     pub fn switch_workspace(&mut self, target_workspace: usize) -> Result<(), CompositorError> {
@@ -477,7 +1031,8 @@ impl Raven {
 
         let target_windows = self.workspaces[target_workspace].clone();
         for window in target_windows {
-            self.space.map_element(window, (0, 0), false);
+            let loc = self.initial_map_location_for_window(&window);
+            self.space.map_element(window, loc, false);
         }
 
         self.apply_layout()?;
@@ -526,7 +1081,8 @@ impl Raven {
             self.apply_layout()?;
             self.refocus_visible_window();
         } else if target_workspace == self.current_workspace {
-            self.space.map_element(window, (0, 0), false);
+            let loc = self.initial_map_location_for_window(&window);
+            self.space.map_element(window, loc, false);
             self.apply_layout()?;
         }
 
@@ -1085,6 +1641,27 @@ impl Raven {
         self.apply_layout()
     }
 
+    pub fn toggle_floating_focused_window(&mut self) -> Result<(), CompositorError> {
+        let Some(keyboard) = self.seat.get_keyboard() else {
+            return Ok(());
+        };
+        let Some(focused_surface) = keyboard.current_focus() else {
+            return Ok(());
+        };
+        let Some(window) = self.window_for_surface(&focused_surface) else {
+            return Ok(());
+        };
+
+        let currently_floating = self.is_window_floating(&window);
+        self.set_window_floating(&window, !currently_floating);
+        if !currently_floating && self.is_window_mapped(&window) {
+            let loc = self.initial_map_location_for_window(&window);
+            self.space.map_element(window.clone(), loc, true);
+        }
+
+        self.apply_layout()
+    }
+
     pub(crate) fn set_window_fullscreen_state(&self, window: &Window, fullscreen: bool) {
         let Some(toplevel) = window.toplevel() else {
             return;
@@ -1166,6 +1743,69 @@ pub fn init_wayland_listener(
         .expect("failed to init display event source");
 
     socket_name
+}
+
+fn init_ipc_listener(
+    loop_handle: &LoopHandle<'static, Raven>,
+    socket_name: &OsString,
+) -> Result<PathBuf, CompositorError> {
+    let ipc_socket_path = ipc_socket_path_for_wayland_socket(socket_name)?;
+
+    if ipc_socket_path.exists()
+        && let Err(err) = std::fs::remove_file(&ipc_socket_path)
+    {
+        return Err(CompositorError::Backend(format!(
+            "failed to remove stale ipc socket {}: {err}",
+            ipc_socket_path.display()
+        )));
+    }
+
+    let listener = UnixListener::bind(&ipc_socket_path).map_err(|err| {
+        CompositorError::Backend(format!(
+            "failed to bind ipc socket {}: {err}",
+            ipc_socket_path.display()
+        ))
+    })?;
+    listener.set_nonblocking(true).map_err(|err| {
+        CompositorError::Backend(format!(
+            "failed to set ipc socket nonblocking {}: {err}",
+            ipc_socket_path.display()
+        ))
+    })?;
+
+    loop_handle
+        .insert_source(
+            Generic::new(listener, Interest::READ, Mode::Level),
+            move |_, listener, state| {
+                loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => state.handle_ipc_stream(stream),
+                        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+                        Err(err) => {
+                            tracing::warn!("ipc accept failed: {err}");
+                            break;
+                        }
+                    }
+                }
+                Ok(PostAction::Continue)
+            },
+        )
+        .map_err(|err| CompositorError::EventLoop(format!("failed to init ipc listener: {err}")))?;
+
+    Ok(ipc_socket_path)
+}
+
+fn ipc_socket_path_for_wayland_socket(socket_name: &OsString) -> Result<PathBuf, CompositorError> {
+    let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR").ok_or_else(|| {
+        CompositorError::Backend("XDG_RUNTIME_DIR is not set; cannot create ipc socket".to_owned())
+    })?;
+    let wayland_socket = socket_name.to_string_lossy().trim().to_owned();
+    if wayland_socket.is_empty() {
+        return Err(CompositorError::Backend(
+            "wayland socket name is empty; cannot create ipc socket".to_owned(),
+        ));
+    }
+    Ok(PathBuf::from(runtime_dir).join(format!("raven-{wayland_socket}.sock")))
 }
 
 pub struct ClientState {

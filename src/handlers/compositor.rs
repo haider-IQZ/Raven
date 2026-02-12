@@ -36,19 +36,25 @@ impl CompositorHandler for Raven {
     fn commit(&mut self, surface: &WlSurface) {
         on_commit_buffer_handler::<Self>(surface);
         let mut is_root = false;
+        let mut root_surface = None;
         if !is_sync_subsurface(surface) {
-            let mut root_surface = surface.clone();
-            while let Some(parent) = get_parent(&root_surface) {
-                root_surface = parent;
+            let mut root = surface.clone();
+            while let Some(parent) = get_parent(&root) {
+                root = parent;
             }
-            is_root = root_surface == *surface;
+            is_root = root == *surface;
 
-            if let Some(window) = self.window_for_surface(&root_surface) {
+            if let Some(window) = self.window_for_surface(&root) {
                 window.on_commit();
             }
+            root_surface = Some(root);
         }
 
         xdg_shell::handle_commit(&mut self.popups, &self.space, surface);
+        if let Some(root_surface) = root_surface.as_ref() {
+            self.maybe_apply_deferred_window_rules(root_surface);
+            self.maybe_recenter_floating_window_after_commit(root_surface);
+        }
         resize_grab::handle_commit(&mut self.space, surface);
         let current_focus = self
             .seat

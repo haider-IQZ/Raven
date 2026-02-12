@@ -16,6 +16,7 @@ pub struct MoveGrab {
     pub start_data: PointerGrabStartData<Raven>,
     pub window: Window,
     pub initial_window_location: Point<i32, Logical>,
+    pub current_window_location: Point<i32, Logical>,
 }
 
 impl PointerGrab<Raven> for MoveGrab {
@@ -30,9 +31,12 @@ impl PointerGrab<Raven> for MoveGrab {
         handle.motion(data, None, event);
 
         let delta = event.location - self.start_data.location;
-        let new_location = self.initial_window_location.to_f64() + delta;
-        data.space
-            .map_element(self.window.clone(), new_location.to_i32_round(), true);
+        let new_location = (self.initial_window_location.to_f64() + delta).to_i32_round();
+        if new_location != self.current_window_location {
+            // Window was already raised at grab start; queue updates and apply once per frame.
+            data.queue_interactive_move(&self.window, new_location);
+            self.current_window_location = new_location;
+        }
     }
 
     fn relative_motion(
@@ -153,6 +157,7 @@ impl PointerGrab<Raven> for MoveGrab {
     }
 
     fn unset(&mut self, data: &mut Raven) {
+        data.clear_pending_interactive_move(&self.window);
         data.apply_layout().ok();
     }
 }

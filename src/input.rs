@@ -1,4 +1,12 @@
-use crate::{action::Action, config::KeybindAction, grabs::move_grab::MoveGrab, state::Raven};
+use crate::{
+    action::Action,
+    config::KeybindAction,
+    grabs::{
+        move_grab::MoveGrab,
+        resize_grab::{ResizeEdge, ResizeSurfaceGrab},
+    },
+    state::Raven,
+};
 use smithay::{
     backend::input::{
         AbsolutePositionEvent, Axis, AxisSource, ButtonState, Event, InputBackend, InputEvent,
@@ -12,7 +20,7 @@ use smithay::{
             AxisFrame, ButtonEvent, Focus, GrabStartData as PointerGrabStartData, MotionEvent,
         },
     },
-    utils::{Logical, Point, SERIAL_COUNTER, Serial},
+    utils::{Logical, Point, Rectangle, SERIAL_COUNTER, Serial},
     wayland::{
         input_method::InputMethodSeat,
         shell::wlr_layer::{KeyboardInteractivity, Layer as WlrLayer},
@@ -175,7 +183,9 @@ impl Raven {
         }
 
         let keyboard = self.seat.get_keyboard().expect("keyboard not initialized");
-        let main_key_held = self.config.main_key.matches(&keyboard.modifier_state());
+        let modifiers = keyboard.modifier_state();
+        let main_key_held = self.config.main_key.matches(&modifiers);
+        let resize_modifier_held = main_key_held || modifiers.alt;
 
         if ButtonState::Pressed == button_state
             && button == Some(MouseButton::Left)
@@ -195,7 +205,30 @@ impl Raven {
                 start_data,
                 window: window.clone(),
                 initial_window_location,
+                current_window_location: initial_window_location,
             };
+            pointer.set_grab(self, grab, serial, Focus::Clear);
+            self.space.raise_element(&window, true);
+        }
+
+        if ButtonState::Pressed == button_state
+            && button == Some(MouseButton::Right)
+            && resize_modifier_held
+            && let Some((window, window_location)) = self.window_under_pointer()
+            && !pointer.is_grabbed()
+        {
+            let location = self.pointer_location;
+            let window_size = window.geometry().size;
+            let local_pos = location - window_location.to_f64();
+            let edges = resize_edges_from_local_point(local_pos, window_size.w, window_size.h);
+
+            let start_data = PointerGrabStartData {
+                focus: None,
+                button: button_code,
+                location,
+            };
+            let initial_window_rect = Rectangle::new(window_location, window_size);
+            let grab = ResizeSurfaceGrab::start(start_data, window.clone(), edges, initial_window_rect);
             pointer.set_grab(self, grab, serial, Focus::Clear);
             self.space.raise_element(&window, true);
         }
@@ -432,6 +465,12 @@ fn execute_keybind_action(state: &mut Raven, action: KeybindAction) {
                 .map_err(|err| tracing::warn!("failed to toggle fullscreen: {err}"))
                 .ok();
         }
+        KeybindAction::ToggleFloating => {
+            state
+                .toggle_floating_focused_window()
+                .map_err(|err| tracing::warn!("failed to toggle floating: {err}"))
+                .ok();
+        }
         KeybindAction::Quit => state.loop_signal.stop(),
         KeybindAction::FocusNext => Action::FocusNext.execute(state),
         KeybindAction::FocusPrevious => Action::FocusPrevious.execute(state),
@@ -483,4 +522,22 @@ fn workspace_from_keysym(keysym: Keysym) -> Option<usize> {
         Keysym::_0 | Keysym::parenright => Some(9),
         _ => None,
     }
+}
+
+fn resize_edges_from_local_point(local: Point<f64, Logical>, width: i32, height: i32) -> ResizeEdge {
+    let width = width.max(1) as f64;
+    let height = height.max(1) as f64;
+
+    let horizontal = if local.x < width / 2.0 {
+        ResizeEdge::LEFT
+    } else {
+        ResizeEdge::RIGHT
+    };
+    let vertical = if local.y < height / 2.0 {
+        ResizeEdge::TOP
+    } else {
+        ResizeEdge::BOTTOM
+    };
+
+    horizontal | vertical
 }

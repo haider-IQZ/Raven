@@ -29,7 +29,42 @@ pub struct RuntimeConfig {
     pub cursor_theme: String,
     pub cursor_size: u32,
     pub monitors: Vec<MonitorConfig>,
+    pub window_rules: Vec<WindowRule>,
     pub wallpaper: WallpaperConfig,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct WindowRule {
+    pub class: Option<String>,
+    pub app_id: Option<String>,
+    pub title: Option<String>,
+    pub workspace: Option<usize>,
+    pub floating: Option<bool>,
+    pub fullscreen: Option<bool>,
+    pub focus: Option<bool>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+}
+
+impl WindowRule {
+    pub fn matches(&self, app_id: Option<&str>, title: Option<&str>) -> bool {
+        if let Some(expected) = &self.class
+            && !matches_ci_exact(app_id, expected)
+        {
+            return false;
+        }
+        if let Some(expected) = &self.app_id
+            && !matches_ci_exact(app_id, expected)
+        {
+            return false;
+        }
+        if let Some(expected) = &self.title
+            && !matches_ci_contains(title, expected)
+        {
+            return false;
+        }
+        true
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -121,6 +156,7 @@ impl Default for RuntimeConfig {
             cursor_theme: "default".to_owned(),
             cursor_size: 24,
             monitors: Vec::new(),
+            window_rules: Vec::new(),
             wallpaper: WallpaperConfig::default(),
         }
     }
@@ -188,6 +224,7 @@ pub enum KeybindAction {
     Launcher,
     CloseFocused,
     ToggleFullscreen,
+    ToggleFloating,
     Quit,
     FocusNext,
     FocusPrevious,
@@ -363,6 +400,7 @@ pub fn load_from_path(path: &Path) -> Result<RuntimeConfig, CompositorError> {
     }
 
     config.monitors = parse_monitor_configs(&values)?;
+    config.window_rules = parse_window_rules(&values)?;
 
     let keybind_lines = collect_indexed_values(&values, "keybind.")?;
     config.keybinds = if keybind_lines.is_empty() {
@@ -944,6 +982,109 @@ fn parse_monitor_configs(
     Ok(monitors)
 }
 
+fn parse_window_rules(values: &HashMap<String, String>) -> Result<Vec<WindowRule>, CompositorError> {
+    let mut grouped = BTreeMap::<usize, HashMap<String, String>>::new();
+
+    for (key, value) in values {
+        let Some(rest) = key.strip_prefix("window_rule.") else {
+            continue;
+        };
+        let Some((raw_index, field)) = rest.split_once('.') else {
+            return Err(CompositorError::Backend(format!(
+                "invalid window rule key `{key}`: expected format window_rule.<index>.<field>"
+            )));
+        };
+        if field.trim().is_empty() {
+            return Err(CompositorError::Backend(format!(
+                "invalid window rule key `{key}`: missing field"
+            )));
+        }
+        let index = raw_index.parse::<usize>().map_err(|err| {
+            CompositorError::Backend(format!(
+                "invalid window rule key `{key}`: index is not a number ({err})"
+            ))
+        })?;
+        grouped
+            .entry(index)
+            .or_default()
+            .insert(field.trim().to_owned(), value.clone());
+    }
+
+    let mut rules = Vec::with_capacity(grouped.len());
+    for (index, fields) in grouped {
+        let mut rule = WindowRule::default();
+        rule.class = normalize_non_empty_field(&fields, "class");
+        rule.app_id = normalize_non_empty_field(&fields, "app_id")
+            .or_else(|| normalize_non_empty_field(&fields, "appid"));
+        rule.title = normalize_non_empty_field(&fields, "title");
+        rule.workspace = parse_window_rule_workspace(&fields, index)?;
+        rule.floating = parse_optional_bool_flexible_in_map(
+            &fields,
+            "floating",
+            &format!("window_rule.{index}.floating"),
+        )?;
+        rule.fullscreen = parse_optional_bool_flexible_in_map(
+            &fields,
+            "fullscreen",
+            &format!("window_rule.{index}.fullscreen"),
+        )?;
+        rule.focus = parse_optional_bool_flexible_in_map(
+            &fields,
+            "focus",
+            &format!("window_rule.{index}.focus"),
+        )?;
+        rule.width = parse_optional_u32_in_map(
+            &fields,
+            "width",
+            &format!("window_rule.{index}.width"),
+        )?;
+        rule.height = parse_optional_u32_in_map(
+            &fields,
+            "height",
+            &format!("window_rule.{index}.height"),
+        )?;
+
+        rules.push(rule);
+    }
+
+    Ok(rules)
+}
+
+fn normalize_non_empty_field(fields: &HashMap<String, String>, field: &str) -> Option<String> {
+    fields
+        .get(field)
+        .map(|raw| raw.trim())
+        .filter(|raw| !raw.is_empty())
+        .map(|raw| raw.to_owned())
+}
+
+fn parse_window_rule_workspace(
+    fields: &HashMap<String, String>,
+    index: usize,
+) -> Result<Option<usize>, CompositorError> {
+    let Some(raw) = fields.get("workspace").map(String::as_str) else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    let number = trimmed.parse::<usize>().map_err(|err| {
+        CompositorError::Backend(format!(
+            "invalid value for window_rule.{index}.workspace: {trimmed} ({err})"
+        ))
+    })?;
+
+    if !(1..=10).contains(&number) {
+        return Err(CompositorError::Backend(format!(
+            "invalid value for window_rule.{index}.workspace: {trimmed} (expected 1..10)"
+        )));
+    }
+
+    Ok(Some(number - 1))
+}
+
 fn parse_optional_bool_flexible_in_map(
     fields: &HashMap<String, String>,
     field: &str,
@@ -959,6 +1100,23 @@ fn parse_optional_bool_flexible_in_map(
             "invalid value for {key}: {raw} (expected bool or 0/1)"
         ))),
     }
+}
+
+fn parse_optional_u32_in_map(
+    fields: &HashMap<String, String>,
+    field: &str,
+    key: &str,
+) -> Result<Option<u32>, CompositorError> {
+    let Some(raw) = fields.get(field) else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    trimmed.parse::<u32>().map(Some).map_err(|err| {
+        CompositorError::Backend(format!("invalid value for {key}: {trimmed} ({err})"))
+    })
 }
 
 fn parse_optional_u16_flexible_in_map(
@@ -1107,6 +1265,7 @@ fn default_keybinds(main_key: MainKey) -> Result<Vec<Keybind>, CompositorError> 
         "Main+Return terminal",
         "Main+D launcher",
         "Main+Q close",
+        "Main+V toggle_floating",
         "Main+J focus_next",
         "Main+K focus_previous",
         "Main+Shift+R reload_config",
@@ -1223,6 +1382,7 @@ fn parse_keybind_action(
         "close" | "close_focused" => KeybindAction::CloseFocused,
         "close_window" => KeybindAction::CloseFocused,
         "fullscreen" | "togglefullscreen" => KeybindAction::ToggleFullscreen,
+        "toggle_floating" | "togglefloating" | "floating" => KeybindAction::ToggleFloating,
         "quit" => KeybindAction::Quit,
         "focus_next" | "next" => KeybindAction::FocusNext,
         "focus_prev" | "focus_previous" | "prev" => KeybindAction::FocusPrevious,
@@ -1292,6 +1452,17 @@ fn parse_workspace_index(
     }
 
     Ok(number - 1)
+}
+
+fn matches_ci_exact(actual: Option<&str>, expected: &str) -> bool {
+    actual.is_some_and(|value| value.eq_ignore_ascii_case(expected))
+}
+
+fn matches_ci_contains(actual: Option<&str>, expected: &str) -> bool {
+    let expected = expected.to_ascii_lowercase();
+    actual
+        .map(str::to_ascii_lowercase)
+        .is_some_and(|value| value.contains(&expected))
 }
 
 fn keysym_matches_token(keysym: Keysym, token: &str) -> bool {
@@ -1444,6 +1615,7 @@ return {
     { combo = "Main+D", action = "exec", command = "fuzzel" },
     { combo = "Main+C", action = "close_window" },
     { combo = "Main+F", action = "fullscreen" },
+    { combo = "Main+V", action = "toggle_floating" },
     { combo = "Main+J", action = "focus_next" },
     { combo = "Main+K", action = "focus_prev" },
     { combo = "Main+Shift+R", action = "reload_config" },
@@ -1489,7 +1661,7 @@ return {
 
   window_rules = {
     { class = "Firefox", workspace = "2" },
-    { class = "mpv", floating = true },
+    -- { class = "mpv", floating = true, width = 1280, height = 720 },
   },
 
   autostart = {
@@ -1752,6 +1924,41 @@ if autostart then
       os.exit(1)
     end
     emit("autostart." .. tostring(index), command)
+  end
+end
+
+local window_rules = pick(cfg.window_rules, pick(cfg.rules, pick(_G.window_rules, _G.rules)))
+expect_table("window_rules", window_rules)
+if window_rules then
+  local rule_index = 1
+
+  local function emit_rule(rule, key_name)
+    if type(rule) ~= "table" then
+      io.stderr:write("window_rules entry must be a table\n")
+      os.exit(1)
+    end
+
+    local prefix = "window_rule." .. tostring(rule_index) .. "."
+    emit_string(prefix .. "class", pick(rule.class, key_name))
+    emit_string(prefix .. "app_id", pick(rule.app_id, rule.appid))
+    emit_string(prefix .. "title", rule.title)
+    emit_string(prefix .. "workspace", pick(rule.workspace, rule.ws))
+    emit_bool_like(prefix .. "floating", rule.floating)
+    emit_bool_like(prefix .. "fullscreen", rule.fullscreen)
+    emit_bool_like(prefix .. "focus", rule.focus)
+    emit_number(prefix .. "width", rule.width)
+    emit_number(prefix .. "height", rule.height)
+    rule_index = rule_index + 1
+  end
+
+  for _, rule in ipairs(window_rules) do
+    emit_rule(rule, nil)
+  end
+
+  for key, rule in pairs(window_rules) do
+    if type(key) == "string" then
+      emit_rule(rule, key)
+    end
   end
 end
 
