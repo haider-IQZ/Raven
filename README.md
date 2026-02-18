@@ -16,7 +16,6 @@ Project status: alpha.
 - Layer-shell integration (Waybar, launchers, notifications) with reserved space handling
 - Runtime config reload (`Main+Shift+R` by default)
 - Lua config at `~/.config/raven/config.lua`
-- Hyprland-style config compatibility (subset)
 - Window rules (`class`/`app_id`/`title` match with workspace/floating/fullscreen/focus actions)
 - Per-output monitor configuration (mode, refresh, scale, transform, position, enable/disable)
 - Wallpaper restore flow (external command, default `waypaper --restore`) with optional legacy `swww` mode
@@ -98,7 +97,7 @@ When running inside a Raven session:
 - If missing: Raven creates a default config automatically.
 - If empty: Raven writes the default config automatically.
 
-### Default Style
+### Default Config (Lua)
 
 ```lua
 return {
@@ -147,16 +146,7 @@ return {
 }
 ```
 
-### Supported Config Shapes
-
-- Structured Lua style:
-  - `general`, `keybindings`, `monitors`, `autostart`, `xwayland`, `wallpaper`
-- String keybind list style:
-  - `keybinds = { "Super+X exec firefox", ... }`
-- Function helper style:
-  - `keys()` with `bind("Mod4", "j", focus_next)` and `spawn(...)`
-- Hyprland-like style (subset):
-  - `bind = ...`, `exec-once = ...`, `general { ... }`, `input { ... }`
+Raven expects a Lua config table in the same structure as the default example above.
 
 ### Window Rules
 
