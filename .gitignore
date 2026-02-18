@@ -3,7 +3,3 @@
 /error/
 error
 *.log
-
-# Local upstream reference clones (do not track)
-/niri-main*/
-/niri-*/
