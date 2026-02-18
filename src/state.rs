@@ -12,18 +12,19 @@ use smithay::{
         },
         wayland_protocols_misc::server_decoration::server::org_kde_kwin_server_decoration_manager::Mode as KdeDecorationsMode,
         wayland_server::{
-            Display, DisplayHandle,
+            Display, DisplayHandle, Resource,
             backend::{ClientData, ClientId, DisconnectReason},
             protocol::wl_surface::WlSurface,
-            Resource,
         },
     },
     utils::{Clock, Logical, Monotonic, Point, SERIAL_COUNTER, Serial},
     wayland::{
         compositor::{CompositorClientState, CompositorState, with_states},
         dmabuf::DmabufState,
+        drm_syncobj::DrmSyncobjState,
         fractional_scale::FractionalScaleManagerState,
         output::OutputManagerState,
+        presentation::PresentationState,
         selection::{data_device::DataDeviceState, primary_selection::PrimarySelectionState},
         shell::{
             kde::decoration::KdeDecorationState,
@@ -38,6 +39,7 @@ use smithay::{
 use std::{
     collections::HashSet,
     ffi::OsString,
+    fs,
     fs::OpenOptions,
     io::{Read, Write},
     os::unix::net::{UnixListener, UnixStream},
@@ -116,8 +118,10 @@ pub struct Raven {
     pub screencopy_state: ScreencopyManagerState,
     pub viewporter_state: ViewporterState,
     pub fractional_scale_manager_state: FractionalScaleManagerState,
+    pub presentation_state: PresentationState,
 
     pub pointer_location: Point<f64, Logical>,
+    pub last_pointer_redraw_msec: Option<u32>,
     pub pending_screencopy: Option<Screencopy>,
     pending_interactive_moves: Vec<PendingInteractiveMove>,
     pending_interactive_resizes: Vec<PendingInteractiveResize>,
@@ -134,6 +138,7 @@ pub struct Raven {
     pub cursor_status: CursorImageStatus,
     pub clock: Clock<Monotonic>,
     pub dmabuf_state: Option<DmabufState>,
+    pub syncobj_state: Option<DrmSyncobjState>,
     pub udev_data: Option<crate::backend::udev::UdevData>,
 }
 
@@ -183,6 +188,8 @@ impl Raven {
         let viewporter_state = ViewporterState::new::<Self>(&display_handle);
         let fractional_scale_manager_state =
             FractionalScaleManagerState::new::<Self>(&display_handle);
+        // CLOCK_MONOTONIC = 1 on Linux; must match Clock<Monotonic>
+        let presentation_state = PresentationState::new::<Self>(&display_handle, 1);
         let mut seat_state = SeatState::new();
 
         let mut seat = seat_state.new_wl_seat(&display_handle, "winit");
@@ -232,8 +239,10 @@ impl Raven {
             screencopy_state,
             viewporter_state,
             fractional_scale_manager_state,
+            presentation_state,
 
             pointer_location: Point::from((0.0, 0.0)),
+            last_pointer_redraw_msec: None,
             pending_screencopy: None,
             pending_interactive_moves: Vec::new(),
             pending_interactive_resizes: Vec::new(),
@@ -249,9 +258,11 @@ impl Raven {
             cursor_status: CursorImageStatus::default_named(),
             clock: Clock::new(),
             dmabuf_state: None,
+            syncobj_state: None,
             udev_data: None,
         };
 
+        Self::ensure_portal_preferences_file();
         state.sync_activation_environment();
 
         Ok(state)
@@ -280,8 +291,22 @@ impl Raven {
             .find(|window| self.fullscreen_windows.contains(window))
             .cloned()
         {
-            self.set_window_fullscreen_state(&fullscreen_window, true);
-            self.space.map_element(fullscreen_window, out_geo.loc, true);
+            let current_location = self.space.element_location(&fullscreen_window);
+            let current_geometry = self
+                .space
+                .element_geometry(&fullscreen_window)
+                .unwrap_or_else(|| fullscreen_window.geometry());
+            let is_mapped = current_location.is_some();
+            let needs_resize = current_geometry.size != out_geo.size;
+            let needs_reposition = current_location != Some(out_geo.loc);
+
+            // Avoid repeatedly reconfiguring/remapping an already-correct fullscreen window.
+            if !is_mapped || needs_resize {
+                self.set_window_fullscreen_state(&fullscreen_window, true);
+            }
+            if !is_mapped || needs_reposition {
+                self.space.map_element(fullscreen_window, out_geo.loc, true);
+            }
             return Ok(());
         }
 
@@ -328,10 +353,21 @@ impl Raven {
                 layout_geo.loc.x + geom.x_coordinate,
                 layout_geo.loc.y + geom.y_coordinate,
             ));
+            let desired_size = (geom.width as i32, geom.height as i32).into();
+            let current_location = self.space.element_location(&window);
+            let current_geometry = self
+                .space
+                .element_geometry(&window)
+                .unwrap_or_else(|| window.geometry());
+            let is_mapped = current_location.is_some();
+            let needs_resize = current_geometry.size != desired_size;
+            let needs_reposition = current_location != Some(loc);
 
-            if let Some(toplevel) = window.toplevel() {
+            if let Some(toplevel) = window.toplevel()
+                && (!is_mapped || needs_resize)
+            {
                 toplevel.with_pending_state(|state| {
-                    state.size = Some((geom.width as i32, geom.height as i32).into());
+                    state.size = Some(desired_size);
                     state.states.unset(xdg_toplevel::State::Fullscreen);
                     state.states.unset(xdg_toplevel::State::Maximized);
                     state.states.set(xdg_toplevel::State::TiledLeft);
@@ -342,7 +378,9 @@ impl Raven {
                 toplevel.send_pending_configure();
             }
 
-            self.space.map_element(window, loc, false);
+            if !is_mapped || needs_reposition {
+                self.space.map_element(window, loc, false);
+            }
         }
 
         Ok(())
@@ -446,7 +484,8 @@ impl Raven {
                 self.floating_windows.push(window.clone());
             }
         } else {
-            self.floating_windows.retain(|candidate| candidate != window);
+            self.floating_windows
+                .retain(|candidate| candidate != window);
         }
     }
 
@@ -531,10 +570,11 @@ impl Raven {
             pending.size = size;
             return;
         }
-        self.pending_interactive_resizes.push(PendingInteractiveResize {
-            window: window.clone(),
-            size,
-        });
+        self.pending_interactive_resizes
+            .push(PendingInteractiveResize {
+                window: window.clone(),
+                size,
+            });
     }
 
     pub fn clear_pending_interactive_resize(&mut self, window: &Window) {
@@ -545,7 +585,8 @@ impl Raven {
     pub fn flush_interactive_frame_updates(&mut self) {
         let pending_moves = std::mem::take(&mut self.pending_interactive_moves);
         for pending in pending_moves {
-            self.space.map_element(pending.window, pending.location, false);
+            self.space
+                .map_element(pending.window, pending.location, false);
         }
 
         let pending_resizes = std::mem::take(&mut self.pending_interactive_resizes);
@@ -626,10 +667,7 @@ impl Raven {
         false
     }
 
-    pub fn resolve_window_rules_for_surface(
-        &self,
-        surface: &WlSurface,
-    ) -> NewWindowRuleDecision {
+    pub fn resolve_window_rules_for_surface(&self, surface: &WlSurface) -> NewWindowRuleDecision {
         let (app_id, title) = Self::surface_app_id_and_title(surface);
 
         let mut decision = NewWindowRuleDecision {
@@ -756,7 +794,8 @@ impl Raven {
         }
 
         let decision = self.resolve_window_rules_for_surface(surface);
-        if let Err(err) = self.move_window_to_workspace_internal(&window, decision.workspace_index) {
+        if let Err(err) = self.move_window_to_workspace_internal(&window, decision.workspace_index)
+        {
             tracing::warn!("failed to move window after deferred rule resolution: {err}");
         }
         self.apply_window_rule_size_to_window(&window, &decision);
@@ -771,7 +810,7 @@ impl Raven {
         if decision.floating && self.is_window_mapped(&window) {
             let loc = self.initial_map_location_for_window(&window);
             // Re-center when metadata arrives and after first commit size settles.
-            // This mirrors niri-style "center in working area" behavior more closely.
+            // This centers in the working area after geometry settles.
             self.space.map_element(window.clone(), loc, !was_floating);
             self.queue_floating_recenter_for_surface(surface);
         }
@@ -963,6 +1002,14 @@ impl Raven {
     }
 
     pub fn set_keyboard_focus(&mut self, target: Option<WlSurface>, serial: Serial) {
+        let current_focus = self
+            .seat
+            .get_keyboard()
+            .and_then(|keyboard| keyboard.current_focus());
+        if current_focus.as_ref() == target.as_ref() {
+            return;
+        }
+
         let focused_window = target
             .as_ref()
             .and_then(|surface| self.window_for_surface(surface));
@@ -1008,7 +1055,8 @@ impl Raven {
         }
         self.fullscreen_windows
             .retain(|candidate| candidate != window);
-        self.floating_windows.retain(|candidate| candidate != window);
+        self.floating_windows
+            .retain(|candidate| candidate != window);
     }
 
     pub fn switch_workspace(&mut self, target_workspace: usize) -> Result<(), CompositorError> {
@@ -1158,25 +1206,107 @@ impl Raven {
         }
     }
 
+    fn apply_wayland_browser_spawn_overrides(&self, command: &str) -> String {
+        let trimmed = command.trim();
+        if trimmed.is_empty() {
+            return trimmed.to_owned();
+        }
+
+        let lower = trimmed.to_ascii_lowercase();
+        let Some(program) = Self::infer_command_program(trimmed) else {
+            return trimmed.to_owned();
+        };
+
+        let is_chromium_family = matches!(
+            program,
+            "brave"
+                | "brave-browser"
+                | "chromium"
+                | "chromium-browser"
+                | "google-chrome"
+                | "chrome"
+                | "microsoft-edge"
+        );
+
+        if !is_chromium_family {
+            return trimmed.to_owned();
+        }
+
+        let mut out = trimmed.to_owned();
+        if !lower.contains("--ozone-platform=") && !lower.contains("--ozone-platform-hint=") {
+            out.push_str(" --ozone-platform=wayland");
+        }
+
+        // Select Chromium sync mode based on compositor capability and env overrides.
+        if !lower.contains("waylandlinuxdrmsyncobj") {
+            if self.chromium_explicit_sync_enabled() {
+                out.push_str(" --enable-features=WaylandLinuxDrmSyncobj");
+            } else {
+                out.push_str(" --disable-features=WaylandLinuxDrmSyncobj");
+            }
+        }
+
+        out
+    }
+
+    fn chromium_explicit_sync_enabled(&self) -> bool {
+        let parse_bool = |name: &str| {
+            std::env::var_os(name).map(|value| {
+                let value = value.to_string_lossy().to_ascii_lowercase();
+                matches!(value.as_str(), "1" | "true" | "yes" | "on")
+            })
+        };
+
+        // Hard disable always wins.
+        if parse_bool("RAVEN_DISABLE_EXPLICIT_SYNC").unwrap_or(false)
+            || parse_bool("RAVEN_CHROMIUM_DISABLE_EXPLICIT_SYNC").unwrap_or(false)
+        {
+            return false;
+        }
+
+        // Explicit user override if provided.
+        if let Some(explicit) = parse_bool("RAVEN_CHROMIUM_EXPLICIT_SYNC") {
+            return explicit;
+        }
+
+        // Default to explicit sync only when the compositor exposed syncobj protocol.
+        self.syncobj_state.is_some()
+    }
+
     fn apply_wayland_child_env(&self, cmd: &mut Command) {
         cmd.env("WAYLAND_DISPLAY", &self.socket_name);
         if let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR") {
             cmd.env("XDG_RUNTIME_DIR", runtime_dir);
         }
         cmd.env("XDG_SESSION_TYPE", "wayland");
-        cmd.env("XDG_CURRENT_DESKTOP", "Raven");
-        cmd.env("XDG_SESSION_DESKTOP", "Raven");
+        cmd.env("XDG_CURRENT_DESKTOP", "raven");
+        cmd.env("XDG_SESSION_DESKTOP", "raven");
         cmd.env("MOZ_ENABLE_WAYLAND", "1");
         cmd.env("MOZ_DBUS_REMOTE", "0");
-        cmd.env("GDK_BACKEND", "wayland");
         cmd.env("QT_QPA_PLATFORM", "wayland");
         cmd.env("SDL_VIDEODRIVER", "wayland");
+        // Prefer native Wayland paths for Chromium/Electron apps on NixOS/NVIDIA.
+        cmd.env("NIXOS_OZONE_WL", "1");
+        cmd.env("OZONE_PLATFORM", "wayland");
+        cmd.env("OZONE_PLATFORM_HINT", "wayland");
+        cmd.env("ELECTRON_OZONE_PLATFORM_HINT", "wayland");
+        let chromium_sync_flags = if self.chromium_explicit_sync_enabled() {
+            "--enable-features=WaylandLinuxDrmSyncobj"
+        } else {
+            "--disable-features=WaylandLinuxDrmSyncobj"
+        };
+        cmd.env("CHROMIUM_FLAGS", chromium_sync_flags);
+        cmd.env("BRAVE_USER_FLAGS", chromium_sync_flags);
         if self.config.no_csd {
             cmd.env("QT_WAYLAND_DISABLE_WINDOWDECORATION", "1");
         } else {
             cmd.env_remove("QT_WAYLAND_DISABLE_WINDOWDECORATION");
         }
-        cmd.env_remove("DISPLAY");
+        if self.config.xwayland.enabled {
+            cmd.env("DISPLAY", self.config.xwayland.display.trim());
+        } else {
+            cmd.env_remove("DISPLAY");
+        }
         cmd.env_remove("HYPRLAND_INSTANCE_SIGNATURE");
         cmd.env_remove("HYPRLAND_CMD");
         cmd.env_remove("SWAYSOCK");
@@ -1185,18 +1315,31 @@ impl Raven {
         cmd.env_remove("SWWW_NAMESPACE");
     }
 
-    fn sync_activation_environment(&self) {
+    pub(crate) fn sync_activation_environment(&self) {
+        let chromium_sync_flags = if self.chromium_explicit_sync_enabled() {
+            "--enable-features=WaylandLinuxDrmSyncobj"
+        } else {
+            "--disable-features=WaylandLinuxDrmSyncobj"
+        };
         let mut env_kv = vec![
             format!("WAYLAND_DISPLAY={}", self.socket_name.to_string_lossy()),
-            "XDG_CURRENT_DESKTOP=Raven".to_owned(),
+            "XDG_CURRENT_DESKTOP=raven".to_owned(),
             "XDG_SESSION_TYPE=wayland".to_owned(),
-            "XDG_SESSION_DESKTOP=Raven".to_owned(),
-            "GDK_BACKEND=wayland".to_owned(),
-            "QT_QPA_PLATFORM=wayland".to_owned(),
-            "SDL_VIDEODRIVER=wayland".to_owned(),
-            "MOZ_ENABLE_WAYLAND=1".to_owned(),
-            "MOZ_DBUS_REMOTE=0".to_owned(),
+            "XDG_SESSION_DESKTOP=raven".to_owned(),
+            "GDK_BACKEND=".to_owned(),
+            "QT_QPA_PLATFORM=".to_owned(),
+            "SDL_VIDEODRIVER=".to_owned(),
+            "MOZ_ENABLE_WAYLAND=".to_owned(),
+            "MOZ_DBUS_REMOTE=".to_owned(),
+            format!("CHROMIUM_FLAGS={chromium_sync_flags}"),
+            format!("BRAVE_USER_FLAGS={chromium_sync_flags}"),
         ];
+
+        if self.config.xwayland.enabled {
+            env_kv.push(format!("DISPLAY={}", self.config.xwayland.display.trim()));
+        } else {
+            env_kv.push("DISPLAY=".to_owned());
+        }
 
         if self.config.no_csd {
             env_kv.push("QT_WAYLAND_DISABLE_WINDOWDECORATION=1".to_owned());
@@ -1226,39 +1369,96 @@ impl Raven {
             }
         }
 
-        let mut import_vars = vec![
-            "WAYLAND_DISPLAY".to_owned(),
-            "XDG_CURRENT_DESKTOP".to_owned(),
-            "XDG_SESSION_TYPE".to_owned(),
-            "XDG_SESSION_DESKTOP".to_owned(),
-            "GDK_BACKEND".to_owned(),
-            "QT_QPA_PLATFORM".to_owned(),
-            "SDL_VIDEODRIVER".to_owned(),
-            "MOZ_ENABLE_WAYLAND".to_owned(),
-            "MOZ_DBUS_REMOTE".to_owned(),
-            "QT_WAYLAND_DISABLE_WINDOWDECORATION".to_owned(),
+        let mut systemd_env_kv = vec![
+            format!("WAYLAND_DISPLAY={}", self.socket_name.to_string_lossy()),
+            "XDG_CURRENT_DESKTOP=raven".to_owned(),
+            "XDG_SESSION_TYPE=wayland".to_owned(),
+            "XDG_SESSION_DESKTOP=raven".to_owned(),
+            format!("CHROMIUM_FLAGS={chromium_sync_flags}"),
+            format!("BRAVE_USER_FLAGS={chromium_sync_flags}"),
         ];
-        import_vars.dedup();
+        if self.config.xwayland.enabled {
+            systemd_env_kv.push(format!("DISPLAY={}", self.config.xwayland.display.trim()));
+        }
+        if self.config.no_csd {
+            systemd_env_kv.push("QT_WAYLAND_DISABLE_WINDOWDECORATION=1".to_owned());
+        } else {
+            systemd_env_kv.push("QT_WAYLAND_DISABLE_WINDOWDECORATION=".to_owned());
+        }
 
         match Command::new("systemctl")
             .arg("--user")
-            .arg("import-environment")
-            .args(&import_vars)
+            .arg("set-environment")
+            .args(&systemd_env_kv)
             .output()
         {
             Ok(output) if output.status.success() => {
-                tracing::info!("synced activation env via systemctl --user import-environment");
+                tracing::info!("synced activation env via systemctl --user set-environment");
             }
             Ok(output) => {
                 let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
                 tracing::warn!(
                     status = ?output.status.code(),
                     stderr,
-                    "failed to sync activation env via systemctl --user import-environment"
+                    "failed to sync activation env via systemctl --user set-environment"
                 );
             }
             Err(err) => {
-                tracing::warn!("failed to execute systemctl --user import-environment: {err}");
+                tracing::warn!("failed to execute systemctl --user set-environment: {err}");
+            }
+        }
+
+        match Command::new("systemctl")
+            .arg("--user")
+            .arg("unset-environment")
+            .args([
+                "GDK_BACKEND",
+                "QT_QPA_PLATFORM",
+                "SDL_VIDEODRIVER",
+                "MOZ_ENABLE_WAYLAND",
+                "MOZ_DBUS_REMOTE",
+            ])
+            .output()
+        {
+            Ok(output) if output.status.success() => {
+                tracing::info!("cleared portal-sensitive vars from systemctl --user environment");
+            }
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+                tracing::warn!(
+                    status = ?output.status.code(),
+                    stderr,
+                    "failed to clear vars via systemctl --user unset-environment"
+                );
+            }
+            Err(err) => {
+                tracing::warn!("failed to execute systemctl --user unset-environment: {err}");
+            }
+        }
+
+        if !self.config.xwayland.enabled {
+            match Command::new("systemctl")
+                .arg("--user")
+                .arg("unset-environment")
+                .arg("DISPLAY")
+                .output()
+            {
+                Ok(output) if output.status.success() => {
+                    tracing::info!("cleared DISPLAY from systemctl --user environment");
+                }
+                Ok(output) => {
+                    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+                    tracing::warn!(
+                        status = ?output.status.code(),
+                        stderr,
+                        "failed to clear DISPLAY via systemctl --user unset-environment"
+                    );
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        "failed to execute systemctl --user unset-environment DISPLAY: {err}"
+                    );
+                }
             }
         }
     }
@@ -1269,6 +1469,7 @@ impl Raven {
         }
 
         let command = self.apply_no_csd_spawn_overrides(command);
+        let command = self.apply_wayland_browser_spawn_overrides(&command);
         let mut cmd = Command::new("sh");
         cmd.arg("-c").arg(&command);
         self.apply_wayland_child_env(&mut cmd);
@@ -1284,9 +1485,13 @@ impl Raven {
             socket = ?self.socket_name,
             "running startup tasks"
         );
+        self.start_xwayland_satellite();
+        self.kick_portal_services_async();
         self.run_autostart_commands();
         self.ensure_waypaper_swww_daemon();
         self.apply_wallpaper();
+        // Make startup surfaces visible promptly without requiring input events.
+        crate::backend::udev::queue_redraw_all(self);
     }
 
     pub fn preferred_decoration_mode(&self) -> XdgDecorationMode {
@@ -1326,6 +1531,237 @@ impl Raven {
         }
     }
 
+    fn ensure_portal_preferences_file() {
+        let config_root = std::env::var_os("XDG_CONFIG_HOME")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .filter(|value| !value.is_empty())
+                    .map(|home| PathBuf::from(home).join(".config"))
+            });
+
+        let Some(config_root) = config_root else {
+            tracing::warn!("unable to resolve config directory for xdg-desktop-portal preferences");
+            return;
+        };
+
+        let portal_dir = config_root.join("xdg-desktop-portal");
+        let portal_conf = portal_dir.join("raven-portals.conf");
+
+        if portal_conf.exists() {
+            match fs::read_to_string(&portal_conf) {
+                Ok(existing) if existing.trim() == Self::legacy_portal_preferences().trim() => {
+                    if let Err(err) = fs::write(&portal_conf, Self::default_portal_preferences()) {
+                        tracing::warn!(
+                            path = %portal_conf.display(),
+                            "failed to migrate legacy portal preferences: {err}"
+                        );
+                    } else {
+                        tracing::info!(
+                            path = %portal_conf.display(),
+                            "migrated legacy portal preferences"
+                        );
+                    }
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    tracing::warn!(
+                        path = %portal_conf.display(),
+                        "failed to read existing portal preferences: {err}"
+                    );
+                }
+            }
+            return;
+        }
+
+        if let Err(err) = fs::create_dir_all(&portal_dir) {
+            tracing::warn!(
+                path = %portal_dir.display(),
+                "failed to create xdg-desktop-portal config directory: {err}"
+            );
+            return;
+        }
+
+        if let Err(err) = fs::write(&portal_conf, Self::default_portal_preferences()) {
+            tracing::warn!(
+                path = %portal_conf.display(),
+                "failed to write portal preferences file: {err}"
+            );
+            return;
+        }
+
+        tracing::info!(path = %portal_conf.display(), "created default portal preferences");
+    }
+
+    fn default_portal_preferences() -> &'static str {
+        "[preferred]\n\
+default=gtk;\n\
+org.freedesktop.impl.portal.Access=gtk;\n\
+org.freedesktop.impl.portal.Notification=gtk;\n\
+org.freedesktop.impl.portal.FileChooser=gtk;\n\
+org.freedesktop.impl.portal.Settings=gtk;\n\
+org.freedesktop.impl.portal.Secret=gnome-keyring;\n"
+    }
+
+    fn legacy_portal_preferences() -> &'static str {
+        "[preferred]\n\
+default=gnome;gtk;\n\
+org.freedesktop.impl.portal.Access=gtk;\n\
+org.freedesktop.impl.portal.Notification=gtk;\n\
+org.freedesktop.impl.portal.Secret=gnome-keyring;\n"
+    }
+
+    fn kick_portal_services_async(&self) {
+        thread::spawn(move || {
+            const CONFLICTING_UNITS: [&str; 3] = [
+                "xdg-desktop-portal-gnome.service",
+                "xdg-desktop-portal-hyprland.service",
+                "xdg-desktop-portal-kde.service",
+            ];
+            const UNITS: [&str; 3] = [
+                "xdg-desktop-portal-gtk.service",
+                "xdg-desktop-portal-wlr.service",
+                "xdg-desktop-portal.service",
+            ];
+
+            for unit in CONFLICTING_UNITS {
+                match Command::new("systemctl")
+                    .arg("--user")
+                    .arg("--no-block")
+                    .arg("stop")
+                    .arg(unit)
+                    .output()
+                {
+                    Ok(output) if output.status.success() => {
+                        tracing::info!(unit, "requested conflicting portal unit stop");
+                    }
+                    Ok(output) => {
+                        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+                        if !stderr.contains("not found") && !stderr.contains("not loaded") {
+                            tracing::warn!(
+                                unit,
+                                status = ?output.status.code(),
+                                stderr,
+                                "failed to stop conflicting portal unit"
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!("failed to execute systemctl --user stop for {unit}: {err}");
+                    }
+                }
+            }
+
+            for unit in UNITS {
+                match Command::new("systemctl")
+                    .arg("--user")
+                    .arg("restart")
+                    .arg(unit)
+                    .output()
+                {
+                    Ok(output)
+                        if output.status.success()
+                            || output.status.code() == Some(1)
+                                && String::from_utf8_lossy(&output.stderr)
+                                    .contains("Job type restart is not applicable") =>
+                    {
+                        tracing::info!(unit, "requested portal unit restart");
+                    }
+                    Ok(output) => {
+                        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+                        // Missing units are expected across different distros.
+                        if stderr.contains("Job type restart is not applicable") {
+                            match Command::new("systemctl")
+                                .arg("--user")
+                                .arg("--no-block")
+                                .arg("start")
+                                .arg(unit)
+                                .output()
+                            {
+                                Ok(start_output) if start_output.status.success() => {
+                                    tracing::info!(unit, "requested portal unit start");
+                                }
+                                Ok(start_output) => {
+                                    let start_stderr =
+                                        String::from_utf8_lossy(&start_output.stderr)
+                                            .trim()
+                                            .to_owned();
+                                    if !start_stderr.contains("not found")
+                                        && !start_stderr.contains("not loaded")
+                                    {
+                                        tracing::warn!(
+                                            unit,
+                                            status = ?start_output.status.code(),
+                                            stderr = start_stderr,
+                                            "failed to start portal unit"
+                                        );
+                                    }
+                                }
+                                Err(err) => {
+                                    tracing::warn!(
+                                        "failed to execute systemctl --user start for {unit}: {err}"
+                                    );
+                                }
+                            }
+                        } else if !stderr.contains("not found") && !stderr.contains("not loaded") {
+                            tracing::warn!(
+                                unit,
+                                status = ?output.status.code(),
+                                stderr,
+                                "failed to restart portal unit"
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            "failed to execute systemctl --user restart for {unit}: {err}"
+                        );
+                    }
+                }
+            }
+        });
+    }
+
+    fn start_xwayland_satellite(&self) {
+        if !self.config.xwayland.enabled {
+            return;
+        }
+
+        let path = self.config.xwayland.path.trim();
+        let x11_display_text = self.config.xwayland.display.trim();
+        if path.is_empty() || x11_display_text.is_empty() {
+            tracing::warn!("xwayland is enabled but xwayland.path or xwayland.display is empty");
+            return;
+        }
+
+        let mut cmd = Command::new(path);
+        cmd.arg(x11_display_text)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        self.apply_wayland_child_env(&mut cmd);
+        cmd.env_remove("RUST_BACKTRACE");
+        cmd.env_remove("RUST_LIB_BACKTRACE");
+
+        match cmd.spawn() {
+            Ok(_) => {
+                tracing::info!(
+                    path = path,
+                    x11_display = x11_display_text,
+                    "started xwayland-satellite"
+                );
+            }
+            Err(err) => {
+                tracing::warn!(
+                    path = path,
+                    x11_display = x11_display_text,
+                    "failed to start xwayland-satellite: {err}"
+                );
+            }
+        }
+    }
+
     fn ensure_waypaper_swww_daemon(&self) {
         let restore_command = self.config.wallpaper.restore_command.trim();
         if restore_command != "waypaper --restore" {
@@ -1358,8 +1794,8 @@ impl Raven {
             cmd.env("XDG_RUNTIME_DIR", runtime_dir);
         }
         cmd.env("XDG_SESSION_TYPE", "wayland");
-        cmd.env("XDG_CURRENT_DESKTOP", "Raven");
-        cmd.env("XDG_SESSION_DESKTOP", "Raven");
+        cmd.env("XDG_CURRENT_DESKTOP", "raven");
+        cmd.env("XDG_SESSION_DESKTOP", "raven");
         cmd.env_remove("DISPLAY");
         cmd.env_remove("HYPRLAND_INSTANCE_SIGNATURE");
         cmd.env_remove("HYPRLAND_CMD");
@@ -1736,6 +2172,10 @@ pub fn init_wayland_listener(
                 // Safety: we don't drop the display
                 unsafe {
                     display.get_mut().dispatch_clients(state).unwrap();
+                }
+                state.space.refresh();
+                if let Err(err) = state.display_handle.flush_clients() {
+                    tracing::warn!("failed to flush clients after dispatch: {err}");
                 }
                 Ok(PostAction::Continue)
             },

@@ -122,6 +122,9 @@ src/
 | Cursor theme reload on config change | Working |
 | VBlank-driven render loop | Working — 60% frame duration repaint delay |
 | No-damage reschedule | Working — prevents compositor stalling |
+| Per-output redraw queuing | Working — prevents excessive redraws on all outputs |
+| Early buffer import | Working — pre-imports GPU buffers at commit time |
+| Direct scanout | Working — allows fullscreen apps to bypass GPU compositing |
 | DmabufFeedback (per-surface) | Not yet |
 | Hardware cursor | Not yet |
 | Screencopy on DRM | Not yet |

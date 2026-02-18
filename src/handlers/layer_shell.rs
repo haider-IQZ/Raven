@@ -46,19 +46,27 @@ impl WlrLayerShellHandler for Raven {
         if let Err(err) = layer_map.map_layer(&layer_surface) {
             tracing::warn!("failed to map layer surface: {err:?}");
         }
+        // Only redraw the affected output, not all outputs
+        crate::backend::udev::queue_redraw_for_output(self, &output);
     }
 
     fn layer_destroyed(&mut self, surface: WlrLayerSurface) {
-        if let Some((mut map, layer)) = self.space.outputs().find_map(|output| {
-            let map = layer_map_for_output(output);
+        let mut output_to_redraw: Option<Output> = None;
+        for output in self.space.outputs() {
+            let mut map = layer_map_for_output(output);
             let layer = map
                 .layers()
                 .find(|layer| layer.layer_surface() == &surface)
                 .cloned();
-
-            layer.map(|layer| (map, layer))
-        }) {
-            map.unmap_layer(&layer);
+            if let Some(layer) = layer {
+                map.unmap_layer(&layer);
+                output_to_redraw = Some(output.clone());
+                break;
+            }
+        }
+        if let Some(output) = output_to_redraw {
+            // Only redraw the affected output
+            crate::backend::udev::queue_redraw_for_output(self, &output);
         }
     }
 
@@ -82,11 +90,14 @@ pub fn handle_commit(
 
     for output in space.outputs() {
         let mut layer_map = layer_map_for_output(output);
+        let prev_work_geo = layer_map.non_exclusive_zone();
         if let Some(layer) = layer_map
             .layer_for_surface(&root_surface, WindowSurfaceType::TOPLEVEL)
             .cloned()
         {
+            let prev_layer_geo = layer_map.layer_geometry(&layer);
             layer_map.arrange();
+            let next_work_geo = layer_map.non_exclusive_zone();
 
             let initial_configure_sent = compositor::with_states(&root_surface, |states| {
                 states
@@ -97,7 +108,10 @@ pub fn handle_commit(
             });
 
             let geometry = layer_map.layer_geometry(&layer);
-            tracing::debug!(
+            let relayout = !initial_configure_sent
+                || prev_work_geo != next_work_geo
+                || prev_layer_geo != geometry;
+            tracing::trace!(
                 namespace = layer.namespace(),
                 layer = ?layer.layer(),
                 initial_configure_sent,
@@ -106,7 +120,7 @@ pub fn handle_commit(
             );
 
             if !initial_configure_sent {
-                tracing::debug!(
+                tracing::trace!(
                     namespace = layer.namespace(),
                     "sending initial configure for layer"
                 );
@@ -134,14 +148,14 @@ pub fn handle_commit(
 
             if should_focus {
                 let namespace = layer.namespace();
-                tracing::debug!(
+                tracing::trace!(
                     namespace,
                     "focusing layer on commit because pointer is over it"
                 );
-                return (Some(layer.wl_surface().clone()), true);
+                return (Some(layer.wl_surface().clone()), relayout);
             }
 
-            return (None, true);
+            return (None, relayout);
         }
     }
 

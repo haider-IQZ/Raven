@@ -4,7 +4,8 @@ mod xdg_shell;
 
 use smithay::{
     backend::renderer::ImportDma,
-    delegate_data_device, delegate_dmabuf, delegate_fractional_scale, delegate_output,
+    delegate_data_device, delegate_dmabuf, delegate_drm_syncobj, delegate_fractional_scale,
+    delegate_output, delegate_presentation,
     delegate_primary_selection, delegate_seat, delegate_viewporter,
     desktop::layer_map_for_output,
     input::{
@@ -18,6 +19,7 @@ use smithay::{
     wayland::{
         compositor::with_states,
         dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier},
+        drm_syncobj::{DrmSyncobjHandler, DrmSyncobjState},
         fractional_scale::{FractionalScaleHandler, with_fractional_scale},
         output::OutputHandler,
         selection::{
@@ -345,3 +347,12 @@ impl DmabufHandler for Raven {
 }
 
 delegate_dmabuf!(Raven);
+
+impl DrmSyncobjHandler for Raven {
+    fn drm_syncobj_state(&mut self) -> Option<&mut DrmSyncobjState> {
+        self.syncobj_state.as_mut()
+    }
+}
+
+delegate_drm_syncobj!(Raven);
+delegate_presentation!(Raven);

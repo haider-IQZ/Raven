@@ -20,6 +20,7 @@ Project status: alpha.
 - Window rules (`class`/`app_id`/`title` match with workspace/floating/fullscreen/focus actions)
 - Per-output monitor configuration (mode, refresh, scale, transform, position, enable/disable)
 - Wallpaper restore flow (external command, default `waypaper --restore`) with optional legacy `swww` mode
+- Xwayland support via automatic `xwayland-satellite` startup (`DISPLAY` export for spawned apps)
 - `no_csd` mode with server decoration preference + environment/spawn overrides
 - Foreign toplevel management (`zwlr_foreign_toplevel_management_v1`)
 - Ext workspace protocol (`ext_workspace_v1`)
@@ -38,6 +39,12 @@ Run nested explicitly:
 cargo run -- --winit
 ```
 
+Force native DRM/KMS explicitly (even if a display environment variable is set):
+
+```bash
+cargo run -- --drm
+```
+
 Spawn an app on startup:
 
 ```bash
@@ -48,6 +55,14 @@ Debug logs:
 
 ```bash
 RUST_LOG=debug cargo run
+```
+
+Scanout tuning:
+- Default is conservative (`scanout` disabled) for stability on flicker-prone apps.
+- Re-enable scanout explicitly with:
+
+```bash
+RAVEN_ENABLE_SCANOUT=1 cargo run -- --drm
 ```
 
 ## Requirements (non-Nix)
@@ -62,6 +77,10 @@ If you are not using `nix develop`, Raven expects at minimum:
 - Raven auto-selects backend:
   - Uses Winit when `WAYLAND_DISPLAY` or `DISPLAY` is present.
   - Uses DRM/KMS when running from a bare TTY.
+- Raven exports `XDG_CURRENT_DESKTOP=raven` and `XDG_SESSION_DESKTOP=raven`.
+- Raven can auto-start `xwayland-satellite` and export `DISPLAY` for X11 apps.
+- Raven auto-creates `~/.config/xdg-desktop-portal/raven-portals.conf` if missing (GTK-first defaults; legacy Raven portal config is auto-migrated).
+- Raven auto-starts available portal units (`xdg-desktop-portal*`) in non-blocking mode at startup.
 - Logs are written to `log/raven.log`.
 - `swww-daemon` output is written to `log/swww-daemon.log` (when used).
 
@@ -115,6 +134,12 @@ return {
 
   autostart = { "waybar", "mako" },
 
+  xwayland = {
+    enabled = true,
+    path = "xwayland-satellite",
+    display = ":0",
+  },
+
   wallpaper = {
     enabled = false,
     restore_command = "waypaper --restore",
@@ -125,7 +150,7 @@ return {
 ### Supported Config Shapes
 
 - Structured Lua style:
-  - `general`, `keybindings`, `monitors`, `autostart`, `wallpaper`
+  - `general`, `keybindings`, `monitors`, `autostart`, `xwayland`, `wallpaper`
 - String keybind list style:
   - `keybinds = { "Super+X exec firefox", ... }`
 - Function helper style:
@@ -185,6 +210,12 @@ Parsed but currently unimplemented:
 - Recommended mode: set `wallpaper.restore_command` (default `waypaper --restore`).
 - Legacy mode: set `restore_command = ""` and provide `image`, `resize`, `transition_type`, `transition_duration`.
 - Requires the corresponding external tools in `PATH` (`waypaper`, or `swww`/`swww-daemon` for legacy mode).
+
+## Xwayland Notes
+
+- Install `xwayland-satellite` and keep `xwayland.enabled = true`.
+- Raven starts it automatically on startup and exports `DISPLAY` to spawned apps.
+- Configure custom binary path or display with `xwayland.path` and `xwayland.display`.
 
 ## Limitations
 

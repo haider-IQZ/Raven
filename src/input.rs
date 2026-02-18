@@ -28,6 +28,21 @@ use smithay::{
 };
 
 impl Raven {
+    fn queue_pointer_redraw_throttled(&mut self, event_time_msec: u32) {
+        // Avoid flooding redraw requests during high-rate mouse motion.
+        // 8ms ~= 125 FPS, good enough for cursor smoothness while reducing stalls.
+        const POINTER_REDRAW_MIN_DELTA_MS: u32 = 8;
+        let should_redraw = self
+            .last_pointer_redraw_msec
+            .map(|last| event_time_msec.wrapping_sub(last) >= POINTER_REDRAW_MIN_DELTA_MS)
+            .unwrap_or(true);
+
+        if should_redraw {
+            self.last_pointer_redraw_msec = Some(event_time_msec);
+            crate::backend::udev::queue_redraw_all(self);
+        }
+    }
+
     pub fn handle_input_event<B: InputBackend>(&mut self, event: InputEvent<B>) {
         match event {
             InputEvent::Keyboard { event } => self.handle_keyboard_event::<B>(event),
@@ -72,6 +87,7 @@ impl Raven {
                 keyboard.input::<(), _>(self, key_code, key_state, serial, time_msec, |_, _, _| {
                     FilterResult::Forward
                 });
+                crate::backend::udev::queue_redraw_all(self);
                 return;
             }
         }
@@ -92,6 +108,8 @@ impl Raven {
                 FilterResult::Forward
             },
         );
+
+        self.queue_pointer_redraw_throttled(event.time_msec());
     }
 
     fn handle_pointer_motion<B: InputBackend>(&mut self, event: B::PointerMotionEvent) {
@@ -118,6 +136,8 @@ impl Raven {
         if self.config.focus_follow_mouse {
             self.update_keyboard_focus(self.pointer_location, serial, false);
         }
+
+        self.queue_pointer_redraw_throttled(event.time_msec());
     }
 
     fn handle_pointer_motion_absolute<B: InputBackend>(
@@ -156,6 +176,8 @@ impl Raven {
         if self.config.focus_follow_mouse {
             self.update_keyboard_focus(self.pointer_location, serial, false);
         }
+
+        crate::backend::udev::queue_redraw_all(self);
     }
 
     fn handle_pointer_button<B: InputBackend>(&mut self, event: B::PointerButtonEvent) {
@@ -228,7 +250,8 @@ impl Raven {
                 location,
             };
             let initial_window_rect = Rectangle::new(window_location, window_size);
-            let grab = ResizeSurfaceGrab::start(start_data, window.clone(), edges, initial_window_rect);
+            let grab =
+                ResizeSurfaceGrab::start(start_data, window.clone(), edges, initial_window_rect);
             pointer.set_grab(self, grab, serial, Focus::Clear);
             self.space.raise_element(&window, true);
         }
@@ -247,6 +270,8 @@ impl Raven {
             },
         );
         pointer.frame(self);
+
+        crate::backend::udev::queue_redraw_all(self);
     }
 
     fn update_keyboard_focus(
@@ -317,7 +342,7 @@ impl Raven {
                 .element_under(location)
                 .map(|(w, p)| (w.clone(), p))
             {
-                tracing::debug!("Setting focus of surface under pointer");
+                tracing::trace!("Setting focus of surface under pointer");
                 if raise {
                     self.space.raise_element(&window, true);
                 }
@@ -402,6 +427,8 @@ impl Raven {
 
         pointer.axis(self, axis_frame);
         pointer.frame(self);
+
+        crate::backend::udev::queue_redraw_all(self);
     }
 
     fn clamp_pointer_location(&mut self) {
@@ -524,7 +551,11 @@ fn workspace_from_keysym(keysym: Keysym) -> Option<usize> {
     }
 }
 
-fn resize_edges_from_local_point(local: Point<f64, Logical>, width: i32, height: i32) -> ResizeEdge {
+fn resize_edges_from_local_point(
+    local: Point<f64, Logical>,
+    width: i32,
+    height: i32,
+) -> ResizeEdge {
     let width = width.max(1) as f64;
     let height = height.max(1) as f64;
 

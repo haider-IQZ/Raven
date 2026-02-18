@@ -40,8 +40,15 @@ fn main() -> Result<()> {
     let mut state = Raven::new(display, event_loop.handle(), event_loop.get_signal())?;
 
     let force_winit = args.iter().any(|a| a == "--winit");
+    let force_drm = args.iter().any(|a| a == "--drm" || a == "--tty");
 
-    if force_winit || is_nested() {
+    if force_winit && force_drm {
+        return Err(CompositorError::Backend(
+            "cannot pass both --winit and --drm/--tty".to_owned(),
+        ));
+    }
+
+    if force_winit || (!force_drm && is_nested()) {
         tracing::info!("Starting with Winit backend");
         raven::backend::winit::init_winit(&mut event_loop, &mut state)?;
     } else {
@@ -68,8 +75,25 @@ fn main() -> Result<()> {
         state.spawn_command(cmd);
     }
 
+    // Present any redraws queued during backend initialization before entering the loop.
+    raven::backend::udev::drain_queued_redraws(&mut state);
+
     event_loop
-        .run(None, &mut state, |_| {})
+        .run(None, &mut state, |state| {
+            // Refresh compositor state before rendering: clean up dead surfaces,
+            // stale popup grabs, etc.
+            state.space.refresh();
+            state.popups.cleanup();
+
+            raven::backend::udev::drain_queued_redraws(state);
+
+            // Flush protocol messages to clients.  Without this, frame callbacks,
+            // configure events, and other protocol traffic pile up and get burst-
+            // delivered, causing clients like Brave to stutter.
+            if let Err(err) = state.display_handle.flush_clients() {
+                tracing::warn!("failed to flush clients: {err}");
+            }
+        })
         .map_err(|e| CompositorError::EventLoop(e.to_string()))?;
 
     Ok(())
@@ -164,7 +188,13 @@ fn is_nested() -> bool {
     std::env::var("WAYLAND_DISPLAY").is_ok() || std::env::var("DISPLAY").is_ok()
 }
 
-const DEFAULT_LOG_FILTER: &str = "raven=debug,smithay::backend::renderer::gles=error";
+const DEFAULT_LOG_FILTER: &str = concat!(
+    "raven=debug,",
+    "raven::backend::udev=trace,",
+    "raven::handlers=debug,",
+    "smithay::backend::drm=debug,",
+    "smithay::backend::renderer::gles=error"
+);
 
 fn init_logging() -> Result<()> {
     let log_dir: PathBuf = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("log");

@@ -31,6 +31,7 @@ pub struct RuntimeConfig {
     pub monitors: Vec<MonitorConfig>,
     pub window_rules: Vec<WindowRule>,
     pub wallpaper: WallpaperConfig,
+    pub xwayland: XwaylandConfig,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -78,6 +79,13 @@ pub struct WallpaperConfig {
 }
 
 #[derive(Clone, Debug)]
+pub struct XwaylandConfig {
+    pub enabled: bool,
+    pub path: String,
+    pub display: String,
+}
+
+#[derive(Clone, Debug)]
 pub struct MonitorConfig {
     pub name: String,
     pub enabled: bool,
@@ -115,6 +123,16 @@ impl Default for WallpaperConfig {
             resize: "crop".to_owned(),
             transition_type: "simple".to_owned(),
             transition_duration: 0.7,
+        }
+    }
+}
+
+impl Default for XwaylandConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            path: "xwayland-satellite".to_owned(),
+            display: ":0".to_owned(),
         }
     }
 }
@@ -158,6 +176,7 @@ impl Default for RuntimeConfig {
             monitors: Vec::new(),
             window_rules: Vec::new(),
             wallpaper: WallpaperConfig::default(),
+            xwayland: XwaylandConfig::default(),
         }
     }
 }
@@ -399,6 +418,33 @@ pub fn load_from_path(path: &Path) -> Result<RuntimeConfig, CompositorError> {
         ));
     }
 
+    config.xwayland.enabled =
+        parse_bool_flexible(&values, "xwayland.enabled", config.xwayland.enabled)?;
+    if let Some(value) = values
+        .get("xwayland.path")
+        .or_else(|| values.get("xwayland_path"))
+    {
+        config.xwayland.path = value.clone();
+    }
+    if let Some(value) = values
+        .get("xwayland.display")
+        .or_else(|| values.get("xwayland_display"))
+    {
+        config.xwayland.display = value.clone();
+    }
+    if config.xwayland.enabled {
+        if config.xwayland.path.trim().is_empty() {
+            return Err(CompositorError::Backend(
+                "xwayland.enabled is true but xwayland.path is empty".to_owned(),
+            ));
+        }
+        if config.xwayland.display.trim().is_empty() {
+            return Err(CompositorError::Backend(
+                "xwayland.enabled is true but xwayland.display is empty".to_owned(),
+            ));
+        }
+    }
+
     config.monitors = parse_monitor_configs(&values)?;
     config.window_rules = parse_window_rules(&values)?;
 
@@ -421,9 +467,8 @@ pub fn apply_environment(config: &RuntimeConfig) {
         std::env::set_var("XCURSOR_THEME", &config.cursor_theme);
         std::env::set_var("XCURSOR_SIZE", config.cursor_size.to_string());
         std::env::set_var("XDG_SESSION_TYPE", "wayland");
-        std::env::set_var("XDG_CURRENT_DESKTOP", "Raven");
-        std::env::set_var("XDG_SESSION_DESKTOP", "Raven");
-        std::env::set_var("GDK_BACKEND", "wayland");
+        std::env::set_var("XDG_CURRENT_DESKTOP", "raven");
+        std::env::set_var("XDG_SESSION_DESKTOP", "raven");
         std::env::set_var("QT_QPA_PLATFORM", "wayland");
         std::env::set_var("SDL_VIDEODRIVER", "wayland");
         std::env::set_var("MOZ_ENABLE_WAYLAND", "1");
@@ -1664,6 +1709,12 @@ return {
     -- { class = "mpv", floating = true, width = 1280, height = 720 },
   },
 
+  xwayland = {
+    enabled = true,
+    path = "xwayland-satellite",
+    display = ":0",
+  },
+
   autostart = {
     "waybar",
     "mako",
@@ -2018,6 +2069,7 @@ expect_table("layout", cfg.layout)
 expect_table("gaps", cfg.gaps)
 expect_table("cursor", cfg.cursor)
 expect_table("wallpaper", cfg.wallpaper)
+expect_table("xwayland", cfg.xwayland)
 
 local layout = cfg.layout or {}
 local gaps = pick(layout.gaps, cfg.gaps)
@@ -2044,5 +2096,18 @@ emit_string("wallpaper.image", pick(wallpaper.image, pick(wallpaper.path, cfg.wa
 emit_string("wallpaper.resize", pick(wallpaper.resize, cfg.wallpaper_resize))
 emit_string("wallpaper.transition_type", pick(wallpaper.transition_type, cfg.wallpaper_transition_type))
 emit_number("wallpaper.transition_duration", pick(wallpaper.transition_duration, cfg.wallpaper_transition_duration))
+
+local xwayland = cfg.xwayland or {}
+local xwayland_enabled = pick(xwayland.enabled, pick(cfg.xwayland_enabled, _G.xwayland_enabled))
+if xwayland_enabled == nil and xwayland.off ~= nil then
+  if type(xwayland.off) ~= "boolean" then
+    io.stderr:write("xwayland.off must be a boolean\n")
+    os.exit(1)
+  end
+  xwayland_enabled = not xwayland.off
+end
+emit_bool_like("xwayland.enabled", xwayland_enabled)
+emit_string("xwayland.path", pick(xwayland.path, pick(cfg.xwayland_path, _G.xwayland_path)))
+emit_string("xwayland.display", pick(xwayland.display, pick(cfg.xwayland_display, _G.xwayland_display)))
 "#
 }

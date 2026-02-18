@@ -260,7 +260,7 @@ impl XdgDecorationHandler for Raven {
     }
 
     fn request_mode(&mut self, toplevel: ToplevelSurface, mode: DecorationMode) {
-        // Match niri behavior: honor the client request here to avoid
+        // Honor the client request here to avoid
         // client creation edge-cases caused by forcing a different mode
         // during the initial negotiation.
         tracing::debug!(
@@ -316,7 +316,7 @@ impl KdeDecorationHandler for Raven {
             return;
         };
         tracing::debug!(?mode, "kde_decoration: client requested mode");
-        // Match niri behavior and keep protocol negotiation simple: echo
+        // Keep protocol negotiation simple: echo
         // the requested mode.
         decoration.mode(mode);
     }
@@ -408,9 +408,16 @@ impl Raven {
             return;
         };
 
-        let output = self.space.outputs().next().unwrap();
-        let output_geo = self.space.output_geometry(output).unwrap();
-        let window_geo = self.space.element_geometry(&window).unwrap();
+        let Some(output) = self.space.outputs().next() else {
+            return;
+        };
+        let Some(output_geo) = self.space.output_geometry(output) else {
+            return;
+        };
+        let window_geo = self
+            .space
+            .element_geometry(&window)
+            .unwrap_or_else(|| window.geometry());
 
         // The target geometry for the positioner should be relative to its parent's geometry, so
         // we will compute that here.

@@ -8,7 +8,9 @@ mod handlers;
 pub mod input;
 pub mod layout;
 pub mod protocols;
+pub mod render_helpers;
 pub mod state;
+pub mod vblank_throttle;
 
 pub use errors::{CompositorError, Result};
 pub use state::Raven;
