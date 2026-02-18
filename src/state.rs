@@ -44,7 +44,7 @@ use std::{
     fs::OpenOptions,
     io::{Read, Write},
     os::unix::net::{UnixListener, UnixStream},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
         Arc,
@@ -129,8 +129,10 @@ pub struct Raven {
     pub current_workspace: usize,
     pub workspaces: Vec<Vec<Window>>,
     pub fullscreen_windows: Vec<Window>,
-    pub fullscreen_ready_surface_ids: HashSet<u32>,
-    pub fullscreen_transition_redraw_outputs: HashMap<String, u8>,
+    // Root surfaces that have committed a fullscreen-sized buffer.
+    ready_fullscreen_surfaces: HashSet<u32>,
+    // Remaining redraw budget for fullscreen transitions per output name.
+    fullscreen_transition_redraw_by_output: HashMap<String, u8>,
     pub floating_windows: Vec<Window>,
     pub pending_floating_recenter_ids: HashSet<u32>,
     pub pending_window_rule_recheck_ids: HashSet<u32>,
@@ -147,6 +149,8 @@ pub struct Raven {
 
 impl Raven {
     const SWWW_NAMESPACE: &'static str = "raven";
+    const FULLSCREEN_READY_TOLERANCE: i32 = 2;
+    const FULLSCREEN_TRANSITION_REDRAW_FRAMES: u8 = 4;
 
     pub fn new(
         display: Display<Self>,
@@ -213,7 +217,7 @@ impl Raven {
         let loaded_config = config::load_or_create_default()?;
         config::apply_environment(&loaded_config.config);
 
-        let state = Self {
+        let mut state = Self {
             display_handle,
             loop_handle,
             loop_signal,
@@ -252,8 +256,8 @@ impl Raven {
             current_workspace: 0,
             workspaces: vec![Vec::new(); WORKSPACE_COUNT],
             fullscreen_windows: Vec::new(),
-            fullscreen_ready_surface_ids: HashSet::new(),
-            fullscreen_transition_redraw_outputs: HashMap::new(),
+            ready_fullscreen_surfaces: HashSet::new(),
+            fullscreen_transition_redraw_by_output: HashMap::new(),
             floating_windows: Vec::new(),
             pending_floating_recenter_ids: HashSet::new(),
             pending_window_rule_recheck_ids: HashSet::new(),
@@ -268,6 +272,7 @@ impl Raven {
         };
 
         Self::ensure_portal_preferences_file();
+        state.ensure_xwayland_display();
         state.sync_activation_environment();
 
         Ok(state)
@@ -537,7 +542,7 @@ impl Raven {
         let Some(surface_id) = Self::window_surface_id(window) else {
             return false;
         };
-        self.fullscreen_ready_surface_ids.contains(&surface_id)
+        self.ready_fullscreen_surfaces.contains(&surface_id)
             && self
                 .space
                 .outputs_for_element(window)
@@ -564,9 +569,9 @@ impl Raven {
             .space
             .element_geometry(&window)
             .unwrap_or_else(|| window.geometry());
-        const FULLSCREEN_READY_TOLERANCE: i32 = 2;
-        let fullscreen_sized = window_geo.size.w + FULLSCREEN_READY_TOLERANCE >= output_geo.size.w
-            && window_geo.size.h + FULLSCREEN_READY_TOLERANCE >= output_geo.size.h;
+        let fullscreen_sized =
+            window_geo.size.w + Self::FULLSCREEN_READY_TOLERANCE >= output_geo.size.w
+                && window_geo.size.h + Self::FULLSCREEN_READY_TOLERANCE >= output_geo.size.h;
         let surface_buffer_sized = with_states(surface, |states| {
             states
                 .data_map
@@ -574,43 +579,35 @@ impl Raven {
                 .and_then(|data| data.lock().ok())
                 .and_then(|data| data.buffer_size())
                 .is_some_and(|size| {
-                    size.w + FULLSCREEN_READY_TOLERANCE >= output_geo.size.w
-                        && size.h + FULLSCREEN_READY_TOLERANCE >= output_geo.size.h
+                    size.w + Self::FULLSCREEN_READY_TOLERANCE >= output_geo.size.w
+                        && size.h + Self::FULLSCREEN_READY_TOLERANCE >= output_geo.size.h
                 })
         });
 
-        let is_committed_fullscreen = window.toplevel().is_some_and(|toplevel| {
-            toplevel.with_committed_state(|state| {
-                state
-                    .as_ref()
-                    .is_some_and(|state| state.states.contains(xdg_toplevel::State::Fullscreen))
-            })
-        });
-
-        if !is_committed_fullscreen || !fullscreen_sized || !surface_buffer_sized {
-            self.fullscreen_ready_surface_ids.remove(&surface_id);
+        if !Self::window_is_committed_fullscreen(&window)
+            || !fullscreen_sized
+            || !surface_buffer_sized
+        {
+            self.ready_fullscreen_surfaces.remove(&surface_id);
             return;
         }
 
-        if self.fullscreen_ready_surface_ids.contains(&surface_id) {
+        if !self.ready_fullscreen_surfaces.insert(surface_id) {
             return;
         }
 
-        let became_ready = self.fullscreen_ready_surface_ids.insert(surface_id);
-        if became_ready {
-            if self.space.element_location(&window) != Some(output_geo.loc) {
-                self.space.map_element(window.clone(), output_geo.loc, true);
-            }
-            self.mark_fullscreen_transition_redraw_for_window(&window);
+        if self.space.element_location(&window) != Some(output_geo.loc) {
+            self.space.map_element(window.clone(), output_geo.loc, true);
         }
+        self.mark_fullscreen_transition_redraw_for_window(&window);
     }
 
     pub fn clear_fullscreen_ready_for_window(&mut self, window: &Window) {
         if let Some(surface_id) = Self::window_surface_id(window) {
-            self.fullscreen_ready_surface_ids.remove(&surface_id);
+            self.ready_fullscreen_surfaces.remove(&surface_id);
         }
         for output in self.space.outputs_for_element(window) {
-            self.fullscreen_transition_redraw_outputs
+            self.fullscreen_transition_redraw_by_output
                 .remove(&output.name());
         }
     }
@@ -620,21 +617,46 @@ impl Raven {
         output: &smithay::output::Output,
     ) -> bool {
         let key = output.name();
-        let Some(frames_left) = self.fullscreen_transition_redraw_outputs.get_mut(&key) else {
+        let Some(redraw_budget) = self.fullscreen_transition_redraw_by_output.get_mut(&key) else {
             return false;
         };
 
-        let should_redraw = *frames_left > 0;
-        if *frames_left <= 1 {
-            self.fullscreen_transition_redraw_outputs.remove(&key);
+        let should_redraw = *redraw_budget > 0;
+        if *redraw_budget <= 1 {
+            self.fullscreen_transition_redraw_by_output.remove(&key);
         } else {
-            *frames_left -= 1;
+            *redraw_budget -= 1;
         }
         should_redraw
     }
 
-    pub fn queue_fullscreen_transition_redraw_for_window(&mut self, window: &Window) {
+    pub fn enter_fullscreen_window(&mut self, window: &Window) -> bool {
+        if self.fullscreen_windows.contains(window) {
+            return false;
+        }
+
+        let previous_fullscreen_windows = std::mem::take(&mut self.fullscreen_windows);
+        for fullscreen_window in &previous_fullscreen_windows {
+            self.clear_fullscreen_ready_for_window(fullscreen_window);
+            self.set_window_fullscreen_state(fullscreen_window, false);
+        }
+
+        self.fullscreen_windows.push(window.clone());
+        self.clear_fullscreen_ready_for_window(window);
+        self.set_window_fullscreen_state(window, true);
         self.mark_fullscreen_transition_redraw_for_window(window);
+        true
+    }
+
+    pub fn exit_fullscreen_window(&mut self, window: &Window) -> bool {
+        if !self.fullscreen_windows.contains(window) {
+            return false;
+        }
+
+        self.fullscreen_windows.retain(|candidate| candidate != window);
+        self.clear_fullscreen_ready_for_window(window);
+        self.set_window_fullscreen_state(window, false);
+        true
     }
 
     fn window_surface_id(window: &Window) -> Option<u32> {
@@ -643,8 +665,17 @@ impl Raven {
             .map(|toplevel| toplevel.wl_surface().id().protocol_id())
     }
 
+    fn window_is_committed_fullscreen(window: &Window) -> bool {
+        window.toplevel().is_some_and(|toplevel| {
+            toplevel.with_committed_state(|state| {
+                state
+                    .as_ref()
+                    .is_some_and(|state| state.states.contains(xdg_toplevel::State::Fullscreen))
+            })
+        })
+    }
+
     fn mark_fullscreen_transition_redraw_for_window(&mut self, window: &Window) {
-        const FULLSCREEN_TRANSITION_REDRAW_FRAMES: u8 = 4;
         let mut outputs = self.space.outputs_for_element(window);
         if outputs.is_empty() {
             // During some transitions the window/output mapping can lag by a commit.
@@ -653,12 +684,12 @@ impl Raven {
         }
         for output in outputs {
             let key = output.name();
-            self.fullscreen_transition_redraw_outputs
+            self.fullscreen_transition_redraw_by_output
                 .entry(key)
                 .and_modify(|frames| {
-                    *frames = (*frames).max(FULLSCREEN_TRANSITION_REDRAW_FRAMES);
+                    *frames = (*frames).max(Self::FULLSCREEN_TRANSITION_REDRAW_FRAMES);
                 })
-                .or_insert(FULLSCREEN_TRANSITION_REDRAW_FRAMES);
+                .or_insert(Self::FULLSCREEN_TRANSITION_REDRAW_FRAMES);
         }
     }
 
@@ -984,17 +1015,8 @@ impl Raven {
             self.queue_floating_recenter_for_surface(surface);
         }
 
-        if decision.fullscreen && !self.fullscreen_windows.contains(&window) {
-            let existing = self.fullscreen_windows.clone();
-            for fullscreen_window in &existing {
-                self.clear_fullscreen_ready_for_window(fullscreen_window);
-                self.set_window_fullscreen_state(fullscreen_window, false);
-            }
-            self.fullscreen_windows.clear();
-            self.fullscreen_windows.push(window.clone());
-            self.clear_fullscreen_ready_for_window(&window);
-            self.set_window_fullscreen_state(&window, true);
-            self.queue_fullscreen_transition_redraw_for_window(&window);
+        if decision.fullscreen {
+            self.enter_fullscreen_window(&window);
         }
 
         if let Err(err) = self.apply_layout() {
@@ -1475,8 +1497,9 @@ impl Raven {
         } else {
             cmd.env_remove("QT_WAYLAND_DISABLE_WINDOWDECORATION");
         }
-        if self.config.xwayland.enabled {
-            cmd.env("DISPLAY", self.config.xwayland.display.trim());
+        let xwayland_display = self.config.xwayland.display.trim();
+        if self.config.xwayland.enabled && !xwayland_display.is_empty() {
+            cmd.env("DISPLAY", xwayland_display);
         } else {
             cmd.env_remove("DISPLAY");
         }
@@ -1508,8 +1531,9 @@ impl Raven {
             format!("BRAVE_USER_FLAGS={chromium_sync_flags}"),
         ];
 
-        if self.config.xwayland.enabled {
-            env_kv.push(format!("DISPLAY={}", self.config.xwayland.display.trim()));
+        let xwayland_display = self.config.xwayland.display.trim();
+        if self.config.xwayland.enabled && !xwayland_display.is_empty() {
+            env_kv.push(format!("DISPLAY={xwayland_display}"));
         } else {
             env_kv.push("DISPLAY=".to_owned());
         }
@@ -1550,8 +1574,8 @@ impl Raven {
             format!("CHROMIUM_FLAGS={chromium_sync_flags}"),
             format!("BRAVE_USER_FLAGS={chromium_sync_flags}"),
         ];
-        if self.config.xwayland.enabled {
-            systemd_env_kv.push(format!("DISPLAY={}", self.config.xwayland.display.trim()));
+        if self.config.xwayland.enabled && !xwayland_display.is_empty() {
+            systemd_env_kv.push(format!("DISPLAY={xwayland_display}"));
         }
         if self.config.no_csd {
             systemd_env_kv.push("QT_WAYLAND_DISABLE_WINDOWDECORATION=1".to_owned());
@@ -1609,7 +1633,7 @@ impl Raven {
             }
         }
 
-        if !self.config.xwayland.enabled {
+        if !self.config.xwayland.enabled || xwayland_display.is_empty() {
             match Command::new("systemctl")
                 .arg("--user")
                 .arg("unset-environment")
@@ -1658,6 +1682,9 @@ impl Raven {
             socket = ?self.socket_name,
             "running startup tasks"
         );
+        if self.ensure_xwayland_display() {
+            self.sync_activation_environment();
+        }
         self.start_xwayland_satellite();
         self.kick_portal_services_async();
         self.run_autostart_commands();
@@ -1894,6 +1921,38 @@ org.freedesktop.impl.portal.Secret=gnome-keyring;\n"
                 }
             }
         });
+    }
+
+    fn ensure_xwayland_display(&mut self) -> bool {
+        if !self.config.xwayland.enabled {
+            return false;
+        }
+        if !self.config.xwayland.display.trim().is_empty() {
+            return false;
+        }
+
+        let Some(selected_display) = Self::find_free_x11_display() else {
+            tracing::warn!("xwayland.display is unset and no free X11 DISPLAY was found");
+            return false;
+        };
+
+        self.config.xwayland.display = selected_display.clone();
+        tracing::info!(
+            x11_display = %selected_display,
+            "selected automatic Xwayland DISPLAY"
+        );
+        true
+    }
+
+    fn find_free_x11_display() -> Option<String> {
+        for display_num in 0..100 {
+            let socket_path = format!("/tmp/.X11-unix/X{display_num}");
+            let lock_path = format!("/tmp/.X{display_num}-lock");
+            if !Path::new(&socket_path).exists() && !Path::new(&lock_path).exists() {
+                return Some(format!(":{display_num}"));
+            }
+        }
+        None
     }
 
     fn start_xwayland_satellite(&self) {
@@ -2206,6 +2265,7 @@ org.freedesktop.impl.portal.Secret=gnome-keyring;\n"
         let config = config::load_from_path(&self.config_path)?;
         config::apply_environment(&config);
         self.config = config;
+        self.ensure_xwayland_display();
         self.sync_activation_environment();
         self.apply_decoration_preferences();
 
@@ -2230,26 +2290,13 @@ org.freedesktop.impl.portal.Secret=gnome-keyring;\n"
             return Ok(());
         };
 
-        if self.fullscreen_windows.contains(&window) {
-            self.fullscreen_windows
-                .retain(|candidate| candidate != &window);
-            self.clear_fullscreen_ready_for_window(&window);
-            self.set_window_fullscreen_state(&window, false);
+        if self.exit_fullscreen_window(&window) {
             return self.apply_layout();
         }
 
-        let previous_fullscreen_windows = self.fullscreen_windows.clone();
-        for fullscreen_window in &previous_fullscreen_windows {
-            self.clear_fullscreen_ready_for_window(fullscreen_window);
-            self.set_window_fullscreen_state(fullscreen_window, false);
+        if self.enter_fullscreen_window(&window) {
+            self.space.raise_element(&window, true);
         }
-
-        self.fullscreen_windows.clear();
-        self.fullscreen_windows.push(window.clone());
-        self.clear_fullscreen_ready_for_window(&window);
-        self.set_window_fullscreen_state(&window, true);
-        self.queue_fullscreen_transition_redraw_for_window(&window);
-        self.space.raise_element(&window, true);
 
         self.apply_layout()
     }

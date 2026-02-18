@@ -132,7 +132,8 @@ impl Default for XwaylandConfig {
         Self {
             enabled: true,
             path: "xwayland-satellite".to_owned(),
-            display: ":0".to_owned(),
+            // Empty means "auto-pick a free DISPLAY" at runtime.
+            display: String::new(),
         }
     }
 }
@@ -432,11 +433,6 @@ pub fn load_from_path(path: &Path) -> Result<RuntimeConfig, CompositorError> {
         if config.xwayland.path.trim().is_empty() {
             return Err(CompositorError::Backend(
                 "xwayland.enabled is true but xwayland.path is empty".to_owned(),
-            ));
-        }
-        if config.xwayland.display.trim().is_empty() {
-            return Err(CompositorError::Backend(
-                "xwayland.enabled is true but xwayland.display is empty".to_owned(),
             ));
         }
     }
@@ -1420,12 +1416,6 @@ return {
   window_rules = {
     { class = "Firefox", workspace = "2" },
     -- { class = "mpv", floating = true, width = 1280, height = 720 },
-  },
-
-  xwayland = {
-    enabled = true,
-    path = "xwayland-satellite",
-    display = ":0",
   },
 
   autostart = {

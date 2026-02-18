@@ -231,18 +231,7 @@ impl ForeignToplevelHandler for Raven {
             return;
         }
 
-        if !self.fullscreen_windows.contains(&window) {
-            let existing = self.fullscreen_windows.clone();
-            for fullscreen_window in &existing {
-                self.clear_fullscreen_ready_for_window(fullscreen_window);
-                self.set_window_fullscreen_state(fullscreen_window, false);
-            }
-
-            self.fullscreen_windows.clear();
-            self.fullscreen_windows.push(window.clone());
-            self.clear_fullscreen_ready_for_window(&window);
-            self.set_window_fullscreen_state(&window, true);
-            self.queue_fullscreen_transition_redraw_for_window(&window);
+        if self.enter_fullscreen_window(&window) {
             self.space.raise_element(&window, true);
             if let Err(err) = self.apply_layout() {
                 tracing::warn!("failed to apply layout after foreign toplevel fullscreen: {err}");
@@ -255,11 +244,7 @@ impl ForeignToplevelHandler for Raven {
             return;
         };
 
-        if self.fullscreen_windows.contains(&window) {
-            self.fullscreen_windows
-                .retain(|candidate| candidate != &window);
-            self.clear_fullscreen_ready_for_window(&window);
-            self.set_window_fullscreen_state(&window, false);
+        if self.exit_fullscreen_window(&window) {
             if let Err(err) = self.apply_layout() {
                 tracing::warn!("failed to apply layout after foreign toplevel unfullscreen: {err}");
             }

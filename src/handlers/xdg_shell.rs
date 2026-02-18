@@ -16,7 +16,7 @@ use smithay::{
         wayland_protocols_misc::server_decoration::server::org_kde_kwin_server_decoration,
         wayland_server::{
             Resource, WEnum,
-            protocol::{wl_seat, wl_surface::WlSurface},
+            protocol::{wl_output, wl_seat, wl_surface::WlSurface},
         },
     },
     utils::{Rectangle, SERIAL_COUNTER, Serial},
@@ -75,17 +75,8 @@ impl XdgShellHandler for Raven {
             self.space.map_element(window.clone(), location, false);
             tracing::debug!("new_toplevel: step=map_element:done");
         }
-        if rules.fullscreen && !self.fullscreen_windows.contains(&window) {
-            let existing = self.fullscreen_windows.clone();
-            for fullscreen_window in &existing {
-                self.clear_fullscreen_ready_for_window(fullscreen_window);
-                self.set_window_fullscreen_state(fullscreen_window, false);
-            }
-            self.fullscreen_windows.clear();
-            self.fullscreen_windows.push(window.clone());
-            self.clear_fullscreen_ready_for_window(&window);
-            self.set_window_fullscreen_state(&window, true);
-            self.queue_fullscreen_transition_redraw_for_window(&window);
+        if rules.fullscreen {
+            self.enter_fullscreen_window(&window);
         }
         tracing::debug!("new_toplevel: step=apply_layout:start");
         self.apply_layout().ok();
@@ -222,6 +213,47 @@ impl XdgShellHandler for Raven {
 
         if surface.is_initial_configure_sent() {
             surface.send_configure();
+        }
+    }
+
+    fn fullscreen_request(
+        &mut self,
+        surface: ToplevelSurface,
+        _wl_output: Option<wl_output::WlOutput>,
+    ) {
+        let Some(window) = self.window_for_surface(surface.wl_surface()) else {
+            if surface.is_initial_configure_sent() {
+                surface.send_pending_configure();
+            }
+            return;
+        };
+
+        if self.enter_fullscreen_window(&window) {
+            self.space.raise_element(&window, true);
+            if let Err(err) = self.apply_layout() {
+                tracing::warn!("failed to apply layout after xdg fullscreen request: {err}");
+            }
+        } else {
+            // xdg-shell fullscreen requests should still receive a configure response.
+            self.set_window_fullscreen_state(&window, true);
+        }
+    }
+
+    fn unfullscreen_request(&mut self, surface: ToplevelSurface) {
+        let Some(window) = self.window_for_surface(surface.wl_surface()) else {
+            if surface.is_initial_configure_sent() {
+                surface.send_pending_configure();
+            }
+            return;
+        };
+
+        if self.exit_fullscreen_window(&window) {
+            if let Err(err) = self.apply_layout() {
+                tracing::warn!("failed to apply layout after xdg unfullscreen request: {err}");
+            }
+        } else {
+            // Mirror fullscreen_request behavior: always respond with a configure.
+            self.set_window_fullscreen_state(&window, false);
         }
     }
 
