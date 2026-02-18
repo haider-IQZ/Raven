@@ -1,4 +1,5 @@
 use smithay::{
+    backend::renderer::utils::RendererSurfaceStateUserData,
     desktop::{PopupManager, Space, Window, WindowSurfaceType, layer_map_for_output},
     input::{
         Seat, SeatState,
@@ -37,7 +38,7 @@ use smithay::{
     },
 };
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     ffi::OsString,
     fs,
     fs::OpenOptions,
@@ -128,6 +129,8 @@ pub struct Raven {
     pub current_workspace: usize,
     pub workspaces: Vec<Vec<Window>>,
     pub fullscreen_windows: Vec<Window>,
+    pub fullscreen_ready_surface_ids: HashSet<u32>,
+    pub fullscreen_transition_redraw_outputs: HashMap<String, u8>,
     pub floating_windows: Vec<Window>,
     pub pending_floating_recenter_ids: HashSet<u32>,
     pub pending_window_rule_recheck_ids: HashSet<u32>,
@@ -249,6 +252,8 @@ impl Raven {
             current_workspace: 0,
             workspaces: vec![Vec::new(); WORKSPACE_COUNT],
             fullscreen_windows: Vec::new(),
+            fullscreen_ready_surface_ids: HashSet::new(),
+            fullscreen_transition_redraw_outputs: HashMap::new(),
             floating_windows: Vec::new(),
             pending_floating_recenter_ids: HashSet::new(),
             pending_window_rule_recheck_ids: HashSet::new(),
@@ -291,6 +296,8 @@ impl Raven {
             .find(|window| self.fullscreen_windows.contains(window))
             .cloned()
         {
+            let fullscreen_ready =
+                self.window_is_ready_fullscreen_on_output(&fullscreen_window, &output);
             let current_location = self.space.element_location(&fullscreen_window);
             let current_geometry = self
                 .space
@@ -299,12 +306,16 @@ impl Raven {
             let is_mapped = current_location.is_some();
             let needs_resize = current_geometry.size != out_geo.size;
             let needs_reposition = current_location != Some(out_geo.loc);
-
             // Avoid repeatedly reconfiguring/remapping an already-correct fullscreen window.
             if !is_mapped || needs_resize {
                 self.set_window_fullscreen_state(&fullscreen_window, true);
             }
-            if !is_mapped || needs_reposition {
+            // Keep the window's previous position until it has committed a fullscreen-sized frame.
+            // This mirrors niri's commit-synchronized fullscreen transition and avoids first-frame
+            // bottom-edge flashes from moving the old-size buffer too early.
+            if !is_mapped {
+                self.space.map_element(fullscreen_window, out_geo.loc, true);
+            } else if needs_reposition && fullscreen_ready {
                 self.space.map_element(fullscreen_window, out_geo.loc, true);
             }
             return Ok(());
@@ -368,6 +379,7 @@ impl Raven {
             {
                 toplevel.with_pending_state(|state| {
                     state.size = Some(desired_size);
+                    state.bounds = Some(layout_geo.size);
                     state.states.unset(xdg_toplevel::State::Fullscreen);
                     state.states.unset(xdg_toplevel::State::Maximized);
                     state.states.set(xdg_toplevel::State::TiledLeft);
@@ -427,6 +439,7 @@ impl Raven {
 
         let layer_map = layer_map_for_output(output);
         let position_within_output = position - output_geo.loc.to_f64();
+        let fullscreen_on_output = self.output_has_ready_fullscreen_window(output);
 
         let surface_on_layer = |layer: WlrLayer| {
             layer_map.layers_on(layer).rev().find_map(|layer_surface| {
@@ -445,19 +458,27 @@ impl Raven {
             })
         };
 
-        surface_on_layer(WlrLayer::Overlay)
-            .or_else(|| surface_on_layer(WlrLayer::Top))
-            .or_else(|| {
-                self.space
-                    .element_under(position)
-                    .and_then(|(window, location)| {
-                        window
-                            .surface_under(position - location.to_f64(), WindowSurfaceType::ALL)
-                            .map(|(surface, local_pos)| (surface, (local_pos + location).to_f64()))
-                    })
+        let window_surface = || {
+            self.space.element_under(position).and_then(|(window, location)| {
+                window
+                    .surface_under(position - location.to_f64(), WindowSurfaceType::ALL)
+                    .map(|(surface, local_pos)| (surface, (local_pos + location).to_f64()))
             })
-            .or_else(|| surface_on_layer(WlrLayer::Bottom))
-            .or_else(|| surface_on_layer(WlrLayer::Background))
+        };
+
+        if fullscreen_on_output {
+            surface_on_layer(WlrLayer::Overlay)
+                .or_else(window_surface)
+                .or_else(|| surface_on_layer(WlrLayer::Top))
+                .or_else(|| surface_on_layer(WlrLayer::Bottom))
+                .or_else(|| surface_on_layer(WlrLayer::Background))
+        } else {
+            surface_on_layer(WlrLayer::Overlay)
+                .or_else(|| surface_on_layer(WlrLayer::Top))
+                .or_else(window_surface)
+                .or_else(|| surface_on_layer(WlrLayer::Bottom))
+                .or_else(|| surface_on_layer(WlrLayer::Background))
+        }
     }
 
     pub fn pointer(&self) -> PointerHandle<Self> {
@@ -491,6 +512,154 @@ impl Raven {
 
     pub fn is_window_floating(&self, window: &Window) -> bool {
         self.floating_windows.contains(window)
+    }
+
+    pub fn output_has_fullscreen_window(&self, output: &smithay::output::Output) -> bool {
+        self.fullscreen_windows.iter().any(|window| {
+            self.space
+                .outputs_for_element(window)
+                .iter()
+                .any(|candidate| candidate == output)
+        })
+    }
+
+    pub fn output_has_ready_fullscreen_window(&self, output: &smithay::output::Output) -> bool {
+        self.fullscreen_windows.iter().any(|window| {
+            self.window_is_ready_fullscreen_on_output(window, output)
+        })
+    }
+
+    fn window_is_ready_fullscreen_on_output(
+        &self,
+        window: &Window,
+        output: &smithay::output::Output,
+    ) -> bool {
+        let Some(surface_id) = Self::window_surface_id(window) else {
+            return false;
+        };
+        self.fullscreen_ready_surface_ids.contains(&surface_id)
+            && self
+                .space
+                .outputs_for_element(window)
+                .iter()
+                .any(|candidate| candidate == output)
+    }
+
+    pub fn mark_fullscreen_ready_for_surface(&mut self, surface: &WlSurface) {
+        let surface_id = surface.id().protocol_id();
+        let Some(window) = self.window_for_surface(surface) else {
+            return;
+        };
+        if !self.fullscreen_windows.contains(&window) {
+            return;
+        }
+
+        let Some(output) = self.space.outputs_for_element(&window).into_iter().next() else {
+            return;
+        };
+        let Some(output_geo) = self.space.output_geometry(&output) else {
+            return;
+        };
+        let window_geo = self
+            .space
+            .element_geometry(&window)
+            .unwrap_or_else(|| window.geometry());
+        const FULLSCREEN_READY_TOLERANCE: i32 = 2;
+        let fullscreen_sized = window_geo.size.w + FULLSCREEN_READY_TOLERANCE >= output_geo.size.w
+            && window_geo.size.h + FULLSCREEN_READY_TOLERANCE >= output_geo.size.h;
+        let surface_buffer_sized = with_states(surface, |states| {
+            states
+                .data_map
+                .get::<RendererSurfaceStateUserData>()
+                .and_then(|data| data.lock().ok())
+                .and_then(|data| data.buffer_size())
+                .is_some_and(|size| {
+                    size.w + FULLSCREEN_READY_TOLERANCE >= output_geo.size.w
+                        && size.h + FULLSCREEN_READY_TOLERANCE >= output_geo.size.h
+                })
+        });
+
+        let is_committed_fullscreen = window.toplevel().is_some_and(|toplevel| {
+            toplevel.with_committed_state(|state| {
+                state
+                    .as_ref()
+                    .is_some_and(|state| state.states.contains(xdg_toplevel::State::Fullscreen))
+            })
+        });
+
+        if !is_committed_fullscreen || !fullscreen_sized || !surface_buffer_sized {
+            self.fullscreen_ready_surface_ids.remove(&surface_id);
+            return;
+        }
+
+        if self.fullscreen_ready_surface_ids.contains(&surface_id) {
+            return;
+        }
+
+        let became_ready = self.fullscreen_ready_surface_ids.insert(surface_id);
+        if became_ready {
+            if self.space.element_location(&window) != Some(output_geo.loc) {
+                self.space.map_element(window.clone(), output_geo.loc, true);
+            }
+            self.mark_fullscreen_transition_redraw_for_window(&window);
+        }
+    }
+
+    pub fn clear_fullscreen_ready_for_window(&mut self, window: &Window) {
+        if let Some(surface_id) = Self::window_surface_id(window) {
+            self.fullscreen_ready_surface_ids.remove(&surface_id);
+        }
+        for output in self.space.outputs_for_element(window) {
+            self.fullscreen_transition_redraw_outputs
+                .remove(&output.name());
+        }
+    }
+
+    pub fn take_fullscreen_transition_redraw_for_output(
+        &mut self,
+        output: &smithay::output::Output,
+    ) -> bool {
+        let key = output.name();
+        let Some(frames_left) = self.fullscreen_transition_redraw_outputs.get_mut(&key) else {
+            return false;
+        };
+
+        let should_redraw = *frames_left > 0;
+        if *frames_left <= 1 {
+            self.fullscreen_transition_redraw_outputs.remove(&key);
+        } else {
+            *frames_left -= 1;
+        }
+        should_redraw
+    }
+
+    pub fn queue_fullscreen_transition_redraw_for_window(&mut self, window: &Window) {
+        self.mark_fullscreen_transition_redraw_for_window(window);
+    }
+
+    fn window_surface_id(window: &Window) -> Option<u32> {
+        window
+            .toplevel()
+            .map(|toplevel| toplevel.wl_surface().id().protocol_id())
+    }
+
+    fn mark_fullscreen_transition_redraw_for_window(&mut self, window: &Window) {
+        const FULLSCREEN_TRANSITION_REDRAW_FRAMES: u8 = 4;
+        let mut outputs = self.space.outputs_for_element(window);
+        if outputs.is_empty() {
+            // During some transitions the window/output mapping can lag by a commit.
+            // Fall back to all outputs so we don't miss the first fullscreen frames.
+            outputs = self.space.outputs().cloned().collect();
+        }
+        for output in outputs {
+            let key = output.name();
+            self.fullscreen_transition_redraw_outputs
+                .entry(key)
+                .and_modify(|frames| {
+                    *frames = (*frames).max(FULLSCREEN_TRANSITION_REDRAW_FRAMES);
+                })
+                .or_insert(FULLSCREEN_TRANSITION_REDRAW_FRAMES);
+        }
     }
 
     fn active_output_for_pointer(&self) -> Option<smithay::output::Output> {
@@ -818,11 +987,14 @@ impl Raven {
         if decision.fullscreen && !self.fullscreen_windows.contains(&window) {
             let existing = self.fullscreen_windows.clone();
             for fullscreen_window in &existing {
+                self.clear_fullscreen_ready_for_window(fullscreen_window);
                 self.set_window_fullscreen_state(fullscreen_window, false);
             }
             self.fullscreen_windows.clear();
             self.fullscreen_windows.push(window.clone());
+            self.clear_fullscreen_ready_for_window(&window);
             self.set_window_fullscreen_state(&window, true);
+            self.queue_fullscreen_transition_redraw_for_window(&window);
         }
 
         if let Err(err) = self.apply_layout() {
@@ -1050,6 +1222,7 @@ impl Raven {
     }
 
     pub fn remove_window_from_workspaces(&mut self, window: &Window) {
+        self.clear_fullscreen_ready_for_window(window);
         for workspace in &mut self.workspaces {
             workspace.retain(|candidate| candidate != window);
         }
@@ -2060,18 +2233,22 @@ org.freedesktop.impl.portal.Secret=gnome-keyring;\n"
         if self.fullscreen_windows.contains(&window) {
             self.fullscreen_windows
                 .retain(|candidate| candidate != &window);
+            self.clear_fullscreen_ready_for_window(&window);
             self.set_window_fullscreen_state(&window, false);
             return self.apply_layout();
         }
 
         let previous_fullscreen_windows = self.fullscreen_windows.clone();
         for fullscreen_window in &previous_fullscreen_windows {
+            self.clear_fullscreen_ready_for_window(fullscreen_window);
             self.set_window_fullscreen_state(fullscreen_window, false);
         }
 
         self.fullscreen_windows.clear();
         self.fullscreen_windows.push(window.clone());
+        self.clear_fullscreen_ready_for_window(&window);
         self.set_window_fullscreen_state(&window, true);
+        self.queue_fullscreen_transition_redraw_for_window(&window);
         self.space.raise_element(&window, true);
 
         self.apply_layout()
@@ -2112,6 +2289,12 @@ org.freedesktop.impl.portal.Secret=gnome-keyring;\n"
         } else {
             None
         };
+        let output_bounds = self
+            .space
+            .outputs()
+            .next()
+            .and_then(|output| self.space.output_geometry(output))
+            .map(|geometry| geometry.size);
 
         toplevel.with_pending_state(|state| {
             if fullscreen {
@@ -2124,6 +2307,7 @@ org.freedesktop.impl.portal.Secret=gnome-keyring;\n"
                 if let Some(size) = fullscreen_size {
                     state.size = Some(size);
                 }
+                state.bounds = fullscreen_size.or(output_bounds);
             } else {
                 state.states.unset(xdg_toplevel::State::Fullscreen);
                 state.states.unset(xdg_toplevel::State::TiledLeft);
@@ -2131,6 +2315,7 @@ org.freedesktop.impl.portal.Secret=gnome-keyring;\n"
                 state.states.unset(xdg_toplevel::State::TiledTop);
                 state.states.unset(xdg_toplevel::State::TiledBottom);
                 state.size = None;
+                state.bounds = output_bounds;
             }
         });
         toplevel.send_pending_configure();

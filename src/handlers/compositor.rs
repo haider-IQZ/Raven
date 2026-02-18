@@ -121,6 +121,7 @@ impl CompositorHandler for Raven {
             if let Some(window) = self.window_for_surface(&root) {
                 window.on_commit();
             }
+            self.mark_fullscreen_ready_for_surface(&root);
             root_surface = Some(root);
         }
 

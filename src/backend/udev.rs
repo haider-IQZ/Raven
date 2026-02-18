@@ -25,6 +25,7 @@ use smithay::{
                 AsRenderElements, Kind, default_primary_scanout_output_compare,
                 memory::MemoryRenderBuffer,
                 surface::WaylandSurfaceRenderElement,
+                utils::CropRenderElement,
             },
             gles::GlesRenderer,
             multigpu::{GpuManager, MultiRenderer, gbm::GbmGlesBackend},
@@ -53,12 +54,13 @@ use smithay::{
         wayland_protocols::wp::presentation_time::server::wp_presentation_feedback,
         wayland_server::{backend::GlobalId, protocol::wl_surface::WlSurface},
     },
-    utils::{DeviceFd, IsAlive, Scale, Transform},
+    utils::{DeviceFd, IsAlive, Rectangle, Scale, Transform},
     wayland::{
         compositor,
         dmabuf::{DmabufFeedbackBuilder, DmabufState},
         drm_syncobj::{DrmSyncobjState, supports_syncobj_eventfd},
         presentation::Refresh,
+        shell::wlr_layer::Layer as WlrLayer,
     },
 };
 use smithay_drm_extras::{
@@ -134,6 +136,12 @@ smithay::backend::renderer::element::render_elements! {
     Backdrop=SolidColorRenderElement,
     Space=SpaceRenderElements<R, E>,
     Pointer=PointerRenderElement<R>,
+}
+
+smithay::backend::renderer::element::render_elements! {
+    pub UdevCompositeRenderElement<R, E> where R: ImportAll + ImportMem;
+    Base=UdevRenderElement<R, E>,
+    Cropped=CropRenderElement<UdevRenderElement<R, E>>,
 }
 
 /// Per-GPU device state
@@ -985,6 +993,19 @@ fn device_removed(state: &mut Raven, node: DrmNode) {
 fn render_surface(state: &mut Raven, node: DrmNode, crtc: crtc::Handle) {
     state.flush_interactive_frame_updates();
     let loop_handle = state.loop_handle.clone();
+    let output = {
+        let udev = state.udev_data.as_ref().unwrap();
+        let Some(device) = udev.backends.get(&node) else {
+            return;
+        };
+        let Some(surface_data) = device.surfaces.get(&crtc) else {
+            return;
+        };
+        surface_data.output.clone()
+    };
+    let fullscreen_requested_on_output = state.output_has_fullscreen_window(&output);
+    let fullscreen_on_output = state.output_has_ready_fullscreen_window(&output);
+    let transition_full_redraw = state.take_fullscreen_transition_redraw_for_output(&output);
 
     let udev = state.udev_data.as_mut().unwrap();
     let Some(device) = udev.backends.get_mut(&node) else {
@@ -1004,7 +1025,6 @@ fn render_surface(state: &mut Raven, node: DrmNode, crtc: crtc::Handle) {
         }
     }
 
-    let output = surface_data.output.clone();
     if let Some(output_geo) = state.space.output_geometry(&output) {
         surface_data.backdrop.update(
             (output_geo.size.w as f64, output_geo.size.h as f64),
@@ -1048,23 +1068,121 @@ fn render_surface(state: &mut Raven, node: DrmNode, crtc: crtc::Handle) {
         }
     };
 
-    // Collect render elements from the space (windows + layer surfaces)
-    let space_elements: Vec<
-        UdevRenderElement<UdevRenderer<'_>, WaylandSurfaceRenderElement<UdevRenderer<'_>>>,
-    > = match space_render_elements(&mut renderer, [&state.space], &output, 1.0) {
+    // Collect render elements from the space (windows + layer surfaces).
+    //
+    // Full niri-style ordering on ready fullscreen:
+    // overlay > windows > top > bottom/background.
+    // Normal ordering remains the default from smithay space_render_elements.
+    if transition_full_redraw {
+        // One-shot full repaint when fullscreen becomes ready on this output. This avoids
+        // transient bottom-edge artifacts without adding per-frame fullscreen repaint cost.
+        surface_data.backdrop.touch();
+    }
+    let mut space_elements = match space_render_elements(&mut renderer, [&state.space], &output, 1.0)
+    {
         Ok(elements) => elements,
         Err(e) => {
             tracing::warn!("Failed to collect render elements: {e:?}");
             Vec::new()
         }
+    };
+    if fullscreen_on_output {
+        let mut window_elements = Vec::new();
+        let mut lower_layer_elements = Vec::new();
+        let mut saw_window_element = false;
+        for element in space_elements {
+            match element {
+                SpaceRenderElements::Element(_) => {
+                    saw_window_element = true;
+                    window_elements.push(element);
+                }
+                SpaceRenderElements::Surface(_) if saw_window_element => {
+                    lower_layer_elements.push(element);
+                }
+                SpaceRenderElements::Surface(_) => {}
+                SpaceRenderElements::_GenericCatcher(_) => {}
+            }
+        }
+
+        let layer_map = layer_map_for_output(&output);
+        let mut collect_layer_elements = |layer: WlrLayer| {
+            let mut out = Vec::new();
+            for layer_surface in layer_map.layers_on(layer).rev() {
+                let Some(layer_geo) = layer_map.layer_geometry(layer_surface) else {
+                    continue;
+                };
+                out.extend(
+                    AsRenderElements::<UdevRenderer<'_>>::render_elements::<
+                        WaylandSurfaceRenderElement<UdevRenderer<'_>>,
+                    >(
+                        layer_surface,
+                        &mut renderer,
+                        layer_geo.loc.to_physical_precise_round(1.0),
+                        Scale::from(1.0),
+                        1.0,
+                    )
+                    .into_iter()
+                    .map(SpaceRenderElements::Surface),
+                );
+            }
+            out
+        };
+        let overlay_layer_elements = collect_layer_elements(WlrLayer::Overlay);
+        let top_layer_elements = collect_layer_elements(WlrLayer::Top);
+
+        let mut reordered = Vec::new();
+        reordered.extend(overlay_layer_elements);
+        reordered.extend(window_elements);
+        reordered.extend(top_layer_elements);
+        reordered.extend(lower_layer_elements);
+        space_elements = reordered;
     }
-    .into_iter()
-    .map(UdevRenderElement::from)
-    .collect();
+    let output_scale = Scale::from(output.current_scale().fractional_scale());
+    let fullscreen_window_crop_rect = state
+        .fullscreen_windows
+        .iter()
+        .find(|window| {
+            state
+                .space
+                .outputs_for_element(window)
+                .iter()
+                .any(|candidate| candidate == &output)
+        })
+        .and_then(|window| {
+            let output_geo = state.space.output_geometry(&output)?;
+            let bbox = state.space.element_bbox(window)?;
+            Some(Rectangle::new(
+                (bbox.loc - output_geo.loc)
+                    .to_f64()
+                    .to_physical(output_scale)
+                    .to_i32_round(),
+                bbox.size.to_f64().to_physical(output_scale).to_i32_round(),
+            ))
+        });
+    let transition_clip_active =
+        fullscreen_requested_on_output && (!fullscreen_on_output || transition_full_redraw);
+    let mut space_elements_converted: Vec<
+        UdevCompositeRenderElement<UdevRenderer<'_>, WaylandSurfaceRenderElement<UdevRenderer<'_>>>,
+    > = Vec::new();
+    for element in space_elements {
+        let is_window_element = matches!(element, SpaceRenderElements::Element(_));
+        if transition_clip_active
+            && is_window_element
+            && let Some(crop_rect) = fullscreen_window_crop_rect
+        {
+            let base = UdevRenderElement::from(element);
+            if let Some(cropped) = CropRenderElement::from_element(base, output_scale, crop_rect) {
+                space_elements_converted.push(UdevCompositeRenderElement::from(cropped));
+            }
+            continue;
+        }
+        let base = UdevRenderElement::from(element);
+        space_elements_converted.push(UdevCompositeRenderElement::from(base));
+    }
 
     // Render order is front-to-back, so cursor elements must come first.
     let mut elements: Vec<
-        UdevRenderElement<UdevRenderer<'_>, WaylandSurfaceRenderElement<UdevRenderer<'_>>>,
+        UdevCompositeRenderElement<UdevRenderer<'_>, WaylandSurfaceRenderElement<UdevRenderer<'_>>>,
     > = Vec::new();
 
     // Render the cursor on outputs where the pointer currently is.
@@ -1096,7 +1214,7 @@ fn render_surface(state: &mut Raven, node: DrmNode, crtc: crtc::Handle) {
         pointer_element.set_buffer(pointer_image);
         pointer_element.set_status(state.cursor_status.clone());
 
-        elements.extend(
+        let pointer_elements: Vec<PointerRenderElement<UdevRenderer<'_>>> =
             pointer_element.render_elements(
                 &mut renderer,
                 (cursor_pos - cursor_hotspot.to_f64())
@@ -1104,16 +1222,18 @@ fn render_surface(state: &mut Raven, node: DrmNode, crtc: crtc::Handle) {
                     .to_i32_round(),
                 scale,
                 1.0,
-            ),
+            );
+        elements.extend(
+            pointer_elements
+                .into_iter()
+                .map(UdevRenderElement::from)
+                .map(UdevCompositeRenderElement::from),
         );
     }
 
-    elements.extend(space_elements);
-    elements.push(UdevRenderElement::from(SolidColorRenderElement::from_buffer(
-        &surface_data.backdrop,
-        (0.0, 0.0),
-        1.0,
-        Kind::Unspecified,
+    elements.extend(space_elements_converted);
+    elements.push(UdevCompositeRenderElement::from(UdevRenderElement::from(
+        SolidColorRenderElement::from_buffer(&surface_data.backdrop, (0.0, 0.0), 1.0, Kind::Unspecified),
     )));
 
     // Render frame with collected elements
@@ -1290,7 +1410,9 @@ fn take_presentation_feedback_for_output(
         layer.take_presentation_feedback(
             &mut output_presentation_feedback,
             surface_primary_scanout_output,
-            |surface, _| surface_presentation_feedback_flags_from_states(surface, render_element_states),
+            |surface, _| {
+                surface_presentation_feedback_flags_from_states(surface, render_element_states)
+            },
         );
     }
 

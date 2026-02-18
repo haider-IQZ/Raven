@@ -78,11 +78,14 @@ impl XdgShellHandler for Raven {
         if rules.fullscreen && !self.fullscreen_windows.contains(&window) {
             let existing = self.fullscreen_windows.clone();
             for fullscreen_window in &existing {
+                self.clear_fullscreen_ready_for_window(fullscreen_window);
                 self.set_window_fullscreen_state(fullscreen_window, false);
             }
             self.fullscreen_windows.clear();
             self.fullscreen_windows.push(window.clone());
+            self.clear_fullscreen_ready_for_window(&window);
             self.set_window_fullscreen_state(&window, true);
+            self.queue_fullscreen_transition_redraw_for_window(&window);
         }
         tracing::debug!("new_toplevel: step=apply_layout:start");
         self.apply_layout().ok();
@@ -201,6 +204,7 @@ impl XdgShellHandler for Raven {
         surface.with_pending_state(|state| {
             state.states.set(xdg_toplevel::State::Maximized);
             state.size = Some(geometry.size);
+            state.bounds = Some(geometry.size);
         });
         self.space.map_element(window, geometry.loc, true);
 
@@ -213,6 +217,7 @@ impl XdgShellHandler for Raven {
         surface.with_pending_state(|state| {
             state.states.unset(xdg_toplevel::State::Maximized);
             state.size = None;
+            state.bounds = None;
         });
 
         if surface.is_initial_configure_sent() {

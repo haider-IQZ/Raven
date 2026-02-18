@@ -234,12 +234,15 @@ impl ForeignToplevelHandler for Raven {
         if !self.fullscreen_windows.contains(&window) {
             let existing = self.fullscreen_windows.clone();
             for fullscreen_window in &existing {
+                self.clear_fullscreen_ready_for_window(fullscreen_window);
                 self.set_window_fullscreen_state(fullscreen_window, false);
             }
 
             self.fullscreen_windows.clear();
             self.fullscreen_windows.push(window.clone());
+            self.clear_fullscreen_ready_for_window(&window);
             self.set_window_fullscreen_state(&window, true);
+            self.queue_fullscreen_transition_redraw_for_window(&window);
             self.space.raise_element(&window, true);
             if let Err(err) = self.apply_layout() {
                 tracing::warn!("failed to apply layout after foreign toplevel fullscreen: {err}");
@@ -255,6 +258,7 @@ impl ForeignToplevelHandler for Raven {
         if self.fullscreen_windows.contains(&window) {
             self.fullscreen_windows
                 .retain(|candidate| candidate != &window);
+            self.clear_fullscreen_ready_for_window(&window);
             self.set_window_fullscreen_state(&window, false);
             if let Err(err) = self.apply_layout() {
                 tracing::warn!("failed to apply layout after foreign toplevel unfullscreen: {err}");
@@ -285,6 +289,7 @@ impl ForeignToplevelHandler for Raven {
             toplevel.with_pending_state(|state| {
                 state.states.set(smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State::Maximized);
                 state.size = Some(geometry.size);
+                state.bounds = Some(geometry.size);
             });
             self.space.map_element(window.clone(), geometry.loc, true);
         } else {
@@ -308,6 +313,7 @@ impl ForeignToplevelHandler for Raven {
         toplevel.with_pending_state(|state| {
             state.states.unset(smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State::Maximized);
             state.size = None;
+            state.bounds = None;
         });
         toplevel.send_pending_configure();
         if let Err(err) = self.apply_layout() {
