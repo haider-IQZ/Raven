@@ -18,11 +18,13 @@ use smithay::{
         keyboard::{FilterResult, Keysym, ModifiersState},
         pointer::{
             AxisFrame, ButtonEvent, Focus, GrabStartData as PointerGrabStartData, MotionEvent,
+            RelativeMotionEvent,
         },
     },
     utils::{Logical, Point, Rectangle, SERIAL_COUNTER, Serial},
     wayland::{
         input_method::InputMethodSeat,
+        pointer_constraints::{PointerConstraint, with_pointer_constraint},
         shell::wlr_layer::{KeyboardInteractivity, Layer as WlrLayer},
     },
 };
@@ -120,18 +122,117 @@ impl Raven {
         self.clamp_pointer_location();
 
         let pointer = self.pointer();
-        let under = self.surface_under_pointer();
+
+        // Check if we have an active pointer constraint (locked or confined pointer).
+        // This is used by games like Steam to lock the pointer for FPS-style mouse control.
+        let mut pointer_confined = None;
+        if let Some(under) = &self.pointer_contents.surface {
+            let pos_within_surface = self.pointer_location - under.1;
+
+            let mut pointer_locked = false;
+            with_pointer_constraint(&under.0, &pointer, |constraint| {
+                let Some(constraint) = constraint else { return };
+                if !constraint.is_active() {
+                    return;
+                }
+
+                // Constraint does not apply if not within region.
+                if let Some(region) = constraint.region() {
+                    if !region.contains(pos_within_surface.to_i32_round()) {
+                        return;
+                    }
+                }
+
+                match &*constraint {
+                    PointerConstraint::Locked(_locked) => {
+                        pointer_locked = true;
+                    }
+                    PointerConstraint::Confined(confine) => {
+                        pointer_confined = Some((under.clone(), confine.region().cloned()));
+                    }
+                }
+            });
+
+            // If the pointer is locked, only send relative motion and don't change focus.
+            // This is critical for games that lock the pointer for mouse-look controls.
+            if pointer_locked {
+                pointer.relative_motion(
+                    self,
+                    Some(under.clone()),
+                    &RelativeMotionEvent {
+                        delta: event.delta(),
+                        delta_unaccel: event.delta_unaccel(),
+                        utime: event.time(),
+                    },
+                );
+
+                pointer.frame(self);
+
+                self.queue_pointer_redraw_throttled(event.time_msec());
+                return;
+            }
+        }
+
+        let under = self.contents_under(self.pointer_location);
+
+        // Handle confined pointer - prevent pointer from leaving the surface.
+        if let Some((focus_surface, region)) = pointer_confined {
+            let mut prevent = false;
+
+            // Prevent the pointer from leaving the focused surface.
+            if Some(&focus_surface.0) != under.surface.as_ref().map(|(s, _)| s) {
+                prevent = true;
+            }
+
+            // Prevent the pointer from leaving the confine region, if any.
+            if let Some(region) = region {
+                let new_pos_within_surface = self.pointer_location - focus_surface.1;
+                if !region.contains(new_pos_within_surface.to_i32_round()) {
+                    prevent = true;
+                }
+            }
+
+            if prevent {
+                pointer.relative_motion(
+                    self,
+                    Some(focus_surface),
+                    &RelativeMotionEvent {
+                        delta: event.delta(),
+                        delta_unaccel: event.delta_unaccel(),
+                        utime: event.time(),
+                    },
+                );
+
+                pointer.frame(self);
+
+                return;
+            }
+        }
+
+        self.pointer_contents.clone_from(&under);
 
         pointer.motion(
             self,
-            under,
+            under.surface.clone(),
             &MotionEvent {
                 location: self.pointer_location,
                 serial,
                 time: event.time_msec(),
             },
         );
+        pointer.relative_motion(
+            self,
+            under.surface,
+            &RelativeMotionEvent {
+                delta: event.delta(),
+                delta_unaccel: event.delta_unaccel(),
+                utime: event.time(),
+            },
+        );
         pointer.frame(self);
+
+        // Activate a new confinement if necessary.
+        self.maybe_activate_pointer_constraint();
 
         if self.config.focus_follow_mouse {
             self.update_keyboard_focus(self.pointer_location, serial, false);
@@ -160,11 +261,12 @@ impl Raven {
 
         let serial = SERIAL_COUNTER.next_serial();
         let pointer = self.pointer();
-        let under = self.surface_under_pointer();
+        let under = self.contents_under(self.pointer_location);
+        self.pointer_contents.clone_from(&under);
 
         pointer.motion(
             self,
-            under,
+            under.surface,
             &MotionEvent {
                 location: self.pointer_location,
                 serial,
@@ -172,6 +274,9 @@ impl Raven {
             },
         );
         pointer.frame(self);
+
+        // Activate pointer constraint if necessary (for games that lock the pointer).
+        self.maybe_activate_pointer_constraint();
 
         if self.config.focus_follow_mouse {
             self.update_keyboard_focus(self.pointer_location, serial, false);
@@ -187,22 +292,7 @@ impl Raven {
         let button_state = event.state();
         let pointer = self.pointer();
 
-        // Keep pointer focus in sync with current cursor location before sending button events.
-        // This ensures layer-shell clients (e.g. waybar) receive clicks even when no prior
-        // motion event updated the pointer target.
-        if !pointer.is_grabbed() {
-            let under = self.surface_under_pointer();
-            pointer.motion(
-                self,
-                under,
-                &MotionEvent {
-                    location: self.pointer_location,
-                    serial,
-                    time: event.time_msec(),
-                },
-            );
-            pointer.frame(self);
-        }
+        self.update_pointer_contents(event.time_msec());
 
         let keyboard = self.seat.get_keyboard().expect("keyboard not initialized");
         let modifiers = keyboard.modifier_state();
@@ -374,43 +464,34 @@ impl Raven {
     }
 
     fn handle_pointer_axis<B: InputBackend>(&mut self, event: B::PointerAxisEvent) {
-        // Like button events, keep pointer focus current so layer surfaces receive scroll.
-        let pointer_serial = SERIAL_COUNTER.next_serial();
         let pointer = self.pointer();
-        if !pointer.is_grabbed() {
-            let under = self.surface_under_pointer();
-            pointer.motion(
-                self,
-                under,
-                &MotionEvent {
-                    location: self.pointer_location,
-                    serial: pointer_serial,
-                    time: event.time_msec(),
-                },
-            );
-            pointer.frame(self);
-        }
+
+        self.update_pointer_contents(event.time_msec());
 
         let horizontal_amount = event
             .amount(Axis::Horizontal)
-            .unwrap_or_else(|| event.amount_v120(Axis::Horizontal).unwrap_or(0.0) * 3.0 / 120.0);
+            .unwrap_or_else(|| event.amount_v120(Axis::Horizontal).unwrap_or(0.0) * 15.0 / 120.0);
         let vertical_amount = event
             .amount(Axis::Vertical)
-            .unwrap_or_else(|| event.amount_v120(Axis::Vertical).unwrap_or(0.0) * 3.0 / 120.0);
+            .unwrap_or_else(|| event.amount_v120(Axis::Vertical).unwrap_or(0.0) * 15.0 / 120.0);
         let horizontal_amount_discrete = event.amount_v120(Axis::Horizontal);
         let vertical_amount_discrete = event.amount_v120(Axis::Vertical);
 
         let mut axis_frame = AxisFrame::new(event.time_msec()).source(event.source());
 
         if horizontal_amount != 0.0 {
-            axis_frame = axis_frame.value(Axis::Horizontal, horizontal_amount);
+            axis_frame = axis_frame
+                .relative_direction(Axis::Horizontal, event.relative_direction(Axis::Horizontal))
+                .value(Axis::Horizontal, horizontal_amount);
             if let Some(discrete) = horizontal_amount_discrete {
                 axis_frame = axis_frame.v120(Axis::Horizontal, discrete as i32);
             }
         }
 
         if vertical_amount != 0.0 {
-            axis_frame = axis_frame.value(Axis::Vertical, vertical_amount);
+            axis_frame = axis_frame
+                .relative_direction(Axis::Vertical, event.relative_direction(Axis::Vertical))
+                .value(Axis::Vertical, vertical_amount);
             if let Some(discrete) = vertical_amount_discrete {
                 axis_frame = axis_frame.v120(Axis::Vertical, discrete as i32);
             }
@@ -427,6 +508,9 @@ impl Raven {
 
         pointer.axis(self, axis_frame);
         pointer.frame(self);
+
+        // Activate pointer constraint if necessary (for games that lock the pointer).
+        self.maybe_activate_pointer_constraint();
 
         crate::backend::udev::queue_redraw_all(self);
     }

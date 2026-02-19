@@ -148,9 +148,11 @@ impl CompositorHandler for Raven {
             let serial = SERIAL_COUNTER.next_serial();
             let pointer = self.pointer();
             if !pointer.is_grabbed() {
+                let under = self.contents_under(self.pointer_location);
+                self.pointer_contents.clone_from(&under);
                 pointer.motion(
                     self,
-                    self.surface_under_pointer(),
+                    under.surface,
                     &MotionEvent {
                         location: self.pointer_location,
                         serial,

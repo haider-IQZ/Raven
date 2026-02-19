@@ -85,6 +85,10 @@ fn main() -> Result<()> {
             state.space.refresh();
             state.popups.cleanup();
 
+            // Keep pointer focus in sync even when client surface trees change without
+            // pointer motion events (common with complex Xwayland clients like Steam).
+            state.refresh_pointer_contents();
+
             raven::backend::udev::drain_queued_redraws(state);
 
             // Flush protocol messages to clients.  Without this, frame callbacks,
@@ -130,9 +134,8 @@ fn run_ipc_command(command: &str) -> Result<String> {
 }
 
 fn ipc_socket_path_from_env() -> Result<PathBuf> {
-    let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR").ok_or_else(|| {
-        CompositorError::Backend("XDG_RUNTIME_DIR is not set".to_owned())
-    })?;
+    let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
+        .ok_or_else(|| CompositorError::Backend("XDG_RUNTIME_DIR is not set".to_owned()))?;
 
     let runtime_dir_path = PathBuf::from(runtime_dir);
     if let Ok(wayland_display) = std::env::var("WAYLAND_DISPLAY") {

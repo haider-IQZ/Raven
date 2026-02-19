@@ -5,23 +5,25 @@ mod xdg_shell;
 use smithay::{
     backend::renderer::ImportDma,
     delegate_data_device, delegate_dmabuf, delegate_drm_syncobj, delegate_fractional_scale,
-    delegate_output, delegate_presentation,
-    delegate_primary_selection, delegate_seat, delegate_viewporter,
+    delegate_output, delegate_pointer_constraints, delegate_pointer_gestures,
+    delegate_presentation, delegate_primary_selection, delegate_relative_pointer, delegate_seat,
+    delegate_viewporter,
     desktop::layer_map_for_output,
     input::{
         Seat, SeatHandler, SeatState,
         dnd::{DnDGrab, DndGrabHandler, GrabType},
-        pointer::{CursorImageStatus, Focus},
+        pointer::{CursorImageStatus, Focus, PointerHandle},
     },
     output::Output,
     reexports::wayland_server::{Resource, protocol::wl_surface::WlSurface},
-    utils::SERIAL_COUNTER,
+    utils::{Logical, Point, SERIAL_COUNTER},
     wayland::{
         compositor::with_states,
         dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier},
         drm_syncobj::{DrmSyncobjHandler, DrmSyncobjState},
         fractional_scale::{FractionalScaleHandler, with_fractional_scale},
         output::OutputHandler,
+        pointer_constraints::{PointerConstraintsHandler, with_pointer_constraint},
         selection::{
             SelectionHandler,
             data_device::{
@@ -68,6 +70,8 @@ impl SeatHandler for Raven {
 }
 
 delegate_seat!(Raven);
+delegate_pointer_gestures!(Raven);
+delegate_relative_pointer!(Raven);
 
 impl SelectionHandler for Raven {
     type SelectionUserData = ();
@@ -347,3 +351,57 @@ impl DrmSyncobjHandler for Raven {
 
 delegate_drm_syncobj!(Raven);
 delegate_presentation!(Raven);
+
+impl PointerConstraintsHandler for Raven {
+    fn new_constraint(&mut self, _surface: &WlSurface, _pointer: &PointerHandle<Self>) {
+        // Pointer constraints track pointer focus internally, so make sure it's up to date before
+        // activating a new one.
+        self.refresh_pointer_contents();
+        self.maybe_activate_pointer_constraint();
+    }
+
+    fn cursor_position_hint(
+        &mut self,
+        surface: &WlSurface,
+        pointer: &PointerHandle<Self>,
+        location: Point<f64, Logical>,
+    ) {
+        let is_constraint_active = with_pointer_constraint(surface, pointer, |constraint| {
+            constraint.is_some_and(|c| c.is_active())
+        });
+        if !is_constraint_active {
+            return;
+        }
+
+        // Use the currently tracked surface origin from pointer contents, like niri.
+        let Some((ref surface_under_pointer, origin)) = self.pointer_contents.surface else {
+            return;
+        };
+        if surface_under_pointer != surface {
+            return;
+        }
+
+        let mut target = origin + location;
+        if let Some(output) = self.space.output_under(target).next().cloned()
+            && let Some(mut output_geometry) = self.space.output_geometry(&output)
+        {
+            // i32 sizes are exclusive, but f64 sizes are inclusive.
+            output_geometry.size -= (1, 1).into();
+            target = target.constrain(output_geometry.to_f64());
+        } else if let Some(output) = self.space.outputs().next()
+            && let Some(mut output_geometry) = self.space.output_geometry(output)
+        {
+            output_geometry.size -= (1, 1).into();
+            target = target.constrain(output_geometry.to_f64());
+        }
+
+        pointer.set_location(target);
+        self.pointer_location = target;
+
+        // Refresh focus at the hinted position and redraw for visible cursor updates.
+        self.refresh_pointer_contents();
+        crate::backend::udev::queue_redraw_all(self);
+    }
+}
+
+delegate_pointer_constraints!(Raven);

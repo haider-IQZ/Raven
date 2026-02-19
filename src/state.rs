@@ -3,7 +3,7 @@ use smithay::{
     desktop::{PopupManager, Space, Window, WindowSurfaceType, layer_map_for_output},
     input::{
         Seat, SeatState,
-        pointer::{CursorImageStatus, PointerHandle},
+        pointer::{CursorImageStatus, MotionEvent, PointerHandle},
     },
     reexports::{
         calloop::{Interest, LoopHandle, LoopSignal, Mode, PostAction, generic::Generic},
@@ -25,7 +25,10 @@ use smithay::{
         drm_syncobj::DrmSyncobjState,
         fractional_scale::FractionalScaleManagerState,
         output::OutputManagerState,
+        pointer_constraints::PointerConstraintsState,
+        pointer_gestures::PointerGesturesState,
         presentation::PresentationState,
+        relative_pointer::RelativePointerManagerState,
         selection::{data_device::DataDeviceState, primary_selection::PrimarySelectionState},
         shell::{
             kde::decoration::KdeDecorationState,
@@ -89,6 +92,14 @@ struct PendingInteractiveResize {
     size: smithay::utils::Size<i32, Logical>,
 }
 
+#[derive(Default, Clone, PartialEq)]
+pub struct PointContents {
+    pub output: Option<smithay::output::Output>,
+    pub surface: Option<(WlSurface, Point<f64, Logical>)>,
+    pub window: Option<Window>,
+    pub layer: Option<WlSurface>,
+}
+
 pub struct Raven {
     pub display_handle: DisplayHandle,
     pub loop_handle: LoopHandle<'static, Raven>,
@@ -120,8 +131,12 @@ pub struct Raven {
     pub viewporter_state: ViewporterState,
     pub fractional_scale_manager_state: FractionalScaleManagerState,
     pub presentation_state: PresentationState,
+    pub pointer_constraints_state: PointerConstraintsState,
+    pub pointer_gestures_state: PointerGesturesState,
+    pub relative_pointer_state: RelativePointerManagerState,
 
     pub pointer_location: Point<f64, Logical>,
+    pub pointer_contents: PointContents,
     pub last_pointer_redraw_msec: Option<u32>,
     pub pending_screencopy: Option<Screencopy>,
     pending_interactive_moves: Vec<PendingInteractiveMove>,
@@ -197,6 +212,9 @@ impl Raven {
             FractionalScaleManagerState::new::<Self>(&display_handle);
         // CLOCK_MONOTONIC = 1 on Linux; must match Clock<Monotonic>
         let presentation_state = PresentationState::new::<Self>(&display_handle, 1);
+        let pointer_constraints_state = PointerConstraintsState::new::<Self>(&display_handle);
+        let pointer_gestures_state = PointerGesturesState::new::<Self>(&display_handle);
+        let relative_pointer_state = RelativePointerManagerState::new::<Self>(&display_handle);
         let mut seat_state = SeatState::new();
 
         let mut seat = seat_state.new_wl_seat(&display_handle, "winit");
@@ -247,8 +265,12 @@ impl Raven {
             viewporter_state,
             fractional_scale_manager_state,
             presentation_state,
+            pointer_constraints_state,
+            pointer_gestures_state,
+            relative_pointer_state,
 
             pointer_location: Point::from((0.0, 0.0)),
+            pointer_contents: PointContents::default(),
             last_pointer_redraw_msec: None,
             pending_screencopy: None,
             pending_interactive_moves: Vec::new(),
@@ -431,59 +453,164 @@ impl Raven {
             .map(|(w, p)| (w.clone(), p))
     }
 
-    pub fn surface_under_pointer(&self) -> Option<(WlSurface, Point<f64, Logical>)> {
-        let position = self.pointer_location;
-        let (output, output_geo) = self.space.outputs().find_map(|output| {
-            let geometry = self.space.output_geometry(output)?;
-            if geometry.to_f64().contains(position) {
-                Some((output, geometry))
-            } else {
-                None
-            }
-        })?;
+    pub fn contents_under(&self, position: Point<f64, Logical>) -> PointContents {
+        let Some(output) = self.space.output_under(position).next() else {
+            return PointContents::default();
+        };
+        let Some(output_geo) = self.space.output_geometry(output) else {
+            return PointContents::default();
+        };
 
         let layer_map = layer_map_for_output(output);
         let position_within_output = position - output_geo.loc.to_f64();
         let fullscreen_on_output = self.output_has_ready_fullscreen_window(output);
 
-        let surface_on_layer = |layer: WlrLayer| {
+        let layer_surface_under = |layer: WlrLayer, popup: bool| -> Option<PointContents> {
             layer_map.layers_on(layer).rev().find_map(|layer_surface| {
                 let layer_geo = layer_map.layer_geometry(layer_surface)?;
+                let surface_type = (if popup {
+                    WindowSurfaceType::POPUP
+                } else {
+                    WindowSurfaceType::TOPLEVEL
+                }) | WindowSurfaceType::SUBSURFACE;
+
                 layer_surface
                     .surface_under(
                         position_within_output - layer_geo.loc.to_f64(),
-                        WindowSurfaceType::ALL,
+                        surface_type,
                     )
-                    .map(|(surface, local_pos)| {
-                        (
+                    .map(|(surface, local_pos)| PointContents {
+                        output: Some(output.clone()),
+                        surface: Some((
                             surface,
                             output_geo.loc.to_f64() + layer_geo.loc.to_f64() + local_pos.to_f64(),
-                        )
+                        )),
+                        window: None,
+                        layer: Some(layer_surface.wl_surface().clone()),
                     })
             })
         };
 
-        let window_surface = || {
-            self.space.element_under(position).and_then(|(window, location)| {
-                window
-                    .surface_under(position - location.to_f64(), WindowSurfaceType::ALL)
-                    .map(|(surface, local_pos)| (surface, (local_pos + location).to_f64()))
-            })
+        let window_under = || -> Option<PointContents> {
+            self.space
+                .element_under(position)
+                .and_then(|(window, render_location)| {
+                    window
+                        .surface_under(position - render_location.to_f64(), WindowSurfaceType::ALL)
+                        .map(|(surface, local_pos)| PointContents {
+                            output: Some(output.clone()),
+                            surface: Some((surface, (local_pos + render_location).to_f64())),
+                            window: Some(window.clone()),
+                            layer: None,
+                        })
+                })
         };
 
         if fullscreen_on_output {
-            surface_on_layer(WlrLayer::Overlay)
-                .or_else(window_surface)
-                .or_else(|| surface_on_layer(WlrLayer::Top))
-                .or_else(|| surface_on_layer(WlrLayer::Bottom))
-                .or_else(|| surface_on_layer(WlrLayer::Background))
+            layer_surface_under(WlrLayer::Overlay, true)
+                .or_else(|| layer_surface_under(WlrLayer::Overlay, false))
+                .or_else(window_under)
+                .or_else(|| layer_surface_under(WlrLayer::Top, true))
+                .or_else(|| layer_surface_under(WlrLayer::Top, false))
+                .or_else(|| layer_surface_under(WlrLayer::Bottom, true))
+                .or_else(|| layer_surface_under(WlrLayer::Background, true))
+                .or_else(|| layer_surface_under(WlrLayer::Bottom, false))
+                .or_else(|| layer_surface_under(WlrLayer::Background, false))
+                .unwrap_or_else(|| PointContents {
+                    output: Some(output.clone()),
+                    surface: None,
+                    window: None,
+                    layer: None,
+                })
         } else {
-            surface_on_layer(WlrLayer::Overlay)
-                .or_else(|| surface_on_layer(WlrLayer::Top))
-                .or_else(window_surface)
-                .or_else(|| surface_on_layer(WlrLayer::Bottom))
-                .or_else(|| surface_on_layer(WlrLayer::Background))
+            layer_surface_under(WlrLayer::Overlay, true)
+                .or_else(|| layer_surface_under(WlrLayer::Overlay, false))
+                .or_else(|| layer_surface_under(WlrLayer::Top, true))
+                .or_else(|| layer_surface_under(WlrLayer::Top, false))
+                .or_else(window_under)
+                .or_else(|| layer_surface_under(WlrLayer::Bottom, true))
+                .or_else(|| layer_surface_under(WlrLayer::Background, true))
+                .or_else(|| layer_surface_under(WlrLayer::Bottom, false))
+                .or_else(|| layer_surface_under(WlrLayer::Background, false))
+                .unwrap_or_else(|| PointContents {
+                    output: Some(output.clone()),
+                    surface: None,
+                    window: None,
+                    layer: None,
+                })
         }
+    }
+
+    pub fn update_pointer_contents(&mut self, time_msec: u32) -> bool {
+        let pointer = self.pointer();
+        let location = pointer.current_location();
+        self.pointer_location = location;
+        let under = self.contents_under(location);
+        if self.pointer_contents == under {
+            return false;
+        }
+
+        self.pointer_contents.clone_from(&under);
+
+        pointer.motion(
+            self,
+            under.surface,
+            &MotionEvent {
+                location,
+                serial: SERIAL_COUNTER.next_serial(),
+                time: time_msec,
+            },
+        );
+        self.maybe_activate_pointer_constraint();
+
+        true
+    }
+
+    pub fn refresh_pointer_contents(&mut self) -> bool {
+        let time_msec = self.start_time.elapsed().as_millis() as u32;
+        if !self.update_pointer_contents(time_msec) {
+            return false;
+        }
+
+        self.pointer().frame(self);
+        crate::backend::udev::queue_redraw_all(self);
+        true
+    }
+
+    /// Activate a pointer constraint if one is available for the current pointer focus.
+    /// Make sure the pointer location and contents are up to date before calling this.
+    pub fn maybe_activate_pointer_constraint(&self) {
+        let Some((surface, surface_loc)) = &self.pointer_contents.surface else {
+            return;
+        };
+
+        let pointer = self.pointer();
+        if Some(surface) != pointer.current_focus().as_ref() {
+            return;
+        }
+
+        smithay::wayland::pointer_constraints::with_pointer_constraint(
+            surface,
+            &pointer,
+            |constraint| {
+                let Some(constraint) = constraint else { return };
+
+                if constraint.is_active() {
+                    return;
+                }
+
+                // Constraint does not apply if not within region.
+                if let Some(region) = constraint.region() {
+                    let pointer_pos = pointer.current_location();
+                    let pos_within_surface = pointer_pos - *surface_loc;
+                    if !region.contains(pos_within_surface.to_i32_round()) {
+                        return;
+                    }
+                }
+
+                constraint.activate();
+            },
+        );
     }
 
     pub fn pointer(&self) -> PointerHandle<Self> {
@@ -529,9 +656,9 @@ impl Raven {
     }
 
     pub fn output_has_ready_fullscreen_window(&self, output: &smithay::output::Output) -> bool {
-        self.fullscreen_windows.iter().any(|window| {
-            self.window_is_ready_fullscreen_on_output(window, output)
-        })
+        self.fullscreen_windows
+            .iter()
+            .any(|window| self.window_is_ready_fullscreen_on_output(window, output))
     }
 
     fn window_is_ready_fullscreen_on_output(
@@ -569,9 +696,9 @@ impl Raven {
             .space
             .element_geometry(&window)
             .unwrap_or_else(|| window.geometry());
-        let fullscreen_sized =
-            window_geo.size.w + Self::FULLSCREEN_READY_TOLERANCE >= output_geo.size.w
-                && window_geo.size.h + Self::FULLSCREEN_READY_TOLERANCE >= output_geo.size.h;
+        let fullscreen_sized = window_geo.size.w + Self::FULLSCREEN_READY_TOLERANCE
+            >= output_geo.size.w
+            && window_geo.size.h + Self::FULLSCREEN_READY_TOLERANCE >= output_geo.size.h;
         let surface_buffer_sized = with_states(surface, |states| {
             states
                 .data_map
@@ -653,7 +780,8 @@ impl Raven {
             return false;
         }
 
-        self.fullscreen_windows.retain(|candidate| candidate != window);
+        self.fullscreen_windows
+            .retain(|candidate| candidate != window);
         self.clear_fullscreen_ready_for_window(window);
         self.set_window_fullscreen_state(window, false);
         true
