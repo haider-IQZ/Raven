@@ -10,6 +10,13 @@ Raven supports:
 - Nested sessions (inside an existing Wayland/X11 session via Winit)
 - Native sessions on real hardware (DRM/KMS + libinput + libseat)
 
+## Why Raven
+
+- Fast, direct compositor path focused on real responsiveness
+- Practical defaults that still stay highly configurable
+- Lua-based config for readable and quick iteration
+- Built for daily driving, but still easy to hack on
+
 ## Feature Highlights
 
 - Master/stack tiling layout with configurable gaps and borders
@@ -78,6 +85,21 @@ When Raven is running, these commands talk to Raven IPC:
 | `raven clients` | Prints client list (class/app_id, title, workspace, mapped, floating, fullscreen, focused) |
 | `raven monitors` | Prints active monitor names, mode, position, logical size, and scale |
 | `raven reload` | Reloads `config.lua` at runtime |
+
+## Default Keymap
+
+| Combo | Action |
+| --- | --- |
+| `Main+Q` | Launch terminal |
+| `Main+D` | Launch launcher |
+| `Main+C` | Close focused window |
+| `Main+F` | Toggle fullscreen |
+| `Main+V` | Toggle floating |
+| `Main+J` / `Main+K` | Focus next / previous |
+| `Main+1..0` | Switch workspace 1..10 |
+| `Main+Shift+1..0` | Move window to workspace 1..10 |
+| `Main+Shift+R` | Reload config |
+| `Main+Shift+Q` | Quit Raven |
 
 ## Configuration
 
@@ -216,8 +238,8 @@ Parsed but currently unimplemented:
 
 ## Xwayland Notes
 
-- Install `xwayland-satellite`
-- Keep `xwayland.enabled = true`
+- `xwayland.enabled` is `true` by default
+- Install `xwayland-satellite` (default binary name used by Raven)
 - Customize binary and display with `xwayland.path` and `xwayland.display`
 
 ## Runtime Behavior
