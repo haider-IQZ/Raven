@@ -400,7 +400,7 @@ impl PointerConstraintsHandler for Raven {
 
         // Refresh focus at the hinted position and redraw for visible cursor updates.
         self.refresh_pointer_contents();
-        crate::backend::udev::queue_redraw_all(self);
+        self.queue_redraw_for_pointer_output();
     }
 }
 

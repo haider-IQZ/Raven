@@ -1,29 +1,30 @@
 # Raven
 
-Raven is a tiling Wayland compositor written in Rust using [Smithay](https://github.com/Smithay/smithay).
+> A fast, Lua-configured Wayland compositor built in Rust on top of [Smithay](https://github.com/Smithay/smithay).
 
-It supports both:
-- Nested mode (inside an existing Wayland/X11 session via Winit)
-- Standalone mode on real hardware (DRM/KMS + libinput + libseat)
+[![Status](https://img.shields.io/badge/status-alpha-orange)](#project-status)
+[![License](https://img.shields.io/badge/license-GPL--3.0-blue)](./Cargo.toml)
+[![Language](https://img.shields.io/badge/language-rust-black)](https://www.rust-lang.org/)
 
-Project status: alpha.
+Raven supports:
+- Nested sessions (inside an existing Wayland/X11 session via Winit)
+- Native sessions on real hardware (DRM/KMS + libinput + libseat)
 
-## Features
+## Feature Highlights
 
-- Master/stack tiling layout with configurable gaps and border size
-- 10 workspaces with built-in `Main+1..0` switching and `Main+Shift+1..0` move
-- Fullscreen toggle, focus cycling, close focused window
-- Layer-shell integration (Waybar, launchers, notifications) with reserved space handling
-- Runtime config reload (`Main+Shift+R` by default)
-- Lua config at `~/.config/raven/config.lua`
-- Window rules (`class`/`app_id`/`title` match with workspace/floating/fullscreen/focus actions)
-- Per-output monitor configuration (mode, refresh, scale, transform, position, enable/disable)
-- Wallpaper restore flow (external command, default `waypaper --restore`) with optional legacy `swww` mode
-- Xwayland support via automatic `xwayland-satellite` startup (`DISPLAY` export for spawned apps)
-- `no_csd` mode with server decoration preference + environment/spawn overrides
+- Master/stack tiling layout with configurable gaps and borders
+- Fullscreen, floating toggle, focus cycling, close focused window
+- 10 workspaces with built-in `Main+1..0` switch and `Main+Shift+1..0` move
+- Runtime config reload (`Main+Shift+R`)
+- Lua config (`~/.config/raven/config.lua`)
+- Window rules (`class` / `app_id` / `title` -> workspace/floating/fullscreen/focus/size)
+- Per-monitor config (mode/scale/transform/position/enable-disable)
+- Layer-shell support (Waybar, launchers, notifications) with reserved space handling
+- Xwayland via `xwayland-satellite` (auto start + `DISPLAY` export)
+- Wallpaper restore flow (default `waypaper --restore`) + legacy `swww` mode
 - Foreign toplevel management (`zwlr_foreign_toplevel_management_v1`)
 - Ext workspace protocol (`ext_workspace_v1`)
-- WLR screencopy protocol support
+- WLR screencopy protocol
 
 ## Quick Start (Nix)
 
@@ -32,15 +33,13 @@ nix develop
 cargo run
 ```
 
-Run nested explicitly:
+Run mode controls:
 
 ```bash
+# Force nested
 cargo run -- --winit
-```
 
-Force native DRM/KMS explicitly (even if a display environment variable is set):
-
-```bash
+# Force native
 cargo run -- --drm
 ```
 
@@ -50,54 +49,45 @@ Spawn an app on startup:
 cargo run -- foot
 ```
 
-Debug logs:
+Debug logging:
 
 ```bash
 RUST_LOG=debug cargo run
 ```
 
-Scanout tuning:
-- Default is conservative (`scanout` disabled) for stability on flicker-prone apps.
-- Re-enable scanout explicitly with:
+Scanout behavior:
+- Default: enabled (performance-first)
+- Disable explicitly when troubleshooting:
 
 ```bash
-RAVEN_ENABLE_SCANOUT=1 cargo run -- --drm
+RAVEN_DISABLE_SCANOUT=1 cargo run -- --drm
 ```
 
-## Requirements (non-Nix)
+## Requirements (Non-Nix)
 
-If you are not using `nix develop`, Raven expects at minimum:
-- Rust toolchain (`cargo`, `rustc`)
-- A working Wayland/DRM graphics stack for Smithay backends
-- `lua` in `PATH` (Raven evaluates `config.lua` via the `lua` binary)
+- `rustc` + `cargo`
+- Working Wayland/DRM graphics stack for Smithay backends
+- `lua` in `PATH` (Raven evaluates `config.lua` through the Lua binary)
 
-## Runtime Behavior
+## CLI Commands
 
-- Raven auto-selects backend:
-  - Uses Winit when `WAYLAND_DISPLAY` or `DISPLAY` is present.
-  - Uses DRM/KMS when running from a bare TTY.
-- Raven exports `XDG_CURRENT_DESKTOP=raven` and `XDG_SESSION_DESKTOP=raven`.
-- Raven can auto-start `xwayland-satellite` and export `DISPLAY` for X11 apps.
-- Raven auto-creates `~/.config/xdg-desktop-portal/raven-portals.conf` if missing (GTK-first defaults; legacy Raven portal config is auto-migrated).
-- Raven auto-starts available portal units (`xdg-desktop-portal*`) in non-blocking mode at startup.
-- Logs are written to `log/raven.log`.
-- `swww-daemon` output is written to `log/swww-daemon.log` (when used).
+When Raven is running, these commands talk to Raven IPC:
 
-### CLI Commands
-
-When running inside a Raven session:
-- `raven clients` prints a Hyprland-style client list (class/app_id, title, workspace, mapped, floating, fullscreen, focused).
-- `raven reload` triggers runtime config reload through IPC.
+| Command | Description |
+| --- | --- |
+| `raven clients` | Prints client list (class/app_id, title, workspace, mapped, floating, fullscreen, focused) |
+| `raven monitors` | Prints active monitor names, mode, position, logical size, and scale |
+| `raven reload` | Reloads `config.lua` at runtime |
 
 ## Configuration
 
-### Location
+Config file location:
+- `~/.config/raven/config.lua`
+- or `$XDG_CONFIG_HOME/raven/config.lua`
 
-- `~/.config/raven/config.lua` (or `$XDG_CONFIG_HOME/raven/config.lua`)
-- If missing: Raven creates a default config automatically.
-- If empty: Raven writes the default config automatically.
+If the file is missing or empty, Raven writes a default config automatically.
 
-### Default Config (Lua)
+### Starter Config
 
 ```lua
 return {
@@ -113,31 +103,20 @@ return {
 
   keybindings = {
     { combo = "Main+Q", action = "exec", command = "foot" },
+    { combo = "Main+X", action = "exec", command = "firefox" },
     { combo = "Main+D", action = "exec", command = "fuzzel" },
-    { combo = "Main+C", action = "close_window" },
     { combo = "Main+F", action = "fullscreen" },
-    { combo = "Main+V", action = "toggle_floating" },
-    { combo = "Main+J", action = "focus_next" },
-    { combo = "Main+K", action = "focus_prev" },
     { combo = "Main+Shift+R", action = "reload_config" },
+    { combo = "Main+1", action = "workspace", arg = "1" },
+    { combo = "Main+Shift+1", action = "movetoworkspace", arg = "1" },
   },
 
   monitors = {
-    ["eDP-1"] = {
-      mode = "1920x1080@120.030",
-      scale = 2,
-      transform = "normal",
-      position = { x = 0, y = 0 },
-    },
+    -- Keep empty for auto mode, or define monitors by name.
+    ["eDP-1"] = { mode = "1920x1080@120.030", scale = 1.0, transform = "normal" },
   },
 
   autostart = { "waybar", "mako" },
-
-  xwayland = {
-    enabled = true,
-    path = "xwayland-satellite",
-    display = ":0",
-  },
 
   wallpaper = {
     enabled = false,
@@ -146,25 +125,71 @@ return {
 }
 ```
 
-Raven expects a Lua config table in the same structure as the default example above.
+## Monitor Configuration
 
-### Window Rules
+- Keep `monitors = {}` empty for fully automatic output setup
+- Discover output names with `raven monitors`
+- Recommended form:
+  - `monitors = { ["eDP-1"] = { ... } }`
+- Array form also works:
+  - `monitors = { { name = "eDP-1", ... } }`
+- Use exactly one sizing style per monitor:
+  - `mode = "1920x1080@120.030"` (or `mode = "1920x1080"`)
+  - `width = 1920`, `height = 1080`, optional `refresh_hz = 120.030` (aliases: `refresh`, `hz`)
+- Do not mix `mode` with `width`/`height`/`refresh_hz` in the same entry
+- Disable an output with `off = true` (same as `enabled = false`)
+- Position can be:
+  - `position = { x = 1920, y = 0 }`
+  - `x = 1920, y = 0`
 
-Window rules support:
-- matchers: `class`, `app_id`, `title`
-- actions: `workspace`, `floating`, `fullscreen`, `focus`, `width`, `height`
+Example:
+
+```lua
+monitors = {
+  ["eDP-1"] = {
+    mode = "1920x1080@120.030",
+    scale = 1.25,
+    transform = "normal",
+    position = { x = 0, y = 0 },
+  },
+  ["DP-1"] = {
+    width = 2560,
+    height = 1440,
+    refresh_hz = 165,
+    x = 1920,
+    y = 0,
+  },
+  ["HDMI-A-1"] = { off = true },
+}
+```
+
+## Window Rules
+
+Matchers:
+- `class`
+- `app_id`
+- `title`
+
+Actions:
+- `workspace`
+- `floating`
+- `fullscreen`
+- `focus`
+- `width`
+- `height`
 
 Example:
 
 ```lua
 window_rules = {
+  { class = "Firefox", workspace = "2" },
   { class = "mpv", floating = true, width = 1280, height = 720 },
 }
 ```
 
-### Keybind Actions
+## Keybind Actions
 
-Supported actions:
+Supported:
 - `exec <command>`
 - `terminal`
 - `launcher`
@@ -183,41 +208,43 @@ Parsed but currently unimplemented:
 - `resize_right`
 - `swap_master`
 
-## Monitor Configuration Notes
+## Wallpaper Notes
 
-- Configure outputs by connector name (for example `eDP-1`, `HDMI-A-1`, `DP-1`).
-- You can define monitors as:
-  - Keyed table: `monitors = { ["eDP-1"] = { ... } }`
-  - Array form: `monitors = { { name = "eDP-1", ... } }`
-- Use either:
-  - `mode = "<width>x<height>@<refresh>"` (or without refresh)
-  - Or explicit `width` + `height` (+ optional `refresh_hz`)
-- Use `off = true` (or `enabled = false`) to disable an output.
-- Check `log/raven.log` for output initialization lines to confirm names.
-
-## Wallpaper Configuration Notes
-
-- Recommended mode: set `wallpaper.restore_command` (default `waypaper --restore`).
-- Legacy mode: set `restore_command = ""` and provide `image`, `resize`, `transition_type`, `transition_duration`.
-- Requires the corresponding external tools in `PATH` (`waypaper`, or `swww`/`swww-daemon` for legacy mode).
+- Recommended mode: `wallpaper.restore_command` (default `waypaper --restore`)
+- Legacy mode: set `restore_command = ""`, then provide `image`, `resize`, `transition_type`, `transition_duration`
+- External tools must exist in `PATH` (`waypaper`, or `swww`/`swww-daemon` for legacy mode)
 
 ## Xwayland Notes
 
-- Install `xwayland-satellite` and keep `xwayland.enabled = true`.
-- Raven starts it automatically on startup and exports `DISPLAY` to spawned apps.
-- Configure custom binary path or display with `xwayland.path` and `xwayland.display`.
+- Install `xwayland-satellite`
+- Keep `xwayland.enabled = true`
+- Customize binary and display with `xwayland.path` and `xwayland.display`
 
-## Limitations
+## Runtime Behavior
 
-- Some parsed actions are placeholders (`resize_left`, `resize_right`, `swap_master`).
-- This project is still alpha; expect behavior changes.
+- Auto backend selection:
+  - Winit when `WAYLAND_DISPLAY` or `DISPLAY` exists
+  - DRM/KMS on bare TTY
+- Exports:
+  - `XDG_CURRENT_DESKTOP=raven`
+  - `XDG_SESSION_DESKTOP=raven`
+- Auto portal setup:
+  - Creates `~/.config/xdg-desktop-portal/raven-portals.conf` when missing
+  - Starts available `xdg-desktop-portal*` units non-blocking at startup
+- Logs:
+  - Raven logs: `log/raven.log`
+  - swww daemon logs: `log/swww-daemon.log` (when used)
+
+## Project Status
+
+Raven is currently **alpha**. Behavior and internals can still change quickly.
 
 ## Development Notes
 
-- Main entrypoint: `src/main.rs`
-- Compositor state and runtime logic: `src/state.rs`
-- Config loading and parsing: `src/config.rs`
+- Entrypoint: `src/main.rs`
+- Core compositor state/runtime: `src/state.rs`
+- Config loading/parsing: `src/config.rs`
 - Input handling: `src/input.rs`
 - Backends:
-  - Nested: `src/backend/winit.rs`
+  - Winit: `src/backend/winit.rs`
   - DRM/KMS: `src/backend/udev.rs`

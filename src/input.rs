@@ -41,7 +41,7 @@ impl Raven {
 
         if should_redraw {
             self.last_pointer_redraw_msec = Some(event_time_msec);
-            crate::backend::udev::queue_redraw_all(self);
+            self.queue_redraw_for_pointer_output();
         }
     }
 
@@ -282,7 +282,7 @@ impl Raven {
             self.update_keyboard_focus(self.pointer_location, serial, false);
         }
 
-        crate::backend::udev::queue_redraw_all(self);
+        self.queue_redraw_for_pointer_output();
     }
 
     fn handle_pointer_button<B: InputBackend>(&mut self, event: B::PointerButtonEvent) {
@@ -361,7 +361,7 @@ impl Raven {
         );
         pointer.frame(self);
 
-        crate::backend::udev::queue_redraw_all(self);
+        self.queue_redraw_for_pointer_output();
     }
 
     fn update_keyboard_focus(
@@ -512,7 +512,7 @@ impl Raven {
         // Activate pointer constraint if necessary (for games that lock the pointer).
         self.maybe_activate_pointer_constraint();
 
-        crate::backend::udev::queue_redraw_all(self);
+        self.queue_redraw_for_pointer_output();
     }
 
     fn clamp_pointer_location(&mut self) {

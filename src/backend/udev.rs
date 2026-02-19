@@ -82,27 +82,26 @@ const SUPPORTED_FORMATS: &[Fourcc] = &[Fourcc::Abgr8888, Fourcc::Argb8888];
 // Background clear color (same as winit backend)
 const CLEAR_COLOR: [f32; 4] = [150.0 / 255.0, 154.0 / 255.0, 171.0 / 255.0, 1.0];
 
-fn frame_flags() -> FrameFlags {
-    static ENABLE_SCANOUT: OnceLock<bool> = OnceLock::new();
-    let enable_scanout = *ENABLE_SCANOUT.get_or_init(|| {
-        // Conservative default for stability: keep scanout off unless explicitly enabled.
-        std::env::var_os("RAVEN_DISABLE_SCANOUT")
-            .map(|value| {
-                let value = value.to_string_lossy().to_ascii_lowercase();
-                matches!(value.as_str(), "1" | "true" | "yes" | "on")
-            })
-            .map(|disabled| !disabled)
-            .unwrap_or_else(|| {
-                std::env::var_os("RAVEN_ENABLE_SCANOUT")
-                    .map(|value| {
-                        let value = value.to_string_lossy().to_ascii_lowercase();
-                        matches!(value.as_str(), "1" | "true" | "yes" | "on")
-                    })
-                    .unwrap_or(false)
-            })
-    });
+fn env_truthy(name: &str) -> Option<bool> {
+    std::env::var_os(name).map(|value| {
+        let value = value.to_string_lossy().to_ascii_lowercase();
+        matches!(value.as_str(), "1" | "true" | "yes" | "on")
+    })
+}
 
-    if enable_scanout {
+fn scanout_enabled() -> bool {
+    static ENABLE_SCANOUT: OnceLock<bool> = OnceLock::new();
+    *ENABLE_SCANOUT.get_or_init(|| {
+        // Performance-first default: keep scanout enabled unless explicitly disabled.
+        if let Some(disabled) = env_truthy("RAVEN_DISABLE_SCANOUT") {
+            return !disabled;
+        }
+        env_truthy("RAVEN_ENABLE_SCANOUT").unwrap_or(true)
+    })
+}
+
+fn frame_flags() -> FrameFlags {
+    if scanout_enabled() {
         FrameFlags::DEFAULT
     } else {
         FrameFlags::empty()
@@ -119,6 +118,40 @@ fn force_full_redraw() -> bool {
             })
             .unwrap_or(false)
     })
+}
+
+fn scanout_rejection_reason(
+    state: &Raven,
+    output: &Output,
+    fullscreen_on_output: bool,
+    transition_clip_active: bool,
+) -> Option<&'static str> {
+    if !fullscreen_on_output {
+        return Some("fullscreen-not-ready");
+    }
+
+    if transition_clip_active {
+        return Some("fullscreen-transition-active");
+    }
+
+    let Some(output_geo) = state.space.output_geometry(output) else {
+        return Some("missing-output-geometry");
+    };
+
+    let cursor_visible_on_output = output_geo.to_f64().contains(state.pointer_location)
+        && !matches!(state.cursor_status, CursorImageStatus::Hidden);
+    if cursor_visible_on_output {
+        return Some("cursor-visible");
+    }
+
+    let layer_map = layer_map_for_output(output);
+    let overlay_or_top_visible = layer_map.layers_on(WlrLayer::Overlay).next().is_some()
+        || layer_map.layers_on(WlrLayer::Top).next().is_some();
+    if overlay_or_top_visible {
+        return Some("overlay-or-top-layer-visible");
+    }
+
+    None
 }
 
 // Type aliases for the renderer stack
@@ -1006,6 +1039,18 @@ fn render_surface(state: &mut Raven, node: DrmNode, crtc: crtc::Handle) {
     let fullscreen_requested_on_output = state.output_has_fullscreen_window(&output);
     let fullscreen_on_output = state.output_has_ready_fullscreen_window(&output);
     let transition_full_redraw = state.take_fullscreen_transition_redraw_for_output(&output);
+    let transition_clip_active =
+        fullscreen_requested_on_output && (!fullscreen_on_output || transition_full_redraw);
+
+    if fullscreen_requested_on_output {
+        if !scanout_enabled() {
+            state.record_scanout_rejection(&output, "scanout-disabled");
+        } else if let Some(reason) =
+            scanout_rejection_reason(state, &output, fullscreen_on_output, transition_clip_active)
+        {
+            state.record_scanout_rejection(&output, reason);
+        }
+    }
 
     let udev = state.udev_data.as_mut().unwrap();
     let Some(device) = udev.backends.get_mut(&node) else {
@@ -1159,8 +1204,6 @@ fn render_surface(state: &mut Raven, node: DrmNode, crtc: crtc::Handle) {
                 bbox.size.to_f64().to_physical(output_scale).to_i32_round(),
             ))
         });
-    let transition_clip_active =
-        fullscreen_requested_on_output && (!fullscreen_on_output || transition_full_redraw);
     let mut space_elements_converted: Vec<
         UdevCompositeRenderElement<UdevRenderer<'_>, WaylandSurfaceRenderElement<UdevRenderer<'_>>>,
     > = Vec::new();

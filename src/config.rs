@@ -1385,32 +1385,40 @@ return {
     { combo = "Main+8", action = "workspace", arg = "8" },
     { combo = "Main+9", action = "workspace", arg = "9" },
     { combo = "Main+0", action = "workspace", arg = "10" },
+
+    { combo = "Main+Shift+1", action = "movetoworkspace", arg = "1" },
+    { combo = "Main+Shift+2", action = "movetoworkspace", arg = "2" },
+    { combo = "Main+Shift+3", action = "movetoworkspace", arg = "3" },
+    { combo = "Main+Shift+4", action = "movetoworkspace", arg = "4" },
+    { combo = "Main+Shift+5", action = "movetoworkspace", arg = "5" },
+    { combo = "Main+Shift+6", action = "movetoworkspace", arg = "6" },
+    { combo = "Main+Shift+7", action = "movetoworkspace", arg = "7" },
+    { combo = "Main+Shift+8", action = "movetoworkspace", arg = "8" },
+    { combo = "Main+Shift+9", action = "movetoworkspace", arg = "9" },
+    { combo = "Main+Shift+0", action = "movetoworkspace", arg = "10" },
   },
 
   monitors = {
-    -- Configure outputs by name (check `log/raven.log` for "Output initialized" lines).
+    -- Keep empty to let Raven auto-pick preferred modes for all outputs.
+    -- Use your real monitor names (examples: eDP-1, DP-1, HDMI-A-1).
+    -- You can list current names with: `raven monitors`.
+    --
+    -- Recommended keyed form:
     -- ["eDP-1"] = {
-    --   -- Set `off = true` to disable this output.
-    --   -- off = true,
+    --   -- Use ONE sizing method (do not mix):
+    --   -- mode = "1920x1080@120.030"   -- or "1920x1080"
+    --   -- width = 1920, height = 1080, refresh_hz = 120.030
     --
-    --   -- Output mode format: "<width>x<height>" or "<width>x<height>@<refresh>".
-    --   -- mode = "1920x1080@120.030",
-    --
-    --   -- You can also use the explicit fields instead of `mode`:
-    --   -- width = 1920,
-    --   -- height = 1080,
-    --   -- refresh_hz = 120.030,
-    --
-    --   -- Scale supports integer or fractional values.
-    --   scale = 2,
-    --
-    --   -- Valid transforms: normal, 90, 180, 270, flipped, flipped-90,
-    --   -- flipped-180, flipped-270.
-    --   transform = "normal",
-    --
-    --   -- Output position in logical coordinates.
-    --   position = { x = 1280, y = 0 },
+    --   scale = 1.0,                     -- integer/fractional, must be > 0
+    --   transform = "normal",            -- normal/90/180/270/flipped/flipped-90/flipped-180/flipped-270
+    --   position = { x = 0, y = 0 },     -- or x = 0, y = 0
     -- },
+    --
+    -- Disable an output:
+    -- ["HDMI-A-1"] = { off = true },     -- same as enabled = false
+    --
+    -- Also valid (array form):
+    -- { name = "DP-1", mode = "2560x1440@165", x = 1920, y = 0 },
   },
 
   window_rules = {
@@ -1426,6 +1434,8 @@ return {
   wallpaper = {
     enabled = false,
     restore_command = "waypaper --restore",
+    -- Note: with waypaper restore configured, Raven may still ensure swww-daemon
+    -- is running at startup for compatibility, even if enabled = false.
 
     -- Optional legacy swww mode:
     -- Set restore_command = "" and uncomment the keys below.

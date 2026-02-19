@@ -148,6 +148,8 @@ pub struct Raven {
     ready_fullscreen_surfaces: HashSet<u32>,
     // Remaining redraw budget for fullscreen transitions per output name.
     fullscreen_transition_redraw_by_output: HashMap<String, u8>,
+    // Track scanout rejection reasons per output to aid debugging/perf tuning.
+    scanout_reject_counters: HashMap<String, u64>,
     pub floating_windows: Vec<Window>,
     pub pending_floating_recenter_ids: HashSet<u32>,
     pub pending_window_rule_recheck_ids: HashSet<u32>,
@@ -280,6 +282,7 @@ impl Raven {
             fullscreen_windows: Vec::new(),
             ready_fullscreen_surfaces: HashSet::new(),
             fullscreen_transition_redraw_by_output: HashMap::new(),
+            scanout_reject_counters: HashMap::new(),
             floating_windows: Vec::new(),
             pending_floating_recenter_ids: HashSet::new(),
             pending_window_rule_recheck_ids: HashSet::new(),
@@ -573,8 +576,23 @@ impl Raven {
         }
 
         self.pointer().frame(self);
-        crate::backend::udev::queue_redraw_all(self);
+        self.queue_redraw_for_pointer_output();
         true
+    }
+
+    pub fn queue_redraw_for_pointer_output(&mut self) {
+        let output = self.pointer_contents.output.clone().or_else(|| {
+            self.space
+                .output_under(self.pointer_location)
+                .next()
+                .cloned()
+        });
+
+        if let Some(output) = output {
+            crate::backend::udev::queue_redraw_for_output(self, &output);
+        } else {
+            crate::backend::udev::queue_redraw_all(self);
+        }
     }
 
     /// Activate a pointer constraint if one is available for the current pointer focus.
@@ -615,6 +633,23 @@ impl Raven {
 
     pub fn pointer(&self) -> PointerHandle<Self> {
         self.seat.get_pointer().expect("pointer not initialized")
+    }
+
+    pub fn record_scanout_rejection(
+        &mut self,
+        output: &smithay::output::Output,
+        reason: &'static str,
+    ) {
+        let key = format!("{}:{reason}", output.name());
+        let count = self
+            .scanout_reject_counters
+            .entry(key)
+            .and_modify(|count| *count += 1)
+            .or_insert(1);
+
+        if *count <= 3 || *count % 300 == 0 {
+            tracing::info!(output = %output.name(), reason, count = *count, "scanout rejected");
+        }
     }
 
     pub fn add_window_to_current_workspace(&mut self, window: Window) {
@@ -1205,6 +1240,10 @@ impl Raven {
                 let output = self.render_clients_report();
                 Self::write_ipc_response(&mut stream, &output);
             }
+            "monitors" => {
+                let output = self.render_monitors_report();
+                Self::write_ipc_response(&mut stream, &output);
+            }
             "reload" => match self.reload_config() {
                 Ok(()) => Self::write_ipc_response(&mut stream, "ok\n"),
                 Err(err) => Self::write_ipc_response(&mut stream, &format!("error: {err}\n")),
@@ -1212,13 +1251,15 @@ impl Raven {
             "" => {
                 Self::write_ipc_response(
                     &mut stream,
-                    "error: empty command (supported: clients, reload)\n",
+                    "error: empty command (supported: clients, monitors, reload)\n",
                 );
             }
             other => {
                 Self::write_ipc_response(
                     &mut stream,
-                    &format!("error: unsupported command `{other}` (supported: clients, reload)\n"),
+                    &format!(
+                        "error: unsupported command `{other}` (supported: clients, monitors, reload)\n"
+                    ),
                 );
             }
         }
@@ -1292,6 +1333,57 @@ impl Raven {
             out.push_str(&format!("  floating: {floating}\n"));
             out.push_str(&format!("  fullscreen: {fullscreen}\n"));
             out.push_str(&format!("  focused: {focused}\n"));
+            out.push('\n');
+        }
+
+        out
+    }
+
+    fn render_monitors_report(&self) -> String {
+        let mut outputs: Vec<_> = self.space.outputs().cloned().collect();
+        if outputs.is_empty() {
+            return "No monitors.\n".to_owned();
+        }
+
+        outputs.sort_by_key(|output| {
+            self.space
+                .output_geometry(output)
+                .map(|geo| (geo.loc.x, geo.loc.y))
+                .unwrap_or((i32::MAX, i32::MAX))
+        });
+
+        let mut out = String::new();
+        for (index, output) in outputs.iter().enumerate() {
+            out.push_str(&format!("Monitor {}:\n", index + 1));
+            out.push_str(&format!("  name: {}\n", output.name()));
+
+            if let Some(mode) = output.current_mode() {
+                if mode.refresh > 0 {
+                    out.push_str(&format!(
+                        "  mode: {}x{}@{:.3}\n",
+                        mode.size.w,
+                        mode.size.h,
+                        mode.refresh as f64 / 1000.0
+                    ));
+                } else {
+                    out.push_str(&format!("  mode: {}x{}\n", mode.size.w, mode.size.h));
+                }
+            } else {
+                out.push_str("  mode: <unknown>\n");
+            }
+
+            if let Some(geo) = self.space.output_geometry(output) {
+                out.push_str(&format!("  position: {}, {}\n", geo.loc.x, geo.loc.y));
+                out.push_str(&format!("  logical_size: {}x{}\n", geo.size.w, geo.size.h));
+            } else {
+                out.push_str("  position: <unknown>\n");
+                out.push_str("  logical_size: <unknown>\n");
+            }
+
+            out.push_str(&format!(
+                "  scale: {:.3}\n",
+                output.current_scale().fractional_scale()
+            ));
             out.push('\n');
         }
 
@@ -1816,6 +1908,8 @@ impl Raven {
         self.start_xwayland_satellite();
         self.kick_portal_services_async();
         self.run_autostart_commands();
+        // Waypaper compatibility path: this can start swww-daemon even when
+        // wallpaper.enabled is false. The gate here is restore_command.
         self.ensure_waypaper_swww_daemon();
         self.apply_wallpaper();
         // Make startup surfaces visible promptly without requiring input events.
@@ -2129,6 +2223,8 @@ org.freedesktop.impl.portal.Secret=gnome-keyring;\n"
         }
 
         // Ensure an swww-daemon exists for waypaper's default namespace handling.
+        // Note: intentionally not gated by wallpaper.enabled; this is a helper for
+        // users who keep waypaper restore configured but disable built-in wallpaper.
         self.spawn_command(
             "unset SWWW_SOCKET SWWW_DAEMON_SOCKET SWWW_NAMESPACE; swww query --namespace '' >/dev/null 2>&1 || (swww-daemon --namespace '' --quiet >/dev/null 2>&1 & sleep 0.2); swww query --namespace '' >/dev/null 2>&1 || (swww-daemon --quiet >/dev/null 2>&1 & sleep 0.2)",
         );

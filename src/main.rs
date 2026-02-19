@@ -26,7 +26,7 @@ fn main() -> Result<()> {
 
     let args: Vec<String> = std::env::args().collect();
     if let Some(command) = args.get(1).map(String::as_str)
-        && matches!(command, "clients" | "reload")
+        && matches!(command, "clients" | "reload" | "monitors")
     {
         let output = run_ipc_command(command)?;
         print!("{output}");

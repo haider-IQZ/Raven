@@ -31,3 +31,8 @@ drm-ffi = "0.9"
 libc = "0.2"
 libdisplay-info = "0.3"
 calloop = { version = "0.14", features = ["executor", "futures-io", "signals"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
