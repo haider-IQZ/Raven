@@ -1,115 +1,76 @@
-# Raven
+# 🐦‍⬛ Raven
 
-> A fast, Lua-configured Wayland compositor built in Rust on top of [Smithay](https://github.com/Smithay/smithay).
+> A Wayland compositor I built for myself. 
 
-[![Status](https://img.shields.io/badge/status-alpha-orange)](#project-status)
-[![License](https://img.shields.io/badge/license-GPL--3.0-blue)](./Cargo.toml)
-[![Language](https://img.shields.io/badge/language-rust-black)](https://www.rust-lang.org/)
+---
 
-Raven supports:
-- Nested sessions (inside an existing Wayland/X11 session via Winit)
-- Native sessions on real hardware (DRM/KMS + libinput + libseat)
+## What is this
 
-## Why Raven
+It's a tiling Wayland compositor written in Rust, configured in Lua, built on [Smithay](https://github.com/Smithay/smithay).
 
-- Fast, direct compositor path focused on real responsiveness
-- Practical defaults that still stay highly configurable
-- Lua-based config for readable and quick iteration
-- Built for daily driving, but still easy to hack on
+I made it because I wanted a compositor that does exactly what I want and nothing else. No animations that look like a jelly fish having a stroke. No 47 options for how rounded your corners are. Just a window manager that gets out of the way and lets me be sad in peace.
 
-## Feature Highlights
+It's fast. It's minimal. It has Lua config so I can change things at 2am without recompiling anything.
 
-- Master/stack tiling layout with configurable gaps and borders
-- Fullscreen, floating toggle, focus cycling, close focused window
-- 10 workspaces with built-in `Main+1..0` switch and `Main+Shift+1..0` move
-- Runtime config reload (`Main+Shift+R`)
-- Lua config (`~/.config/raven/config.lua`)
-- Window rules (`class` / `app_id` / `title` -> workspace/floating/fullscreen/focus/size)
-- Per-monitor config (mode/scale/transform/position/enable-disable)
-- Layer-shell support (Waybar, launchers, notifications) with reserved space handling
-- Xwayland via `xwayland-satellite` (auto start + `DISPLAY` export)
-- Wallpaper restore flow (default `waypaper --restore`) + legacy `swww` mode
-- Foreign toplevel management (`zwlr_foreign_toplevel_management_v1`)
-- Ext workspace protocol (`ext_workspace_v1`)
-- WLR screencopy protocol
+---
 
-## Quick Start (Nix)
+## Why not just use Hyprland / Sway / [insert compositor]
+
+I tried. They were fi:ne. I just wanted to build my own thing and now I have one. This is that thing.
+
+---
+
+## Does it work
+
+Yeah. I use it daily. It has not eaten any of my files yet.
+
+It's alpha software though, which is a fancy way of saying: *works on my machine, godspeed on yours.*
+
+---
+
+## Features
+
+Things Raven actually does:
+
+- **Master/stack tiling** — windows go where they're told
+- **10 workspaces** — one for every project I'll never finish
+- **Fullscreen & floating** — for when tiling feels like a personal attack
+- **Lua config** at `~/.config/raven/config.lua` — readable, hot-reloadable, civilized
+- **Window rules** — tell specific apps where to go (and they actually go there)
+- **Per-monitor config** — scales, modes, transforms, positions, the whole thing
+- **Layer-shell** — Waybar, launchers, notifications all work
+- **Xwayland** via xwayland-satellite — for the apps still living in 2009
+- **Hot config reload** — save the file, it applies. no keybind, no restart, just works
+- **IPC CLI** — `raven clients`, `raven monitors`, `raven reload`
+- **WLR screencopy** — screenshots work, yes
+- **Wallpaper** via swww — because a black desktop is a cry for help. use waypaper on top of it or set it manually via terminal, whatever you prefer
+
+---
+
+## Quick Start
 
 ```bash
 nix develop
 cargo run
 ```
 
-Run mode controls:
+That's it. If you don't use Nix, you'll need `rustc`, `cargo`, and a working graphics stack. You probably know what you're doing if you're reading a Smithay compositor README at this hour.
 
 ```bash
-# Force nested
+# Nested (inside an existing session, for testing)
 cargo run -- --winit
 
-# Force native
+# Native (on real hardware, living dangerously)
 cargo run -- --drm
 ```
 
-Spawn an app on startup:
+---
 
-```bash
-cargo run -- foot
-```
+## Config
 
-Debug logging:
+Raven writes a default config automatically if you don't have one. I got tired of seeing people open issues saying it didn't start — and honestly it's not even their fault, half the window managers out there dump their default config somewhere in `/etc` and then expect you to just know that. you don't know that. nobody knows that. Raven just writes the file to `~/.config/raven/config.lua` and moves on with its life.
 
-```bash
-RUST_LOG=debug cargo run
-```
-
-Scanout behavior:
-- Default: enabled (performance-first)
-- Disable explicitly when troubleshooting:
-
-```bash
-RAVEN_DISABLE_SCANOUT=1 cargo run -- --drm
-```
-
-## Requirements (Non-Nix)
-
-- `rustc` + `cargo`
-- Working Wayland/DRM graphics stack for Smithay backends
-- `lua` in `PATH` (Raven evaluates `config.lua` through the Lua binary)
-
-## CLI Commands
-
-When Raven is running, these commands talk to Raven IPC:
-
-| Command | Description |
-| --- | --- |
-| `raven clients` | Prints client list (class/app_id, title, workspace, mapped, floating, fullscreen, focused) |
-| `raven monitors` | Prints active monitor names, mode, position, logical size, and scale |
-| `raven reload` | Reloads `config.lua` at runtime |
-
-## Default Keymap
-
-| Combo | Action |
-| --- | --- |
-| `Main+Q` | Launch terminal |
-| `Main+D` | Launch launcher |
-| `Main+C` | Close focused window |
-| `Main+F` | Toggle fullscreen |
-| `Main+V` | Toggle floating |
-| `Main+J` / `Main+K` | Focus next / previous |
-| `Main+1..0` | Switch workspace 1..10 |
-| `Main+Shift+1..0` | Move window to workspace 1..10 |
-| `Main+Shift+R` | Reload config |
-| `Main+Shift+Q` | Quit Raven |
-
-## Configuration
-
-Config file location:
-- `~/.config/raven/config.lua`
-- or `$XDG_CONFIG_HOME/raven/config.lua`
-
-If the file is missing or empty, Raven writes a default config automatically.
-
-### Starter Config
+Also the config is **hot-reloaded**. save the file, changes apply immediately. no keybind, no restart, nothing. just save.
 
 ```lua
 return {
@@ -118,155 +79,68 @@ return {
     terminal = "foot",
     launcher = "fuzzel",
     focus_follow_mouse = true,
-    no_csd = true,
     gap_size = 8,
-    border_size = 0,
+    border_size = 0,       -- borders are for people with opinions
   },
 
   keybindings = {
     { combo = "Main+Q", action = "exec", command = "foot" },
-    { combo = "Main+X", action = "exec", command = "firefox" },
     { combo = "Main+D", action = "exec", command = "fuzzel" },
     { combo = "Main+F", action = "fullscreen" },
-    { combo = "Main+Shift+R", action = "reload_config" },
     { combo = "Main+1", action = "workspace", arg = "1" },
-    { combo = "Main+Shift+1", action = "movetoworkspace", arg = "1" },
-  },
-
-  monitors = {
-    -- Keep empty for auto mode, or define monitors by name.
-    ["eDP-1"] = { mode = "1920x1080@120.030", scale = 1.0, transform = "normal" },
   },
 
   autostart = { "waybar", "mako" },
-
-  wallpaper = {
-    enabled = false,
-    restore_command = "waypaper --restore",
-  },
 }
 ```
 
-## Monitor Configuration
+Full config docs are in the wiki. Or just read `config.rs`. It's not that long.
 
-- Keep `monitors = {}` empty for fully automatic output setup
-- Discover output names with `raven monitors`
-- Recommended form:
-  - `monitors = { ["eDP-1"] = { ... } }`
-- Array form also works:
-  - `monitors = { { name = "eDP-1", ... } }`
-- Use exactly one sizing style per monitor:
-  - `mode = "1920x1080@120.030"` (or `mode = "1920x1080"`)
-  - `width = 1920`, `height = 1080`, optional `refresh_hz = 120.030` (aliases: `refresh`, `hz`)
-- Do not mix `mode` with `width`/`height`/`refresh_hz` in the same entry
-- Disable an output with `off = true` (same as `enabled = false`)
-- Position can be:
-  - `position = { x = 1920, y = 0 }`
-  - `x = 1920, y = 0`
+---
 
-Example:
+## Default Keybindings
 
-```lua
-monitors = {
-  ["eDP-1"] = {
-    mode = "1920x1080@120.030",
-    scale = 1.25,
-    transform = "normal",
-    position = { x = 0, y = 0 },
-  },
-  ["DP-1"] = {
-    width = 2560,
-    height = 1440,
-    refresh_hz = 165,
-    x = 1920,
-    y = 0,
-  },
-  ["HDMI-A-1"] = { off = true },
-}
-```
+| Combo | What happens |
+|---|---|
+| `Main+Q` | Terminal |
+| `Main+D` | Launcher |
+| `Main+C` | Close focused window (diplomatically) |
+| `Main+F` | Fullscreen |
+| `Main+V` | Toggle floating |
+| `Main+J / K` | Focus next / previous |
+| `Main+1..0` | Switch workspace |
+| `Main+Shift+1..0` | Move window to workspace |
+| `Main+Shift+Q` | Quit |
 
-## Window Rules
-
-Matchers:
-- `class`
-- `app_id`
-- `title`
-
-Actions:
-- `workspace`
-- `floating`
-- `fullscreen`
-- `focus`
-- `width`
-- `height`
-
-Example:
-
-```lua
-window_rules = {
-  { class = "Firefox", workspace = "2" },
-  { class = "mpv", floating = true, width = 1280, height = 720 },
-}
-```
-
-## Keybind Actions
-
-Supported:
-- `exec <command>`
-- `terminal`
-- `launcher`
-- `close` / `close_window`
-- `fullscreen`
-- `toggle_floating`
-- `focus_next`
-- `focus_prev` / `focus_previous`
-- `reload_config`
-- `quit`
-- `workspace <1..10>`
-- `movetoworkspace <1..10>`
-
-Parsed but currently unimplemented:
-- `resize_left`
-- `resize_right`
-- `swap_master`
-
-## Wallpaper Notes
-
-- Recommended mode: `wallpaper.restore_command` (default `waypaper --restore`)
-- Legacy mode: set `restore_command = ""`, then provide `image`, `resize`, `transition_type`, `transition_duration`
-- External tools must exist in `PATH` (`waypaper`, or `swww`/`swww-daemon` for legacy mode)
-
-## Xwayland Notes
-
-- `xwayland.enabled` is `true` by default
-- Install `xwayland-satellite` (default binary name used by Raven)
-- Customize binary and display with `xwayland.path` and `xwayland.display`
-
-## Runtime Behavior
-
-- Auto backend selection:
-  - Winit when `WAYLAND_DISPLAY` or `DISPLAY` exists
-  - DRM/KMS on bare TTY
-- Exports:
-  - `XDG_CURRENT_DESKTOP=raven`
-  - `XDG_SESSION_DESKTOP=raven`
-- Auto portal setup:
-  - Creates `~/.config/xdg-desktop-portal/raven-portals.conf` when missing
-  - Starts available `xdg-desktop-portal*` units non-blocking at startup
-- Logs:
-  - Raven logs: `log/raven.log`
-  - swww daemon logs: `log/swww-daemon.log` (when used)
+---
 
 ## Project Status
 
-Raven is currently **alpha**. Behavior and internals can still change quickly.
+**Alpha.** I'm one person. I built this for myself. It does what I need it to do.
 
-## Development Notes
+If something's broken for you and you actually want to help — open an issue and I'll look into what's wrong. that's it. no discord, no community, no roadmap. just a github issue and me eventually reading it.
 
-- Entrypoint: `src/main.rs`
-- Core compositor state/runtime: `src/state.rs`
-- Config loading/parsing: `src/config.rs`
-- Input handling: `src/input.rs`
-- Backends:
-  - Winit: `src/backend/winit.rs`
-  - DRM/KMS: `src/backend/udev.rs`
+---
+
+## Source Layout
+
+```
+src/
+  main.rs       — starts things
+  state.rs      — the big struct that knows everything
+  config.rs     — parses your Lua so you don't have to think about it
+  input.rs      — keyboards, mice, your problems
+  backend/
+    winit.rs    — nested mode
+    udev.rs     — real hardware mode
+```
+
+---
+
+## License
+
+Check the repo. It's there.
+
+---
+
+*Built with boredom.*
