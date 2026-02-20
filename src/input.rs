@@ -320,7 +320,7 @@ impl Raven {
                 current_window_location: initial_window_location,
             };
             pointer.set_grab(self, grab, serial, Focus::Clear);
-            self.space.raise_element(&window, true);
+            self.raise_window_preserving_layer(&window);
         }
 
         if ButtonState::Pressed == button_state
@@ -343,7 +343,7 @@ impl Raven {
             let grab =
                 ResizeSurfaceGrab::start(start_data, window.clone(), edges, initial_window_rect);
             pointer.set_grab(self, grab, serial, Focus::Clear);
-            self.space.raise_element(&window, true);
+            self.raise_window_preserving_layer(&window);
         }
 
         if ButtonState::Pressed == button_state {
@@ -434,7 +434,7 @@ impl Raven {
             {
                 tracing::trace!("Setting focus of surface under pointer");
                 if raise {
-                    self.space.raise_element(&window, true);
+                    self.raise_window_preserving_layer(&window);
                 }
                 if let Some(toplevel) = window.toplevel() {
                     self.set_keyboard_focus(Some(toplevel.wl_surface().clone()), serial);

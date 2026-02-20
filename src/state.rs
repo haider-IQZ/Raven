@@ -450,7 +450,53 @@ impl Raven {
             }
         }
 
+        self.restack_floating_windows_above_tiled();
+
         Ok(())
+    }
+
+    fn restack_floating_windows_above_tiled(&mut self) {
+        let windows: Vec<Window> = self.space.elements().cloned().collect();
+        if windows.len() < 2 {
+            return;
+        }
+
+        // Keep fullscreen stacking untouched.
+        let has_mapped_fullscreen = windows.iter().any(|window| {
+            self.fullscreen_windows
+                .iter()
+                .any(|candidate| Self::windows_match(candidate, window))
+        });
+        if has_mapped_fullscreen {
+            return;
+        }
+
+        let mut tiled_windows = Vec::new();
+        let mut floating_windows = Vec::new();
+        for window in windows {
+            if self.is_window_floating(&window) {
+                floating_windows.push(window);
+            } else {
+                tiled_windows.push(window);
+            }
+        }
+
+        if tiled_windows.is_empty() || floating_windows.is_empty() {
+            return;
+        }
+
+        // Preserve relative order inside each group, but ensure floating stays above tiled.
+        for window in &tiled_windows {
+            self.space.raise_element(window, true);
+        }
+        for window in &floating_windows {
+            self.space.raise_element(window, true);
+        }
+    }
+
+    pub(crate) fn raise_window_preserving_layer(&mut self, window: &Window) {
+        self.space.raise_element(window, true);
+        self.restack_floating_windows_above_tiled();
     }
 
     pub fn window_for_surface(&self, surface: &WlSurface) -> Option<Window> {
@@ -1633,6 +1679,11 @@ impl Raven {
         let focused_window = target
             .as_ref()
             .and_then(|surface| self.window_for_surface(surface));
+        if let Some(window) = focused_window.as_ref()
+            && self.is_window_mapped(window)
+        {
+            self.raise_window_preserving_layer(window);
+        }
         self.sync_window_activation(focused_window.as_ref());
 
         if let Some(keyboard) = self.seat.get_keyboard() {

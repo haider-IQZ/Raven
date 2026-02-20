@@ -205,7 +205,7 @@ impl ForeignToplevelHandler for Raven {
             return;
         }
 
-        self.space.raise_element(&window, true);
+        self.raise_window_preserving_layer(&window);
         self.set_keyboard_focus(Some(wl_surface), SERIAL_COUNTER.next_serial());
     }
 
@@ -292,7 +292,7 @@ impl ForeignToplevelHandler for Raven {
         }
 
         toplevel.send_pending_configure();
-        self.space.raise_element(&window, true);
+        self.raise_window_preserving_layer(&window);
     }
 
     fn unset_maximized(&mut self, wl_surface: WlSurface) {
