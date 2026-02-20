@@ -1,5 +1,5 @@
 use smithay::{
-    backend::renderer::utils::on_commit_buffer_handler,
+    backend::renderer::utils::{RendererSurfaceStateUserData, on_commit_buffer_handler},
     delegate_compositor, delegate_shm,
     input::pointer::MotionEvent,
     reexports::{
@@ -127,6 +127,44 @@ impl CompositorHandler for Raven {
 
         xdg_shell::handle_commit(&mut self.popups, &self.space, surface);
         if let Some(root_surface) = root_surface.as_ref() {
+            if let Some(window) = self.window_for_surface(root_surface) {
+                let root_has_buffer = with_states(root_surface, |states| {
+                    states
+                        .data_map
+                        .get::<RendererSurfaceStateUserData>()
+                        .and_then(|data| data.lock().ok())
+                        .and_then(|data| data.buffer_size())
+                        .is_some()
+                });
+                let tracked_mapped = self.is_window_mapped(&window);
+                let ready_to_map = root_has_buffer;
+
+                // Keep Space mapping in sync with real surface mapping.
+                // Without this, an unmapped toplevel can still occupy a tiling slot ("ghost window").
+                if tracked_mapped && !root_has_buffer {
+                    self.space.unmap_elem(&window);
+                    self.clear_fullscreen_ready_for_window(&window);
+                    if let Err(err) = self.apply_layout() {
+                        tracing::warn!("failed to apply layout after root unmap: {err}");
+                    }
+                    self.refocus_visible_window();
+                } else if !tracked_mapped && root_has_buffer {
+                    let defer_pending = self
+                        .pending_window_rule_recheck_ids
+                        .contains(&root_surface.id().protocol_id());
+                    if !defer_pending {
+                        let on_current_workspace =
+                            self.workspace_contains_window(self.current_workspace, &window);
+                        if on_current_workspace && ready_to_map {
+                            let loc = self.initial_map_location_for_window(&window);
+                            self.space.map_element(window.clone(), loc, false);
+                            if let Err(err) = self.apply_layout() {
+                                tracing::warn!("failed to apply layout after root remap: {err}");
+                            }
+                        }
+                    }
+                }
+            }
             self.maybe_apply_deferred_window_rules(root_surface);
             self.maybe_recenter_floating_window_after_commit(root_surface);
         }

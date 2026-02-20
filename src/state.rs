@@ -18,7 +18,7 @@ use smithay::{
             protocol::wl_surface::WlSurface,
         },
     },
-    utils::{Clock, Logical, Monotonic, Point, SERIAL_COUNTER, Serial},
+    utils::{Clock, Logical, Monotonic, Point, SERIAL_COUNTER, Serial, Size},
     wayland::{
         compositor::{CompositorClientState, CompositorState, with_states},
         dmabuf::DmabufState,
@@ -33,7 +33,10 @@ use smithay::{
         shell::{
             kde::decoration::KdeDecorationState,
             wlr_layer::{Layer as WlrLayer, WlrLayerShellState},
-            xdg::{XdgShellState, XdgToplevelSurfaceData, decoration::XdgDecorationState},
+            xdg::{
+                SurfaceCachedState, XdgShellState, XdgToplevelSurfaceData,
+                decoration::XdgDecorationState,
+            },
         },
         shm::ShmState,
         socket::ListeningSocketSource,
@@ -304,7 +307,25 @@ impl Raven {
     }
 
     pub fn apply_layout(&mut self) -> Result<(), CompositorError> {
-        let windows: Vec<smithay::desktop::Window> = self.space.elements().cloned().collect();
+        let mut windows: Vec<smithay::desktop::Window> = self.space.elements().cloned().collect();
+        if windows.is_empty() {
+            return Ok(());
+        }
+
+        // Guard against duplicate mapped entries for the same wl_surface.
+        // Duplicate entries can create a fake second tile ("ghost right window").
+        let mut seen_surface_ids: HashSet<u32> = HashSet::new();
+        for window in &windows {
+            let Some(surface_id) = Self::window_surface_id(window) else {
+                continue;
+            };
+            if !seen_surface_ids.insert(surface_id) {
+                self.space.unmap_elem(window);
+                self.clear_fullscreen_ready_for_window(window);
+            }
+        }
+
+        windows = self.space.elements().cloned().collect();
         if windows.is_empty() {
             return Ok(());
         }
@@ -323,7 +344,11 @@ impl Raven {
 
         if let Some(fullscreen_window) = windows
             .iter()
-            .find(|window| self.fullscreen_windows.contains(window))
+            .find(|window| {
+                self.fullscreen_windows
+                    .iter()
+                    .any(|candidate| Self::windows_match(candidate, window))
+            })
             .cloned()
         {
             let fullscreen_ready =
@@ -353,7 +378,7 @@ impl Raven {
 
         let tiled_windows: Vec<smithay::desktop::Window> = windows
             .iter()
-            .filter(|window| !self.floating_windows.contains(window))
+            .filter(|window| !self.is_window_floating(window))
             .cloned()
             .collect();
         if tiled_windows.is_empty() {
@@ -429,12 +454,13 @@ impl Raven {
     }
 
     pub fn window_for_surface(&self, surface: &WlSurface) -> Option<Window> {
+        let surface_id = surface.id();
         self.space
             .elements()
             .find(|window| {
                 window
                     .toplevel()
-                    .is_some_and(|tl| tl.wl_surface() == surface)
+                    .is_some_and(|tl| tl.wl_surface().id() == surface_id)
             })
             .cloned()
             .or_else(|| {
@@ -444,7 +470,7 @@ impl Raven {
                     .find(|window| {
                         window
                             .toplevel()
-                            .is_some_and(|tl| tl.wl_surface() == surface)
+                            .is_some_and(|tl| tl.wl_surface().id() == surface_id)
                     })
                     .cloned()
             })
@@ -656,29 +682,54 @@ impl Raven {
         self.add_window_to_workspace(self.current_workspace, window);
     }
 
+    fn windows_match(lhs: &Window, rhs: &Window) -> bool {
+        match (Self::window_surface_id(lhs), Self::window_surface_id(rhs)) {
+            (Some(lhs_id), Some(rhs_id)) => lhs_id == rhs_id,
+            _ => lhs == rhs,
+        }
+    }
+
+    fn workspace_contains_window_entry(workspace: &[Window], window: &Window) -> bool {
+        workspace
+            .iter()
+            .any(|candidate| Self::windows_match(candidate, window))
+    }
+
+    pub(crate) fn workspace_contains_window(&self, workspace_index: usize, window: &Window) -> bool {
+        self.workspaces
+            .get(workspace_index)
+            .is_some_and(|workspace| Self::workspace_contains_window_entry(workspace, window))
+    }
+
     pub fn add_window_to_workspace(&mut self, workspace_index: usize, window: Window) {
         let Some(workspace) = self.workspaces.get_mut(workspace_index) else {
             tracing::warn!("attempted to add window to invalid workspace index {workspace_index}");
             return;
         };
-        if !workspace.contains(&window) {
+        if !Self::workspace_contains_window_entry(workspace, &window) {
             workspace.push(window);
         }
     }
 
     pub fn set_window_floating(&mut self, window: &Window, floating: bool) {
         if floating {
-            if !self.floating_windows.contains(window) {
+            if !self
+                .floating_windows
+                .iter()
+                .any(|candidate| Self::windows_match(candidate, window))
+            {
                 self.floating_windows.push(window.clone());
             }
         } else {
             self.floating_windows
-                .retain(|candidate| candidate != window);
+                .retain(|candidate| !Self::windows_match(candidate, window));
         }
     }
 
     pub fn is_window_floating(&self, window: &Window) -> bool {
-        self.floating_windows.contains(window)
+        self.floating_windows
+            .iter()
+            .any(|candidate| Self::windows_match(candidate, window))
     }
 
     pub fn output_has_fullscreen_window(&self, output: &smithay::output::Output) -> bool {
@@ -717,7 +768,11 @@ impl Raven {
         let Some(window) = self.window_for_surface(surface) else {
             return;
         };
-        if !self.fullscreen_windows.contains(&window) {
+        if !self
+            .fullscreen_windows
+            .iter()
+            .any(|candidate| Self::windows_match(candidate, &window))
+        {
             return;
         }
 
@@ -793,7 +848,11 @@ impl Raven {
     }
 
     pub fn enter_fullscreen_window(&mut self, window: &Window) -> bool {
-        if self.fullscreen_windows.contains(window) {
+        if self
+            .fullscreen_windows
+            .iter()
+            .any(|candidate| Self::windows_match(candidate, window))
+        {
             return false;
         }
 
@@ -811,12 +870,16 @@ impl Raven {
     }
 
     pub fn exit_fullscreen_window(&mut self, window: &Window) -> bool {
-        if !self.fullscreen_windows.contains(window) {
+        if !self
+            .fullscreen_windows
+            .iter()
+            .any(|candidate| Self::windows_match(candidate, window))
+        {
             return false;
         }
 
         self.fullscreen_windows
-            .retain(|candidate| candidate != window);
+            .retain(|candidate| !Self::windows_match(candidate, window));
         self.clear_fullscreen_ready_for_window(window);
         self.set_window_fullscreen_state(window, false);
         true
@@ -883,8 +946,15 @@ impl Raven {
             })
             .map(|geometry| {
                 let window_geo = window.geometry();
-                let window_width = window_geo.size.w.clamp(1, geometry.size.w);
-                let window_height = window_geo.size.h.clamp(1, geometry.size.h);
+                // For fixed-size popups (Steam splash/sign-in, dialogs), use size hints for
+                // placement because geometry can still be a temporary tiled size during startup.
+                let hint_size = window
+                    .toplevel()
+                    .and_then(|toplevel| Self::fixed_hint_size_for_surface(toplevel.wl_surface()));
+                let hinted_or_current_w = hint_size.map(|size| size.w).unwrap_or(window_geo.size.w);
+                let hinted_or_current_h = hint_size.map(|size| size.h).unwrap_or(window_geo.size.h);
+                let window_width = hinted_or_current_w.clamp(1, geometry.size.w);
+                let window_height = hinted_or_current_h.clamp(1, geometry.size.h);
                 let x = geometry.loc.x + (geometry.size.w - window_width) / 2;
                 let y = geometry.loc.y + (geometry.size.h - window_height) / 2;
                 (x, y)
@@ -990,6 +1060,87 @@ impl Raven {
         })
     }
 
+    fn has_matching_explicit_floating_rule(
+        &self,
+        app_id: Option<&str>,
+        title: Option<&str>,
+    ) -> bool {
+        self.config
+            .window_rules
+            .iter()
+            .any(|rule| rule.floating.is_some() && rule.matches(app_id, title))
+    }
+
+    fn surface_min_max_size(surface: &WlSurface) -> (Size<i32, Logical>, Size<i32, Logical>) {
+        with_states(surface, |states| {
+            let mut guard = states.cached_state.get::<SurfaceCachedState>();
+            let data = guard.current();
+            (data.min_size, data.max_size)
+        })
+    }
+
+    fn has_window_rule_metadata_gap(&self, app_id: Option<&str>, title: Option<&str>) -> bool {
+        self.config.window_rules.iter().any(|rule| {
+            ((rule.class.is_some() || rule.app_id.is_some()) && app_id.is_none())
+                || (rule.title.is_some() && title.is_none())
+        })
+    }
+
+    fn compute_auto_floating_for_surface(
+        &self,
+        surface: &WlSurface,
+        window: &Window,
+    ) -> (bool, &'static str) {
+        if window
+            .toplevel()
+            .is_some_and(|toplevel| toplevel.parent().is_some())
+        {
+            return (true, "parent");
+        }
+
+        let (min_size, max_size) = Self::surface_min_max_size(surface);
+        if min_size.h > 0 && min_size.h == max_size.h {
+            return (true, "fixed-height");
+        }
+
+        (false, "none")
+    }
+
+    fn fixed_hint_size_for_surface(surface: &WlSurface) -> Option<Size<i32, Logical>> {
+        let (min_size, max_size) = Self::surface_min_max_size(surface);
+        let fixed_w = min_size.w > 0 && min_size.w == max_size.w;
+        let fixed_h = min_size.h > 0 && min_size.h == max_size.h;
+        if fixed_w && fixed_h {
+            Some(min_size)
+        } else {
+            None
+        }
+    }
+
+    pub fn resolve_effective_floating_for_surface(
+        &self,
+        surface: &WlSurface,
+        window: &Window,
+        configured_floating: bool,
+    ) -> (bool, bool, bool, &'static str) {
+        let (app_id, title) = Self::surface_app_id_and_title(surface);
+        let has_explicit_floating_rule =
+            self.has_matching_explicit_floating_rule(app_id.as_deref(), title.as_deref());
+        let (auto_floating, auto_reason) = self.compute_auto_floating_for_surface(surface, window);
+        let final_floating = if has_explicit_floating_rule {
+            configured_floating
+        } else {
+            auto_floating
+        };
+
+        (
+            final_floating,
+            has_explicit_floating_rule,
+            auto_floating,
+            auto_reason,
+        )
+    }
+
     pub fn queue_window_rule_recheck_for_surface(&mut self, surface: &WlSurface) {
         if self.should_defer_window_rules_for_surface(surface) {
             self.pending_window_rule_recheck_ids
@@ -1012,22 +1163,14 @@ impl Raven {
             .remove(&surface.id().protocol_id());
     }
 
-    fn should_defer_window_rules_for_surface(&self, surface: &WlSurface) -> bool {
-        if self.config.window_rules.is_empty() {
-            return false;
-        }
-
+    pub(crate) fn should_defer_window_rules_for_surface(&self, surface: &WlSurface) -> bool {
         let (app_id, title) = Self::surface_app_id_and_title(surface);
-        for rule in &self.config.window_rules {
-            if (rule.class.is_some() || rule.app_id.is_some()) && app_id.is_none() {
-                return true;
-            }
-            if rule.title.is_some() && title.is_none() {
-                return true;
-            }
+        if self.has_window_rule_metadata_gap(app_id.as_deref(), title.as_deref()) {
+            return true;
         }
 
-        false
+        // Re-evaluate floating once the client commits real metadata/size hints.
+        !self.has_matching_explicit_floating_rule(app_id.as_deref(), title.as_deref())
     }
 
     pub fn resolve_window_rules_for_surface(&self, surface: &WlSurface) -> NewWindowRuleDecision {
@@ -1096,7 +1239,7 @@ impl Raven {
     fn workspace_index_for_window(&self, window: &Window) -> Option<usize> {
         self.workspaces
             .iter()
-            .position(|workspace| workspace.contains(window))
+            .position(|workspace| Self::workspace_contains_window_entry(workspace, window))
     }
 
     fn move_window_to_workspace_internal(
@@ -1115,8 +1258,10 @@ impl Raven {
         match source_workspace {
             Some(source_workspace) if source_workspace == target_workspace => {}
             Some(source_workspace) => {
-                self.workspaces[source_workspace].retain(|candidate| candidate != window);
-                if !self.workspaces[target_workspace].contains(window) {
+                self.workspaces[source_workspace]
+                    .retain(|candidate| !Self::windows_match(candidate, window));
+                if !Self::workspace_contains_window_entry(&self.workspaces[target_workspace], window)
+                {
                     self.workspaces[target_workspace].push(window.clone());
                 }
 
@@ -1156,10 +1301,52 @@ impl Raven {
             return;
         }
 
-        let decision = self.resolve_window_rules_for_surface(surface);
+        let mut decision = self.resolve_window_rules_for_surface(surface);
+        let (effective_floating, has_explicit_floating_rule, auto_floating, auto_reason) =
+            self.resolve_effective_floating_for_surface(surface, &window, decision.floating);
+        decision.floating = effective_floating;
+
         if let Err(err) = self.move_window_to_workspace_internal(&window, decision.workspace_index)
         {
             tracing::warn!("failed to move window after deferred rule resolution: {err}");
+        }
+        if let Some(toplevel) = window.toplevel() {
+            let mode = self.preferred_decoration_mode();
+            let fixed_hint_size = if !has_explicit_floating_rule
+                && auto_floating
+                && decision.width.is_none()
+                && decision.height.is_none()
+            {
+                Self::fixed_hint_size_for_surface(surface)
+            } else {
+                None
+            };
+            toplevel.with_pending_state(|state| {
+                state.decoration_mode = Some(mode);
+                let tiled =
+                    (mode == XdgDecorationMode::ServerSide || self.config.no_csd) && !decision.floating;
+                if tiled {
+                    state.states.set(xdg_toplevel::State::TiledLeft);
+                    state.states.set(xdg_toplevel::State::TiledRight);
+                    state.states.set(xdg_toplevel::State::TiledTop);
+                    state.states.set(xdg_toplevel::State::TiledBottom);
+                } else {
+                    state.states.unset(xdg_toplevel::State::TiledLeft);
+                    state.states.unset(xdg_toplevel::State::TiledRight);
+                    state.states.unset(xdg_toplevel::State::TiledTop);
+                    state.states.unset(xdg_toplevel::State::TiledBottom);
+                }
+                // If this window switched from a tiled configure to auto-floating and does not
+                // have a strict fixed-size hint, clear stale tiled configure size so the client
+                // can choose its natural dialog size.
+                if !has_explicit_floating_rule
+                    && auto_floating
+                    && decision.width.is_none()
+                    && decision.height.is_none()
+                {
+                    state.size = fixed_hint_size;
+                }
+            });
         }
         self.apply_window_rule_size_to_window(&window, &decision);
         if let Some(toplevel) = window.toplevel()
@@ -1190,7 +1377,21 @@ impl Raven {
             self.set_keyboard_focus(Some(surface.clone()), SERIAL_COUNTER.next_serial());
         }
 
-        self.pending_window_rule_recheck_ids.remove(&surface_id);
+        let current_geo = self
+            .space
+            .element_geometry(&window)
+            .unwrap_or_else(|| window.geometry());
+        let has_real_mapped_size = current_geo.size.w > 1 && current_geo.size.h > 1;
+        let (app_id, title) = Self::surface_app_id_and_title(surface);
+        let keep_recheck_pending = self
+            .has_window_rule_metadata_gap(app_id.as_deref(), title.as_deref())
+            || (!has_explicit_floating_rule
+                && decision.floating
+                && auto_reason == "fixed-height"
+                && !has_real_mapped_size);
+        if !keep_recheck_pending {
+            self.pending_window_rule_recheck_ids.remove(&surface_id);
+        }
     }
 
     pub fn maybe_recenter_floating_window_after_commit(&mut self, surface: &WlSurface) {
@@ -1312,7 +1513,7 @@ impl Raven {
             let workspace = self
                 .workspaces
                 .iter()
-                .position(|ws| ws.contains(window))
+                .position(|ws| Self::workspace_contains_window_entry(ws, window))
                 .map(|idx| idx + 1)
                 .unwrap_or(self.current_workspace + 1);
 
@@ -1321,7 +1522,10 @@ impl Raven {
             let focused = focused_surface.as_ref() == Some(&wl_surface);
             let mapped = self.is_window_mapped(window);
             let floating = self.is_window_floating(window);
-            let fullscreen = self.fullscreen_windows.contains(window);
+            let fullscreen = self
+                .fullscreen_windows
+                .iter()
+                .any(|candidate| Self::windows_match(candidate, window));
             let surface_id = format!("{:?}", wl_surface.id());
 
             out.push_str(&format!("Client {}:\n", index + 1));
@@ -1390,8 +1594,10 @@ impl Raven {
         out
     }
 
-    fn is_window_mapped(&self, window: &Window) -> bool {
-        self.space.elements().any(|candidate| candidate == window)
+    pub(crate) fn is_window_mapped(&self, window: &Window) -> bool {
+        self.space
+            .elements()
+            .any(|candidate| candidate == window || Self::windows_match(candidate, window))
     }
 
     pub fn sync_window_activation(&self, focused_window: Option<&Window>) {
@@ -1466,12 +1672,12 @@ impl Raven {
     pub fn remove_window_from_workspaces(&mut self, window: &Window) {
         self.clear_fullscreen_ready_for_window(window);
         for workspace in &mut self.workspaces {
-            workspace.retain(|candidate| candidate != window);
+            workspace.retain(|candidate| !Self::windows_match(candidate, window));
         }
         self.fullscreen_windows
-            .retain(|candidate| candidate != window);
+            .retain(|candidate| !Self::windows_match(candidate, window));
         self.floating_windows
-            .retain(|candidate| candidate != window);
+            .retain(|candidate| !Self::windows_match(candidate, window));
     }
 
     pub fn switch_workspace(&mut self, target_workspace: usize) -> Result<(), CompositorError> {
@@ -1527,15 +1733,15 @@ impl Raven {
         let source_workspace = self
             .workspaces
             .iter()
-            .position(|workspace| workspace.contains(&window))
+            .position(|workspace| Self::workspace_contains_window_entry(workspace, &window))
             .unwrap_or(self.current_workspace);
 
         if source_workspace == target_workspace {
             return Ok(());
         }
 
-        self.workspaces[source_workspace].retain(|candidate| candidate != &window);
-        if !self.workspaces[target_workspace].contains(&window) {
+        self.workspaces[source_workspace].retain(|candidate| !Self::windows_match(candidate, &window));
+        if !Self::workspace_contains_window_entry(&self.workspaces[target_workspace], &window) {
             self.workspaces[target_workspace].push(window.clone());
         }
 

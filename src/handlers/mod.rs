@@ -195,7 +195,9 @@ impl ForeignToplevelHandler for Raven {
         if let Some(target_workspace) = self
             .workspaces
             .iter()
-            .position(|workspace| workspace.contains(&window))
+            .enumerate()
+            .find(|(index, _)| self.workspace_contains_window(*index, &window))
+            .map(|(index, _)| index)
             && target_workspace != self.current_workspace
             && let Err(err) = self.switch_workspace(target_workspace)
         {
@@ -227,7 +229,9 @@ impl ForeignToplevelHandler for Raven {
         if let Some(target_workspace) = self
             .workspaces
             .iter()
-            .position(|workspace| workspace.contains(&window))
+            .enumerate()
+            .find(|(index, _)| self.workspace_contains_window(*index, &window))
+            .map(|(index, _)| index)
             && target_workspace != self.current_workspace
             && let Err(err) = self.switch_workspace(target_workspace)
         {

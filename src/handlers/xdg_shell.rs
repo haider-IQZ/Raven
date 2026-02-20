@@ -43,8 +43,24 @@ impl XdgShellHandler for Raven {
     }
 
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
+        if self.window_for_surface(surface.wl_surface()).is_some() {
+            tracing::warn!(
+                surface_id = surface.wl_surface().id().protocol_id(),
+                "duplicate new_toplevel for already tracked surface; ignoring"
+            );
+            surface.send_configure();
+            return;
+        }
+
         let window = Window::new_wayland_window(surface.clone());
         let rules = self.resolve_window_rules_for_surface(surface.wl_surface());
+        let (effective_floating, _, _, _) = self.resolve_effective_floating_for_surface(
+            surface.wl_surface(),
+            &window,
+            rules.floating,
+        );
+        let defer_initial_resolution =
+            self.should_defer_window_rules_for_surface(surface.wl_surface());
         let visible_on_current_workspace = rules.workspace_index == self.current_workspace;
         let mode = self.preferred_decoration_mode();
         tracing::debug!(
@@ -57,7 +73,7 @@ impl XdgShellHandler for Raven {
             state.decoration_mode = Some(mode);
             set_tiled_state(
                 state,
-                (mode == DecorationMode::ServerSide || self.config.no_csd) && !rules.floating,
+                (mode == DecorationMode::ServerSide || self.config.no_csd) && !effective_floating,
             );
         });
         tracing::debug!("new_toplevel: step=with_pending_state:done");
@@ -65,11 +81,11 @@ impl XdgShellHandler for Raven {
         self.add_window_to_workspace(rules.workspace_index, window.clone());
         tracing::debug!("new_toplevel: step=add_window_to_workspace:done");
         self.apply_window_rule_size_to_window(&window, &rules);
-        self.set_window_floating(&window, rules.floating);
-        if rules.floating {
+        self.set_window_floating(&window, effective_floating);
+        if effective_floating {
             self.queue_floating_recenter_for_surface(surface.wl_surface());
         }
-        if visible_on_current_workspace {
+        if visible_on_current_workspace && !defer_initial_resolution {
             tracing::debug!("new_toplevel: step=map_element:start");
             let location = self.initial_map_location_for_window(&window);
             self.space.map_element(window.clone(), location, false);
@@ -78,16 +94,18 @@ impl XdgShellHandler for Raven {
         if rules.fullscreen {
             self.enter_fullscreen_window(&window);
         }
-        tracing::debug!("new_toplevel: step=apply_layout:start");
-        self.apply_layout().ok();
-        tracing::debug!("new_toplevel: step=apply_layout:done");
-        if visible_on_current_workspace && rules.focus {
-            tracing::debug!("new_toplevel: step=set_keyboard_focus:start");
-            self.set_keyboard_focus(
-                Some(surface.wl_surface().clone()),
-                SERIAL_COUNTER.next_serial(),
-            );
-            tracing::debug!("new_toplevel: step=set_keyboard_focus:done");
+        if !defer_initial_resolution {
+            tracing::debug!("new_toplevel: step=apply_layout:start");
+            self.apply_layout().ok();
+            tracing::debug!("new_toplevel: step=apply_layout:done");
+            if visible_on_current_workspace && rules.focus {
+                tracing::debug!("new_toplevel: step=set_keyboard_focus:start");
+                self.set_keyboard_focus(
+                    Some(surface.wl_surface().clone()),
+                    SERIAL_COUNTER.next_serial(),
+                );
+                tracing::debug!("new_toplevel: step=set_keyboard_focus:done");
+            }
         }
         self.queue_window_rule_recheck_for_surface(surface.wl_surface());
         tracing::debug!("new_toplevel: step=send_configure:start");
@@ -401,9 +419,13 @@ fn check_grab(
 /// Should be called on `WlSurface::commit`
 pub fn handle_commit(popups: &mut PopupManager, space: &Space<Window>, surface: &WlSurface) {
     // Handle toplevel commits.
+    let surface_id = surface.id();
     if let Some(window) = space
         .elements()
-        .find(|w| w.toplevel().unwrap().wl_surface() == surface)
+        .find(|w| {
+            w.toplevel()
+                .is_some_and(|toplevel| toplevel.wl_surface().id() == surface_id)
+        })
         .cloned()
     {
         let initial_configure_sent = compositor::with_states(surface, |states| {
