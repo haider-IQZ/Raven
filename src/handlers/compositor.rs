@@ -1,5 +1,7 @@
 use smithay::{
-    backend::renderer::utils::{RendererSurfaceStateUserData, on_commit_buffer_handler},
+    backend::renderer::utils::{
+        RendererSurfaceStateUserData, on_commit_buffer_handler, with_renderer_surface_state,
+    },
     delegate_compositor, delegate_shm,
     input::pointer::MotionEvent,
     reexports::{
@@ -109,14 +111,12 @@ impl CompositorHandler for Raven {
         // the render pipeline and causes frame jitter with heavy clients (Brave).
         crate::backend::udev::early_import(self, surface);
 
-        let mut is_root = false;
         let mut root_surface = None;
         if !is_sync_subsurface(surface) {
             let mut root = surface.clone();
             while let Some(parent) = get_parent(&root) {
                 root = parent;
             }
-            is_root = root == *surface;
 
             if let Some(window) = self.window_for_surface(&root) {
                 window.on_commit();
@@ -128,6 +128,12 @@ impl CompositorHandler for Raven {
         xdg_shell::handle_commit(&mut self.popups, &self.space, surface);
         if let Some(root_surface) = root_surface.as_ref() {
             if let Some(window) = self.window_for_surface(root_surface) {
+                let (app_id, title) = crate::state::Raven::surface_app_id_and_title(root_surface);
+                // Match niri's mapping signal for precise unmap timing.
+                let root_is_mapped = with_renderer_surface_state(root_surface, |state| {
+                    state.buffer().is_some()
+                })
+                .unwrap_or(false);
                 let root_has_buffer = with_states(root_surface, |states| {
                     states
                         .data_map
@@ -137,35 +143,106 @@ impl CompositorHandler for Raven {
                         .is_some()
                 });
                 let tracked_mapped = self.is_window_mapped(&window);
-                let ready_to_map = root_has_buffer;
+                let tracked_unmapped = self.is_surface_unmapped_toplevel(root_surface);
+                let nautilus_debug = app_id.as_deref() == Some("org.gnome.Nautilus");
+                if nautilus_debug {
+                    tracing::info!(
+                        stage = "root_commit_eval",
+                        surface_id = root_surface.id().protocol_id(),
+                        ?app_id,
+                        ?title,
+                        root_is_mapped,
+                        root_has_buffer,
+                        tracked_mapped,
+                        tracked_unmapped,
+                        window_geo = %format!("{}x{}", window.geometry().size.w, window.geometry().size.h),
+                    );
+                }
+
+                if tracked_unmapped {
+                    if root_is_mapped && root_has_buffer {
+                        // niri-style transition: an explicitly tracked unmapped toplevel now has
+                        // a real root buffer, so it may enter the mapped layout path.
+                        self.clear_surface_unmapped_toplevel(root_surface);
+                        self.clear_initial_configure_for_surface(root_surface);
+                    } else {
+                        if self.pending_initial_configure_ids.contains(root_surface) {
+                            if nautilus_debug {
+                                tracing::info!(
+                                    stage = "root_commit_initial_configure_queued",
+                                    surface_id = root_surface.id().protocol_id(),
+                                    ?app_id,
+                                    ?title
+                                );
+                            }
+                            self.queue_initial_configure_idle_for_surface(root_surface);
+                        }
+                        // Ignore unmapped commits for layout mapping/unmapping synchronization.
+                        self.maybe_apply_deferred_window_rules(root_surface);
+                        self.maybe_apply_pending_unmapped_state_for_surface(root_surface);
+                        self.maybe_recenter_floating_window_after_commit(root_surface);
+                        return;
+                    }
+                }
 
                 // Keep Space mapping in sync with real surface mapping.
                 // Without this, an unmapped toplevel can still occupy a tiling slot ("ghost window").
-                if tracked_mapped && !root_has_buffer {
+                if tracked_mapped && !root_is_mapped {
                     self.space.unmap_elem(&window);
+                    if nautilus_debug {
+                        tracing::info!(
+                            stage = "root_commit_unmap",
+                            surface_id = root_surface.id().protocol_id(),
+                            ?app_id,
+                            ?title
+                        );
+                    }
                     self.clear_fullscreen_ready_for_window(&window);
+                    self.mark_surface_unmapped_toplevel(root_surface);
+                    self.queue_initial_configure_for_surface(root_surface);
+                    self.queue_window_rule_recheck_for_surface(root_surface);
                     if let Err(err) = self.apply_layout() {
                         tracing::warn!("failed to apply layout after root unmap: {err}");
                     }
                     self.refocus_visible_window();
-                } else if !tracked_mapped && root_has_buffer {
-                    let defer_pending = self
-                        .pending_window_rule_recheck_ids
-                        .contains(&root_surface.id().protocol_id());
-                    if !defer_pending {
-                        let on_current_workspace =
-                            self.workspace_contains_window(self.current_workspace, &window);
-                        if on_current_workspace && ready_to_map {
-                            let loc = self.initial_map_location_for_window(&window);
-                            self.space.map_element(window.clone(), loc, false);
-                            if let Err(err) = self.apply_layout() {
-                                tracing::warn!("failed to apply layout after root remap: {err}");
-                            }
+                } else if !tracked_mapped && root_is_mapped && root_has_buffer {
+                    let defer_pending = self.pending_window_rule_recheck_ids.contains(root_surface);
+                    if nautilus_debug {
+                        tracing::info!(
+                            stage = "root_commit_remap_check",
+                            surface_id = root_surface.id().protocol_id(),
+                            ?app_id,
+                            ?title,
+                            defer_pending
+                        );
+                    }
+                    // Match niri: resolve pending unmapped metadata/rules first, then map.
+                    if defer_pending {
+                        self.maybe_apply_deferred_window_rules(root_surface);
+                    }
+                    let on_current_workspace =
+                        self.workspace_contains_window(self.current_workspace, &window);
+                    if on_current_workspace {
+                        let loc = self.initial_map_location_for_window(&window);
+                        if nautilus_debug {
+                            tracing::info!(
+                                stage = "root_commit_remap_direct",
+                                surface_id = root_surface.id().protocol_id(),
+                                ?app_id,
+                                ?title,
+                                map_x = loc.0,
+                                map_y = loc.1
+                            );
+                        }
+                        self.space.map_element(window.clone(), loc, false);
+                        if let Err(err) = self.apply_layout() {
+                            tracing::warn!("failed to apply layout after root remap: {err}");
                         }
                     }
                 }
             }
             self.maybe_apply_deferred_window_rules(root_surface);
+            self.maybe_apply_pending_unmapped_state_for_surface(root_surface);
             self.maybe_recenter_floating_window_after_commit(root_surface);
         }
         resize_grab::handle_commit(&mut self.space, surface);
@@ -200,11 +277,6 @@ impl CompositorHandler for Raven {
                 pointer.frame(self);
             }
             self.set_keyboard_focus(Some(layer_focus), serial);
-        }
-
-        if is_root {
-            self.refresh_ext_workspace();
-            self.refresh_foreign_toplevel();
         }
 
         // Queue redraw only for the output that contains this surface,

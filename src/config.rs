@@ -736,7 +736,9 @@ fn parse_monitor_configs(
     Ok(monitors)
 }
 
-fn parse_window_rules(values: &HashMap<String, String>) -> Result<Vec<WindowRule>, CompositorError> {
+fn parse_window_rules(
+    values: &HashMap<String, String>,
+) -> Result<Vec<WindowRule>, CompositorError> {
     let mut grouped = BTreeMap::<usize, HashMap<String, String>>::new();
 
     for (key, value) in values {
@@ -787,16 +789,10 @@ fn parse_window_rules(values: &HashMap<String, String>) -> Result<Vec<WindowRule
             "focus",
             &format!("window_rule.{index}.focus"),
         )?;
-        rule.width = parse_optional_u32_in_map(
-            &fields,
-            "width",
-            &format!("window_rule.{index}.width"),
-        )?;
-        rule.height = parse_optional_u32_in_map(
-            &fields,
-            "height",
-            &format!("window_rule.{index}.height"),
-        )?;
+        rule.width =
+            parse_optional_u32_in_map(&fields, "width", &format!("window_rule.{index}.width"))?;
+        rule.height =
+            parse_optional_u32_in_map(&fields, "height", &format!("window_rule.{index}.height"))?;
 
         rules.push(rule);
     }

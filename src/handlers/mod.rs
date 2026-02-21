@@ -8,14 +8,16 @@ use smithay::{
     delegate_output, delegate_pointer_constraints, delegate_pointer_gestures,
     delegate_presentation, delegate_primary_selection, delegate_relative_pointer, delegate_seat,
     delegate_viewporter,
-    desktop::layer_map_for_output,
     input::{
         Seat, SeatHandler, SeatState,
         dnd::{DnDGrab, DndGrabHandler, GrabType},
         pointer::{CursorImageStatus, Focus, PointerHandle},
     },
     output::Output,
-    reexports::wayland_server::{Resource, protocol::wl_surface::WlSurface},
+    reexports::{
+        wayland_protocols::xdg::shell::server::xdg_toplevel,
+        wayland_server::{Resource, protocol::wl_surface::WlSurface},
+    },
     utils::{Logical, Point, SERIAL_COUNTER},
     wayland::{
         compositor::with_states,
@@ -225,6 +227,25 @@ impl ForeignToplevelHandler for Raven {
         let Some(window) = self.window_for_surface(&wl_surface) else {
             return;
         };
+        let Some(toplevel) = window.toplevel() else {
+            return;
+        };
+
+        self.set_window_floating(&window, false);
+        self.clear_floating_recenter_for_surface(&wl_surface);
+        if !self.is_window_mapped(&window) {
+            // Follow niri's approach: keep fullscreen intent pending until mapped.
+            self.queue_pending_unmapped_fullscreen_for_surface(&wl_surface);
+            toplevel.with_pending_state(|state| {
+                state.states.set(xdg_toplevel::State::Fullscreen);
+                state.states.unset(xdg_toplevel::State::Maximized);
+            });
+            if toplevel.is_initial_configure_sent() {
+                toplevel.send_pending_configure();
+            }
+            return;
+        }
+        self.clear_pending_unmapped_fullscreen_for_surface(&wl_surface);
 
         if let Some(target_workspace) = self
             .workspaces
@@ -251,6 +272,24 @@ impl ForeignToplevelHandler for Raven {
         let Some(window) = self.window_for_surface(&wl_surface) else {
             return;
         };
+        let Some(toplevel) = window.toplevel() else {
+            return;
+        };
+
+        self.clear_pending_unmapped_fullscreen_for_surface(&wl_surface);
+        if !self.is_window_mapped(&window) {
+            let restore_maximized = self.has_pending_unmapped_maximized_for_surface(&wl_surface);
+            toplevel.with_pending_state(|state| {
+                state.states.unset(xdg_toplevel::State::Fullscreen);
+                if restore_maximized {
+                    state.states.set(xdg_toplevel::State::Maximized);
+                }
+            });
+            if toplevel.is_initial_configure_sent() {
+                toplevel.send_pending_configure();
+            }
+            return;
+        }
 
         if self.exit_fullscreen_window(&window) {
             if let Err(err) = self.apply_layout() {
@@ -263,53 +302,27 @@ impl ForeignToplevelHandler for Raven {
         let Some(window) = self.window_for_surface(&wl_surface) else {
             return;
         };
-        let Some(toplevel) = window.toplevel() else {
-            return;
-        };
-
-        let output_geometry = self.space.outputs().next().and_then(|output| {
-            let mut layer_map = layer_map_for_output(output);
-            layer_map.arrange();
-            let work_geo = layer_map.non_exclusive_zone();
-            if work_geo.size.w > 0 && work_geo.size.h > 0 {
-                Some(work_geo)
-            } else {
-                self.space.output_geometry(output)
-            }
-        });
-
-        if let Some(geometry) = output_geometry {
-            toplevel.with_pending_state(|state| {
-                state.states.set(smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State::Maximized);
-                state.size = Some(geometry.size);
-                state.bounds = Some(geometry.size);
-            });
-            self.space.map_element(window.clone(), geometry.loc, true);
+        self.set_window_floating(&window, false);
+        self.clear_floating_recenter_for_surface(&wl_surface);
+        if self.is_window_mapped(&window) {
+            self.clear_pending_unmapped_maximized_for_surface(&wl_surface);
         } else {
-            toplevel.with_pending_state(|state| {
-                state.states.set(smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State::Maximized);
-            });
+            self.queue_pending_unmapped_maximized_for_surface(&wl_surface);
         }
 
-        toplevel.send_pending_configure();
-        self.raise_window_preserving_layer(&window);
+        self.set_window_maximized_state(&window, true);
+        if self.is_window_mapped(&window) {
+            self.raise_window_preserving_layer(&window);
+        }
     }
 
     fn unset_maximized(&mut self, wl_surface: WlSurface) {
         let Some(window) = self.window_for_surface(&wl_surface) else {
             return;
         };
-        let Some(toplevel) = window.toplevel() else {
-            return;
-        };
-
-        toplevel.with_pending_state(|state| {
-            state.states.unset(smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State::Maximized);
-            state.size = None;
-            state.bounds = None;
-        });
-        toplevel.send_pending_configure();
-        if let Err(err) = self.apply_layout() {
+        self.clear_pending_unmapped_maximized_for_surface(&wl_surface);
+        self.set_window_maximized_state(&window, false);
+        if self.is_window_mapped(&window) && let Err(err) = self.apply_layout() {
             tracing::warn!("failed to apply layout after foreign toplevel unmaximize: {err}");
         }
     }

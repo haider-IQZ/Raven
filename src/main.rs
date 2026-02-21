@@ -80,9 +80,15 @@ fn main() -> Result<()> {
 
     event_loop
         .run(None, &mut state, |state| {
+            if state.autostart_started {
+                state.maintain_xwayland_satellite();
+            }
+
             // Refresh compositor state before rendering: clean up dead surfaces,
             // stale popup grabs, etc.
             state.space.refresh();
+            state.refresh_ext_workspace();
+            state.refresh_foreign_toplevel();
             state.popups.cleanup();
 
             // Keep pointer focus in sync even when client surface trees change without
@@ -192,10 +198,10 @@ fn is_nested() -> bool {
 }
 
 const DEFAULT_LOG_FILTER: &str = concat!(
-    "raven=debug,",
-    "raven::backend::udev=trace,",
-    "raven::handlers=debug,",
-    "smithay::backend::drm=debug,",
+    "raven=info,",
+    "raven::backend::udev=info,",
+    "raven::handlers=info,",
+    "smithay::backend::drm=warn,",
     "smithay::backend::renderer::gles=error"
 );
 

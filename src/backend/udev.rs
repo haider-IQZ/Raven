@@ -23,8 +23,7 @@ use smithay::{
             ImportAll, ImportDma, ImportMem, ImportMemWl,
             element::{
                 AsRenderElements, Kind, default_primary_scanout_output_compare,
-                memory::MemoryRenderBuffer,
-                surface::WaylandSurfaceRenderElement,
+                memory::MemoryRenderBuffer, surface::WaylandSurfaceRenderElement,
                 utils::CropRenderElement,
             },
             gles::GlesRenderer,
@@ -35,11 +34,11 @@ use smithay::{
     },
     desktop::{
         layer_map_for_output,
+        space::{SpaceRenderElements, space_render_elements},
         utils::{
             OutputPresentationFeedback, surface_presentation_feedback_flags_from_states,
             surface_primary_scanout_output, update_surface_primary_scanout_output,
         },
-        space::{SpaceRenderElements, space_render_elements},
     },
     input::pointer::{CursorImageAttributes, CursorImageStatus},
     output::{Mode as WlMode, Output, PhysicalProperties, Scale as OutputScale, Subpixel},
@@ -196,7 +195,9 @@ enum RedrawState {
     #[default]
     Idle,
     Queued,
-    WaitingForVBlank { redraw_needed: bool },
+    WaitingForVBlank {
+        redraw_needed: bool,
+    },
     WaitingForEstimatedVBlank(RegistrationToken),
     WaitingForEstimatedVBlankAndQueued(RegistrationToken),
 }
@@ -396,6 +397,10 @@ pub fn queue_redraw_all(state: &mut Raven) {
     let mut to_queue: Vec<(DrmNode, crtc::Handle)> = Vec::new();
     for (node, backend) in &mut udev.backends {
         for (crtc, surface) in &mut backend.surfaces {
+            // Ensure queued redraws always produce at least one damaged region.
+            // Without this, remapped workspaces can occasionally hit an empty-damage frame
+            // and stay visually stale until a later input/commit triggers new damage.
+            surface.backdrop.touch();
             surface.redraw_state = std::mem::take(&mut surface.redraw_state).queue_redraw();
             to_queue.push((*node, *crtc));
         }
@@ -416,6 +421,8 @@ pub fn queue_redraw_for_output(state: &mut Raven, output: &Output) {
     for (node, backend) in &mut udev.backends {
         for (crtc, surface) in &mut backend.surfaces {
             if surface.output == *output {
+                // Force damage for explicit output redraw requests too.
+                surface.backdrop.touch();
                 surface.redraw_state = std::mem::take(&mut surface.redraw_state).queue_redraw();
                 to_queue.push((*node, *crtc));
             }
@@ -833,7 +840,10 @@ fn connector_connected(
             output: output.clone(),
             global: Some(global),
             drm_output,
-            backdrop: SolidColorBuffer::new((wl_mode.size.w as f64, wl_mode.size.h as f64), CLEAR_COLOR),
+            backdrop: SolidColorBuffer::new(
+                (wl_mode.size.w as f64, wl_mode.size.h as f64),
+                CLEAR_COLOR,
+            ),
             redraw_state: RedrawState::Queued,
             frame_callback_sequence: 0,
             vblank_throttle: VBlankThrottle::new(loop_handle, output_name.clone()),
@@ -1123,14 +1133,14 @@ fn render_surface(state: &mut Raven, node: DrmNode, crtc: crtc::Handle) {
         // transient bottom-edge artifacts without adding per-frame fullscreen repaint cost.
         surface_data.backdrop.touch();
     }
-    let mut space_elements = match space_render_elements(&mut renderer, [&state.space], &output, 1.0)
-    {
-        Ok(elements) => elements,
-        Err(e) => {
-            tracing::warn!("Failed to collect render elements: {e:?}");
-            Vec::new()
-        }
-    };
+    let mut space_elements =
+        match space_render_elements(&mut renderer, [&state.space], &output, 1.0) {
+            Ok(elements) => elements,
+            Err(e) => {
+                tracing::warn!("Failed to collect render elements: {e:?}");
+                Vec::new()
+            }
+        };
     if fullscreen_on_output {
         let mut window_elements = Vec::new();
         let mut lower_layer_elements = Vec::new();
@@ -1257,8 +1267,8 @@ fn render_surface(state: &mut Raven, node: DrmNode, crtc: crtc::Handle) {
         pointer_element.set_buffer(pointer_image);
         pointer_element.set_status(state.cursor_status.clone());
 
-        let pointer_elements: Vec<PointerRenderElement<UdevRenderer<'_>>> =
-            pointer_element.render_elements(
+        let pointer_elements: Vec<PointerRenderElement<UdevRenderer<'_>>> = pointer_element
+            .render_elements(
                 &mut renderer,
                 (cursor_pos - cursor_hotspot.to_f64())
                     .to_physical(scale)
@@ -1276,24 +1286,26 @@ fn render_surface(state: &mut Raven, node: DrmNode, crtc: crtc::Handle) {
 
     elements.extend(space_elements_converted);
     elements.push(UdevCompositeRenderElement::from(UdevRenderElement::from(
-        SolidColorRenderElement::from_buffer(&surface_data.backdrop, (0.0, 0.0), 1.0, Kind::Unspecified),
+        SolidColorRenderElement::from_buffer(
+            &surface_data.backdrop,
+            (0.0, 0.0),
+            1.0,
+            Kind::Unspecified,
+        ),
     )));
 
     // Render frame with collected elements
-    let render_result = surface_data.drm_output.render_frame(
-        &mut renderer,
-        &elements,
-        CLEAR_COLOR,
-        frame_flags(),
-    );
+    let render_result =
+        surface_data
+            .drm_output
+            .render_frame(&mut renderer, &elements, CLEAR_COLOR, frame_flags());
 
     match render_result {
         Ok(result) => {
             if result.needs_sync()
                 && let smithay::backend::drm::compositor::PrimaryPlaneElement::Swapchain(
                     ref element,
-                ) =
-                    result.primary_element
+                ) = result.primary_element
                 && let Err(err) = element.sync.wait()
             {
                 tracing::warn!("error waiting for frame completion: {err:?}");
@@ -1420,7 +1432,12 @@ fn send_frame_callbacks_for_output(
 
     let layer_map = layer_map_for_output(output);
     layer_map.layers().for_each(|layer| {
-        layer.send_frame(output, state.start_time.elapsed(), Some(Duration::ZERO), should_send);
+        layer.send_frame(
+            output,
+            state.start_time.elapsed(),
+            Some(Duration::ZERO),
+            should_send,
+        );
     });
 }
 
@@ -1589,7 +1606,10 @@ fn frame_finish(
         .filter(|mode| mode.refresh > 0)
         .map(|mode| Duration::from_secs_f64(1_000f64 / mode.refresh as f64))
         .unwrap_or_else(|| Duration::from_micros(16_667));
-    let seq = metadata.as_ref().map(|meta| meta.sequence as u64).unwrap_or(0);
+    let seq = metadata
+        .as_ref()
+        .map(|meta| meta.sequence as u64)
+        .unwrap_or(0);
     let tp = metadata.as_ref().and_then(|meta| match meta.time {
         DrmEventTime::Monotonic(tp) if !tp.is_zero() => Some(tp),
         _ => None,

@@ -1,9 +1,6 @@
 use smithay::{
     delegate_kde_decoration, delegate_xdg_decoration, delegate_xdg_shell,
-    desktop::{
-        PopupKind, PopupManager, Space, Window, find_popup_root_surface, get_popup_toplevel_coords,
-        layer_map_for_output,
-    },
+    desktop::{PopupKind, PopupManager, Space, Window, find_popup_root_surface, get_popup_toplevel_coords},
     input::{
         Seat,
         pointer::{Focus, GrabStartData as PointerGrabStartData},
@@ -51,7 +48,6 @@ impl XdgShellHandler for Raven {
             surface.send_configure();
             return;
         }
-
         let window = Window::new_wayland_window(surface.clone());
         let rules = self.resolve_window_rules_for_surface(surface.wl_surface());
         let (effective_floating, _, _, _) = self.resolve_effective_floating_for_surface(
@@ -80,17 +76,16 @@ impl XdgShellHandler for Raven {
         tracing::debug!("new_toplevel: step=add_window_to_workspace:start");
         self.add_window_to_workspace(rules.workspace_index, window.clone());
         tracing::debug!("new_toplevel: step=add_window_to_workspace:done");
+        self.mark_surface_unmapped_toplevel(surface.wl_surface());
+        self.queue_initial_configure_for_surface(surface.wl_surface());
         self.apply_window_rule_size_to_window(&window, &rules);
         self.set_window_floating(&window, effective_floating);
         if effective_floating {
             self.queue_floating_recenter_for_surface(surface.wl_surface());
         }
-        if visible_on_current_workspace && !defer_initial_resolution {
-            tracing::debug!("new_toplevel: step=map_element:start");
-            let location = self.initial_map_location_for_window(&window);
-            self.space.map_element(window.clone(), location, false);
-            tracing::debug!("new_toplevel: step=map_element:done");
-        }
+        // Do not map here. Mapping before the first committed buffer causes a visible
+        // top-left placeholder frame in some clients before tiling/full layout applies.
+        // The compositor commit path maps once the surface is truly mapped.
         if rules.fullscreen {
             self.enter_fullscreen_window(&window);
         }
@@ -108,9 +103,6 @@ impl XdgShellHandler for Raven {
             }
         }
         self.queue_window_rule_recheck_for_surface(surface.wl_surface());
-        tracing::debug!("new_toplevel: step=send_configure:start");
-        surface.send_configure();
-        tracing::debug!("new_toplevel: step=send_configure:done");
     }
 
     fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {
@@ -197,40 +189,39 @@ impl XdgShellHandler for Raven {
     }
 
     fn maximize_request(&mut self, surface: ToplevelSurface) {
-        let window = self.window_for_surface(surface.wl_surface()).unwrap();
-        let output = self.space.outputs().next().unwrap();
-        let geometry = {
-            let mut layer_map = layer_map_for_output(output);
-            layer_map.arrange();
-            let work_geo = layer_map.non_exclusive_zone();
-            if work_geo.size.w > 0 && work_geo.size.h > 0 {
-                work_geo
-            } else {
-                self.space.output_geometry(output).unwrap()
+        let Some(window) = self.window_for_surface(surface.wl_surface()) else {
+            if surface.is_initial_configure_sent() {
+                surface.send_configure();
             }
+            return;
         };
 
-        surface.with_pending_state(|state| {
-            state.states.set(xdg_toplevel::State::Maximized);
-            state.size = Some(geometry.size);
-            state.bounds = Some(geometry.size);
-        });
-        self.space.map_element(window, geometry.loc, true);
-
-        if surface.is_initial_configure_sent() {
-            surface.send_configure();
+        self.set_window_floating(&window, false);
+        self.clear_floating_recenter_for_surface(surface.wl_surface());
+        if self.is_window_mapped(&window) {
+            self.clear_pending_unmapped_maximized_for_surface(surface.wl_surface());
+        } else {
+            // Match niri's commit-synchronized flow: remember maximize intent, don't map early.
+            self.queue_pending_unmapped_maximized_for_surface(surface.wl_surface());
+        }
+        self.set_window_maximized_state(&window, true);
+        if self.is_window_mapped(&window) {
+            self.space.raise_element(&window, true);
         }
     }
 
     fn unmaximize_request(&mut self, surface: ToplevelSurface) {
-        surface.with_pending_state(|state| {
-            state.states.unset(xdg_toplevel::State::Maximized);
-            state.size = None;
-            state.bounds = None;
-        });
+        let Some(window) = self.window_for_surface(surface.wl_surface()) else {
+            if surface.is_initial_configure_sent() {
+                surface.send_configure();
+            }
+            return;
+        };
 
-        if surface.is_initial_configure_sent() {
-            surface.send_configure();
+        self.clear_pending_unmapped_maximized_for_surface(surface.wl_surface());
+        self.set_window_maximized_state(&window, false);
+        if self.is_window_mapped(&window) && let Err(err) = self.apply_layout() {
+            tracing::warn!("failed to apply layout after xdg unmaximize request: {err}");
         }
     }
 
@@ -245,6 +236,22 @@ impl XdgShellHandler for Raven {
             }
             return;
         };
+
+        self.set_window_floating(&window, false);
+        self.clear_floating_recenter_for_surface(surface.wl_surface());
+        if !self.is_window_mapped(&window) {
+            // Defer compositor-side fullscreen bookkeeping until first real map commit.
+            self.queue_pending_unmapped_fullscreen_for_surface(surface.wl_surface());
+            surface.with_pending_state(|state| {
+                state.states.set(xdg_toplevel::State::Fullscreen);
+                state.states.unset(xdg_toplevel::State::Maximized);
+            });
+            if surface.is_initial_configure_sent() {
+                surface.send_configure();
+            }
+            return;
+        }
+        self.clear_pending_unmapped_fullscreen_for_surface(surface.wl_surface());
 
         if self.enter_fullscreen_window(&window) {
             self.space.raise_element(&window, true);
@@ -265,6 +272,22 @@ impl XdgShellHandler for Raven {
             return;
         };
 
+        self.clear_pending_unmapped_fullscreen_for_surface(surface.wl_surface());
+        if !self.is_window_mapped(&window) {
+            let restore_maximized =
+                self.has_pending_unmapped_maximized_for_surface(surface.wl_surface());
+            surface.with_pending_state(|state| {
+                state.states.unset(xdg_toplevel::State::Fullscreen);
+                if restore_maximized {
+                    state.states.set(xdg_toplevel::State::Maximized);
+                }
+            });
+            if surface.is_initial_configure_sent() {
+                surface.send_configure();
+            }
+            return;
+        }
+
         if self.exit_fullscreen_window(&window) {
             if let Err(err) = self.apply_layout() {
                 tracing::warn!("failed to apply layout after xdg unfullscreen request: {err}");
@@ -276,6 +299,7 @@ impl XdgShellHandler for Raven {
     }
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
+        self.clear_pending_unmapped_state_for_surface(surface.wl_surface());
         self.clear_window_rule_recheck_for_surface(surface.wl_surface());
         self.clear_floating_recenter_for_surface(surface.wl_surface());
         let window = self.window_for_surface(surface.wl_surface());
@@ -283,7 +307,10 @@ impl XdgShellHandler for Raven {
         if let Some(window) = window {
             self.space.unmap_elem(&window);
             self.remove_window_from_workspaces(&window);
-            self.apply_layout().ok();
+        }
+
+        if let Err(err) = self.apply_layout() {
+            tracing::warn!("failed to apply layout after xdg toplevel destroy: {err}");
         }
 
         self.refocus_visible_window();
