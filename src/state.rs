@@ -146,7 +146,10 @@ pub struct Raven {
     pending_interactive_moves: Vec<PendingInteractiveMove>,
     pending_interactive_resizes: Vec<PendingInteractiveResize>,
     pub current_workspace: usize,
+    // Mapped windows that currently participate in workspace rendering/layout.
     pub workspaces: Vec<Vec<Window>>,
+    // Unmapped toplevels tracked per-workspace until their first real map commit.
+    unmapped_workspaces: Vec<Vec<Window>>,
     pub fullscreen_windows: Vec<Window>,
     // Root surfaces that have committed a fullscreen-sized buffer.
     ready_fullscreen_surfaces: HashSet<WlSurface>,
@@ -298,6 +301,7 @@ impl Raven {
             pending_interactive_resizes: Vec::new(),
             current_workspace: 0,
             workspaces: vec![Vec::new(); WORKSPACE_COUNT],
+            unmapped_workspaces: vec![Vec::new(); WORKSPACE_COUNT],
             fullscreen_windows: Vec::new(),
             ready_fullscreen_surfaces: HashSet::new(),
             fullscreen_transition_redraw_by_output: HashMap::new(),
@@ -386,6 +390,10 @@ impl Raven {
                 self.fullscreen_windows
                     .iter()
                     .any(|candidate| Self::windows_match(candidate, window))
+                    || Self::window_has_pending_or_committed_state(
+                        window,
+                        xdg_toplevel::State::Fullscreen,
+                    )
             })
             .cloned()
         {
@@ -399,8 +407,8 @@ impl Raven {
             let is_mapped = current_location.is_some();
             let needs_resize = current_geometry.size != out_geo.size;
             let needs_reposition = current_location != Some(out_geo.loc);
-            let undersized_for_output =
-                current_geometry.size.w < out_geo.size.w || current_geometry.size.h < out_geo.size.h;
+            let undersized_for_output = current_geometry.size.w < out_geo.size.w
+                || current_geometry.size.h < out_geo.size.h;
             // Avoid repeatedly reconfiguring/remapping an already-correct fullscreen window.
             if !is_mapped || needs_resize {
                 self.set_window_fullscreen_state(&fullscreen_window, true);
@@ -410,7 +418,14 @@ impl Raven {
             // bottom-edge flashes from moving the old-size buffer too early.
             if !is_mapped {
                 self.space.map_element(fullscreen_window, out_geo.loc, true);
-            } else if needs_reposition && (fullscreen_ready || undersized_for_output) {
+            } else if needs_reposition
+                && (fullscreen_ready
+                    || undersized_for_output
+                    || Self::window_has_pending_or_committed_state(
+                        &fullscreen_window,
+                        xdg_toplevel::State::Fullscreen,
+                    ))
+            {
                 self.space.map_element(fullscreen_window, out_geo.loc, true);
             }
             return Ok(());
@@ -538,10 +553,15 @@ impl Raven {
         self.restack_floating_windows_above_tiled();
     }
 
-    pub fn window_for_surface(&self, surface: &WlSurface) -> Option<Window> {
+    pub(crate) fn workspace_windows(&self) -> impl Iterator<Item = &Window> {
         self.workspaces
             .iter()
+            .chain(self.unmapped_workspaces.iter())
             .flatten()
+    }
+
+    pub fn window_for_surface(&self, surface: &WlSurface) -> Option<Window> {
+        self.workspace_windows()
             .find(|window| {
                 window
                     .toplevel()
@@ -797,10 +817,84 @@ impl Raven {
             .any(|candidate| Self::windows_match(candidate, window))
     }
 
+    fn add_window_to_workspace_list(
+        workspaces: &mut [Vec<Window>],
+        workspace_index: usize,
+        window: Window,
+    ) -> Result<(), CompositorError> {
+        let Some(workspace) = workspaces.get_mut(workspace_index) else {
+            return Err(CompositorError::Backend(format!(
+                "invalid workspace index {workspace_index}"
+            )));
+        };
+        if !Self::workspace_contains_window_entry(workspace, &window) {
+            workspace.push(window);
+        }
+        Ok(())
+    }
+
+    fn remove_window_from_workspace_list(
+        workspaces: &mut [Vec<Window>],
+        window: &Window,
+    ) -> Option<usize> {
+        let mut first_removed: Option<usize> = None;
+        for (workspace_index, workspace) in workspaces.iter_mut().enumerate() {
+            let before = workspace.len();
+            workspace.retain(|candidate| !Self::windows_match(candidate, window));
+            if workspace.len() != before && first_removed.is_none() {
+                first_removed = Some(workspace_index);
+            }
+        }
+        first_removed
+    }
+
+    fn workspace_index_in_list(workspaces: &[Vec<Window>], window: &Window) -> Option<usize> {
+        workspaces
+            .iter()
+            .position(|workspace| Self::workspace_contains_window_entry(workspace, window))
+    }
+
+    fn workspace_index_for_mapped_window(&self, window: &Window) -> Option<usize> {
+        Self::workspace_index_in_list(&self.workspaces, window)
+    }
+
+    fn workspace_index_for_unmapped_window(&self, window: &Window) -> Option<usize> {
+        Self::workspace_index_in_list(&self.unmapped_workspaces, window)
+    }
+
+    pub(crate) fn promote_window_to_mapped_workspace(&mut self, window: &Window) {
+        let workspace_index =
+            Self::remove_window_from_workspace_list(&mut self.unmapped_workspaces, window)
+                .or_else(|| self.workspace_index_for_mapped_window(window))
+                .unwrap_or(self.current_workspace);
+        if let Err(err) = Self::add_window_to_workspace_list(
+            &mut self.workspaces,
+            workspace_index,
+            window.clone(),
+        ) {
+            tracing::warn!("failed to promote window to mapped workspace: {err}");
+        }
+    }
+
+    pub(crate) fn demote_window_to_unmapped_workspace(&mut self, window: &Window) {
+        let workspace_index = Self::remove_window_from_workspace_list(&mut self.workspaces, window)
+            .or_else(|| self.workspace_index_for_unmapped_window(window))
+            .unwrap_or(self.current_workspace);
+        if let Err(err) = Self::add_window_to_workspace_list(
+            &mut self.unmapped_workspaces,
+            workspace_index,
+            window.clone(),
+        ) {
+            tracing::warn!("failed to demote window to unmapped workspace: {err}");
+        }
+    }
+
     fn window_has_live_client(window: &Window) -> bool {
-        window
-            .toplevel()
-            .is_some_and(|toplevel| toplevel.alive() && toplevel.wl_surface().is_alive() && toplevel.wl_surface().client().is_some())
+        window.toplevel().is_some_and(|toplevel| {
+            toplevel.alive()
+                && toplevel.wl_surface().is_alive()
+                && toplevel.wl_surface().client().is_some()
+        })
     }
 
     fn window_root_surface_has_buffer(window: &Window) -> bool {
@@ -814,12 +908,7 @@ impl Raven {
         let mut dead_windows: Vec<Window> = Vec::new();
         let mut seen_surface_ids: HashSet<WlSurface> = HashSet::new();
 
-        for window in self
-            .workspaces
-            .iter()
-            .flatten()
-            .chain(self.space.elements())
-        {
+        for window in self.workspace_windows().chain(self.space.elements()) {
             if Self::window_has_live_client(window) {
                 continue;
             }
@@ -858,15 +947,27 @@ impl Raven {
         self.workspaces
             .get(workspace_index)
             .is_some_and(|workspace| Self::workspace_contains_window_entry(workspace, window))
+            || self
+                .unmapped_workspaces
+                .get(workspace_index)
+                .is_some_and(|workspace| Self::workspace_contains_window_entry(workspace, window))
     }
 
     pub fn add_window_to_workspace(&mut self, workspace_index: usize, window: Window) {
-        let Some(workspace) = self.workspaces.get_mut(workspace_index) else {
-            tracing::warn!("attempted to add window to invalid workspace index {workspace_index}");
-            return;
-        };
-        if !Self::workspace_contains_window_entry(workspace, &window) {
-            workspace.push(window);
+        if let Err(err) =
+            Self::add_window_to_workspace_list(&mut self.workspaces, workspace_index, window)
+        {
+            tracing::warn!("attempted to add window to mapped workspace: {err}");
+        }
+    }
+
+    pub fn add_unmapped_window_to_workspace(&mut self, workspace_index: usize, window: Window) {
+        if let Err(err) = Self::add_window_to_workspace_list(
+            &mut self.unmapped_workspaces,
+            workspace_index,
+            window,
+        ) {
+            tracing::warn!("attempted to add window to unmapped workspace: {err}");
         }
     }
 
@@ -960,7 +1061,7 @@ impl Raven {
                 })
         });
 
-        if !Self::window_is_committed_fullscreen(&window)
+        if !Self::window_has_pending_or_committed_state(&window, xdg_toplevel::State::Fullscreen)
             || !fullscreen_sized
             || !surface_buffer_sized
         {
@@ -1015,11 +1116,30 @@ impl Raven {
             return false;
         }
 
-        let previous_fullscreen_windows = std::mem::take(&mut self.fullscreen_windows);
-        for fullscreen_window in &previous_fullscreen_windows {
+        let target_workspace = self
+            .workspace_index_for_window(window)
+            .unwrap_or(self.current_workspace);
+
+        let fullscreen_windows_to_clear: Vec<Window> = self
+            .fullscreen_windows
+            .iter()
+            .filter(|candidate| {
+                self.workspace_index_for_window(candidate)
+                    .unwrap_or(self.current_workspace)
+                    == target_workspace
+            })
+            .cloned()
+            .collect();
+
+        for fullscreen_window in &fullscreen_windows_to_clear {
             self.clear_fullscreen_ready_for_window(fullscreen_window);
             self.set_window_fullscreen_state(fullscreen_window, false);
         }
+        self.fullscreen_windows.retain(|candidate| {
+            !fullscreen_windows_to_clear
+                .iter()
+                .any(|window_to_clear| Self::windows_match(candidate, window_to_clear))
+        });
 
         self.fullscreen_windows.push(window.clone());
         self.set_window_floating(window, false);
@@ -1054,30 +1174,28 @@ impl Raven {
             .map(|toplevel| toplevel.wl_surface().clone())
     }
 
-    fn window_is_committed_fullscreen(window: &Window) -> bool {
-        window.toplevel().is_some_and(|toplevel| {
-            toplevel.with_committed_state(|state| {
-                state
-                    .as_ref()
-                    .is_some_and(|state| state.states.contains(xdg_toplevel::State::Fullscreen))
-            })
-        })
-    }
-
-    fn window_has_pending_or_committed_state(window: &Window, state_flag: xdg_toplevel::State) -> bool {
+    fn window_has_pending_or_committed_state(
+        window: &Window,
+        state_flag: xdg_toplevel::State,
+    ) -> bool {
         let Some(toplevel) = window.toplevel() else {
             return false;
         };
 
-        if toplevel.with_pending_state(|state| state.states.contains(state_flag)) {
-            return true;
-        }
-
-        toplevel.with_committed_state(|state| {
+        let pending_has = toplevel.with_pending_state(|state| state.states.contains(state_flag));
+        let committed_has = toplevel.with_committed_state(|state| {
             state
                 .as_ref()
                 .is_some_and(|state| state.states.contains(state_flag))
-        })
+        });
+
+        // During fullscreen/maximize transitions, prefer pending as the source of truth.
+        // This avoids one-frame/layout-cycle artifacts where committed is stale.
+        if pending_has != committed_has {
+            return pending_has;
+        }
+
+        pending_has || committed_has
     }
 
     fn window_has_exclusive_layout_state(&self, window: &Window) -> bool {
@@ -1466,7 +1584,10 @@ impl Raven {
         if !self.pending_initial_configure_ids.contains(surface) {
             return;
         }
-        if !self.pending_initial_configure_idle_ids.insert(surface.clone()) {
+        if !self
+            .pending_initial_configure_idle_ids
+            .insert(surface.clone())
+        {
             return;
         }
 
@@ -1656,8 +1777,12 @@ impl Raven {
         self.apply_window_rule_size_to_window(&window, &decision);
 
         let visible_on_current_workspace = decision.workspace_index == self.current_workspace;
-        if visible_on_current_workspace && !decision.floating && !decision.fullscreen
-            && let Some((_, tiled_size, tiled_bounds)) = self.pre_layout_tiled_slot_for_window(&window)
+        if visible_on_current_workspace
+            && !decision.floating
+            && !decision.fullscreen
+            && !window_has_exclusive_state
+            && let Some((_, tiled_size, tiled_bounds)) =
+                self.pre_layout_tiled_slot_for_window(&window)
         {
             toplevel.with_pending_state(|state| {
                 state.size = Some(tiled_size);
@@ -1669,9 +1794,8 @@ impl Raven {
     }
 
     fn workspace_index_for_window(&self, window: &Window) -> Option<usize> {
-        self.workspaces
-            .iter()
-            .position(|workspace| Self::workspace_contains_window_entry(workspace, window))
+        self.workspace_index_for_mapped_window(window)
+            .or_else(|| self.workspace_index_for_unmapped_window(window))
     }
 
     fn move_window_to_workspace_internal(
@@ -1685,19 +1809,38 @@ impl Raven {
             )));
         }
 
-        let source_workspace = self.workspace_index_for_window(window);
+        let source_mapped_workspace = self.workspace_index_for_mapped_window(window);
+        let source_unmapped_workspace = self.workspace_index_for_unmapped_window(window);
+        let tracked_unmapped =
+            self.window_is_unmapped_toplevel(window) || source_unmapped_workspace.is_some();
 
-        match source_workspace {
+        if tracked_unmapped {
+            Self::remove_window_from_workspace_list(&mut self.workspaces, window);
+
+            match source_unmapped_workspace {
+                Some(source_workspace) if source_workspace == target_workspace => {}
+                _ => {
+                    Self::remove_window_from_workspace_list(&mut self.unmapped_workspaces, window);
+                    Self::add_window_to_workspace_list(
+                        &mut self.unmapped_workspaces,
+                        target_workspace,
+                        window.clone(),
+                    )?;
+                }
+            }
+
+            return Ok(());
+        }
+
+        match source_mapped_workspace {
             Some(source_workspace) if source_workspace == target_workspace => {}
             Some(source_workspace) => {
-                self.workspaces[source_workspace]
-                    .retain(|candidate| !Self::windows_match(candidate, window));
-                if !Self::workspace_contains_window_entry(
-                    &self.workspaces[target_workspace],
-                    window,
-                ) {
-                    self.workspaces[target_workspace].push(window.clone());
-                }
+                Self::remove_window_from_workspace_list(&mut self.workspaces, window);
+                Self::add_window_to_workspace_list(
+                    &mut self.workspaces,
+                    target_workspace,
+                    window.clone(),
+                )?;
 
                 if source_workspace == self.current_workspace {
                     self.space.unmap_elem(window);
@@ -1713,6 +1856,8 @@ impl Raven {
                 }
             }
         }
+
+        Self::remove_window_from_workspace_list(&mut self.unmapped_workspaces, window);
 
         Ok(())
     }
@@ -1814,7 +1959,11 @@ impl Raven {
         let was_floating = self.is_window_floating(&window);
         self.set_window_floating(&window, decision.floating && !window_has_exclusive_state);
         let on_current_workspace = self.workspace_contains_window(self.current_workspace, &window);
-        let tiled_slot = if on_current_workspace && !decision.floating {
+        let tiled_slot = if on_current_workspace
+            && !decision.floating
+            && !decision.fullscreen
+            && !window_has_exclusive_state
+        {
             self.pre_layout_tiled_slot_for_window(&window)
         } else {
             None
@@ -1956,12 +2105,7 @@ impl Raven {
 
         let mut seen_surfaces = HashSet::new();
         let mut windows = Vec::new();
-        for window in self
-            .workspaces
-            .iter()
-            .flatten()
-            .chain(self.space.elements())
-        {
+        for window in self.workspace_windows().chain(self.space.elements()) {
             let Some(toplevel) = window.toplevel() else {
                 continue;
             };
@@ -1993,9 +2137,7 @@ impl Raven {
             });
 
             let workspace = self
-                .workspaces
-                .iter()
-                .position(|ws| Self::workspace_contains_window_entry(ws, window))
+                .workspace_index_for_window(window)
                 .map(|idx| idx + 1)
                 .unwrap_or(self.current_workspace + 1);
 
@@ -2159,9 +2301,8 @@ impl Raven {
         if let Some(surface_id) = Self::window_surface_id(window) {
             self.clear_pending_unmapped_state_for_surface(&surface_id);
         }
-        for workspace in &mut self.workspaces {
-            workspace.retain(|candidate| !Self::windows_match(candidate, window));
-        }
+        Self::remove_window_from_workspace_list(&mut self.workspaces, window);
+        Self::remove_window_from_workspace_list(&mut self.unmapped_workspaces, window);
         self.fullscreen_windows
             .retain(|candidate| !Self::windows_match(candidate, window));
         self.floating_windows
@@ -2226,27 +2367,22 @@ impl Raven {
         };
 
         let source_workspace = self
-            .workspaces
-            .iter()
-            .position(|workspace| Self::workspace_contains_window_entry(workspace, &window))
+            .workspace_index_for_window(&window)
             .unwrap_or(self.current_workspace);
 
         if source_workspace == target_workspace {
             return Ok(());
         }
 
-        self.workspaces[source_workspace]
-            .retain(|candidate| !Self::windows_match(candidate, &window));
-        if !Self::workspace_contains_window_entry(&self.workspaces[target_workspace], &window) {
-            self.workspaces[target_workspace].push(window.clone());
-        }
+        self.move_window_to_workspace_internal(&window, target_workspace)?;
 
         if source_workspace == self.current_workspace {
-            self.space.unmap_elem(&window);
             self.apply_layout()?;
             self.refocus_visible_window();
         } else if target_workspace == self.current_workspace {
-            if self.map_window_to_initial_location_if_mappable(&window, false) {
+            if self.is_window_mapped(&window)
+                || self.map_window_to_initial_location_if_mappable(&window, false)
+            {
                 self.apply_layout()?;
             }
         }

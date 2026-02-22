@@ -194,12 +194,8 @@ impl ForeignToplevelHandler for Raven {
             return;
         };
 
-        if let Some(target_workspace) = self
-            .workspaces
-            .iter()
-            .enumerate()
-            .find(|(index, _)| self.workspace_contains_window(*index, &window))
-            .map(|(index, _)| index)
+        if let Some(target_workspace) =
+            (0..self.workspaces.len()).find(|index| self.workspace_contains_window(*index, &window))
             && target_workspace != self.current_workspace
             && let Err(err) = self.switch_workspace(target_workspace)
         {
@@ -247,12 +243,8 @@ impl ForeignToplevelHandler for Raven {
         }
         self.clear_pending_unmapped_fullscreen_for_surface(&wl_surface);
 
-        if let Some(target_workspace) = self
-            .workspaces
-            .iter()
-            .enumerate()
-            .find(|(index, _)| self.workspace_contains_window(*index, &window))
-            .map(|(index, _)| index)
+        if let Some(target_workspace) =
+            (0..self.workspaces.len()).find(|index| self.workspace_contains_window(*index, &window))
             && target_workspace != self.current_workspace
             && let Err(err) = self.switch_workspace(target_workspace)
         {
@@ -322,7 +314,9 @@ impl ForeignToplevelHandler for Raven {
         };
         self.clear_pending_unmapped_maximized_for_surface(&wl_surface);
         self.set_window_maximized_state(&window, false);
-        if self.is_window_mapped(&window) && let Err(err) = self.apply_layout() {
+        if self.is_window_mapped(&window)
+            && let Err(err) = self.apply_layout()
+        {
             tracing::warn!("failed to apply layout after foreign toplevel unmaximize: {err}");
         }
     }

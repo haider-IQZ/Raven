@@ -129,10 +129,9 @@ impl CompositorHandler for Raven {
         if let Some(root_surface) = root_surface.as_ref() {
             if let Some(window) = self.window_for_surface(root_surface) {
                 // Match niri's mapping signal for precise unmap timing.
-                let root_is_mapped = with_renderer_surface_state(root_surface, |state| {
-                    state.buffer().is_some()
-                })
-                .unwrap_or(false);
+                let root_is_mapped =
+                    with_renderer_surface_state(root_surface, |state| state.buffer().is_some())
+                        .unwrap_or(false);
                 let root_has_buffer = with_states(root_surface, |states| {
                     states
                         .data_map
@@ -148,6 +147,7 @@ impl CompositorHandler for Raven {
                     if root_is_mapped && root_has_buffer {
                         // niri-style transition: an explicitly tracked unmapped toplevel now has
                         // a real root buffer, so it may enter the mapped layout path.
+                        self.promote_window_to_mapped_workspace(&window);
                         self.clear_surface_unmapped_toplevel(root_surface);
                         self.clear_initial_configure_for_surface(root_surface);
                     } else {
@@ -167,6 +167,7 @@ impl CompositorHandler for Raven {
                 if tracked_mapped && !root_is_mapped {
                     self.space.unmap_elem(&window);
                     self.clear_fullscreen_ready_for_window(&window);
+                    self.demote_window_to_unmapped_workspace(&window);
                     self.mark_surface_unmapped_toplevel(root_surface);
                     self.queue_initial_configure_for_surface(root_surface);
                     self.queue_window_rule_recheck_for_surface(root_surface);

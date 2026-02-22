@@ -1,6 +1,8 @@
 use smithay::{
     delegate_kde_decoration, delegate_xdg_decoration, delegate_xdg_shell,
-    desktop::{PopupKind, PopupManager, Space, Window, find_popup_root_surface, get_popup_toplevel_coords},
+    desktop::{
+        PopupKind, PopupManager, Space, Window, find_popup_root_surface, get_popup_toplevel_coords,
+    },
     input::{
         Seat,
         pointer::{Focus, GrabStartData as PointerGrabStartData},
@@ -74,7 +76,7 @@ impl XdgShellHandler for Raven {
         });
         tracing::debug!("new_toplevel: step=with_pending_state:done");
         tracing::debug!("new_toplevel: step=add_window_to_workspace:start");
-        self.add_window_to_workspace(rules.workspace_index, window.clone());
+        self.add_unmapped_window_to_workspace(rules.workspace_index, window.clone());
         tracing::debug!("new_toplevel: step=add_window_to_workspace:done");
         // Start in explicit unmapped state; commit() drives initial configure + first map.
         self.mark_surface_unmapped_toplevel(surface.wl_surface());
@@ -221,7 +223,9 @@ impl XdgShellHandler for Raven {
 
         self.clear_pending_unmapped_maximized_for_surface(surface.wl_surface());
         self.set_window_maximized_state(&window, false);
-        if self.is_window_mapped(&window) && let Err(err) = self.apply_layout() {
+        if self.is_window_mapped(&window)
+            && let Err(err) = self.apply_layout()
+        {
             tracing::warn!("failed to apply layout after xdg unmaximize request: {err}");
         }
     }

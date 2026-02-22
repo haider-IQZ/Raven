@@ -78,12 +78,7 @@ pub fn refresh(state: &mut Raven) {
     let mut seen_windows = HashSet::new();
     let mut windows = Vec::new();
 
-    for window in state
-        .workspaces
-        .iter()
-        .flatten()
-        .chain(state.space.elements())
-    {
+    for window in state.workspace_windows().chain(state.space.elements()) {
         let Some(toplevel) = window.toplevel() else {
             continue;
         };
