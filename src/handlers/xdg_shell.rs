@@ -76,6 +76,7 @@ impl XdgShellHandler for Raven {
         tracing::debug!("new_toplevel: step=add_window_to_workspace:start");
         self.add_window_to_workspace(rules.workspace_index, window.clone());
         tracing::debug!("new_toplevel: step=add_window_to_workspace:done");
+        // Start in explicit unmapped state; commit() drives initial configure + first map.
         self.mark_surface_unmapped_toplevel(surface.wl_surface());
         self.queue_initial_configure_for_surface(surface.wl_surface());
         self.apply_window_rule_size_to_window(&window, &rules);
@@ -299,21 +300,34 @@ impl XdgShellHandler for Raven {
     }
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
-        self.clear_pending_unmapped_state_for_surface(surface.wl_surface());
-        self.clear_window_rule_recheck_for_surface(surface.wl_surface());
-        self.clear_floating_recenter_for_surface(surface.wl_surface());
-        let window = self.window_for_surface(surface.wl_surface());
+        let wl_surface = surface.wl_surface();
+        let was_tracked_unmapped = self.is_surface_unmapped_toplevel(wl_surface);
+        let window = self.window_for_surface(wl_surface);
 
-        if let Some(window) = window {
-            self.space.unmap_elem(&window);
+        self.clear_pending_unmapped_state_for_surface(wl_surface);
+        self.clear_window_rule_recheck_for_surface(wl_surface);
+        self.clear_floating_recenter_for_surface(wl_surface);
+
+        let Some(window) = window else {
+            return;
+        };
+
+        // Match niri semantics: if the toplevel was already in the unmapped phase, destroy should
+        // only clean bookkeeping, not trigger another layout/remap cycle.
+        if was_tracked_unmapped || !self.is_window_mapped(&window) {
             self.remove_window_from_workspaces(&window);
+            return;
         }
+
+        let outputs = self.space.outputs_for_element(&window);
+        self.space.unmap_elem(&window);
+        self.remove_window_from_workspaces(&window);
 
         if let Err(err) = self.apply_layout() {
             tracing::warn!("failed to apply layout after xdg toplevel destroy: {err}");
         }
-
         self.refocus_visible_window();
+        self.queue_redraw_for_outputs_or_all(outputs);
     }
 }
 

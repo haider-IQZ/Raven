@@ -615,7 +615,14 @@ fn close_focused_window(state: &mut Raven) {
         && let Some(window) = state.window_for_surface(&focused_surface)
     {
         tracing::info!("Closing focused window");
-        window.toplevel().unwrap().send_close();
+        if let Some(toplevel) = window.toplevel() {
+            toplevel.send_close();
+        } else {
+            #[cfg(feature = "xwayland")]
+            if let Some(x11) = window.x11_surface() {
+                let _ = x11.close();
+            }
+        }
     }
 }
 

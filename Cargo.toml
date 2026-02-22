@@ -3,6 +3,9 @@ name = "raven"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+xwayland = []
+
 [dependencies]
 smithay = { git = "https://github.com/Smithay/smithay/", default-features = false, features = [
   "backend_winit",

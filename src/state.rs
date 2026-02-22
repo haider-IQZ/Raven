@@ -155,6 +155,11 @@ pub struct Raven {
     // Track scanout rejection reasons per output to aid debugging/perf tuning.
     scanout_reject_counters: HashMap<String, u64>,
     pub floating_windows: Vec<Window>,
+    // Per-surface lifecycle sets used during the unmapped -> mapped transition.
+    // `pending_initial_configure_ids`: first configure still needs to be sent.
+    // `pending_initial_configure_idle_ids`: idle callback already queued for that send.
+    // `unmapped_toplevel_ids`: tracked in workspace state but must not be mapped yet.
+    // `pending_unmapped_*_ids`: state requests received before the first map commit.
     pub pending_floating_recenter_ids: HashSet<WlSurface>,
     pub pending_window_rule_recheck_ids: HashSet<WlSurface>,
     pub pending_initial_configure_ids: HashSet<WlSurface>,
@@ -700,6 +705,20 @@ impl Raven {
         }
     }
 
+    pub(crate) fn queue_redraw_for_outputs_or_all<I>(&mut self, outputs: I)
+    where
+        I: IntoIterator<Item = smithay::output::Output>,
+    {
+        let mut had_output = false;
+        for output in outputs {
+            had_output = true;
+            crate::backend::udev::queue_redraw_for_output(self, &output);
+        }
+        if !had_output {
+            crate::backend::udev::queue_redraw_all(self);
+        }
+    }
+
     /// Activate a pointer constraint if one is available for the current pointer focus.
     /// Make sure the pointer location and contents are up to date before calling this.
     pub fn maybe_activate_pointer_constraint(&self) {
@@ -781,7 +800,7 @@ impl Raven {
     fn window_has_live_client(window: &Window) -> bool {
         window
             .toplevel()
-            .is_some_and(|toplevel| toplevel.wl_surface().client().is_some())
+            .is_some_and(|toplevel| toplevel.alive() && toplevel.wl_surface().is_alive() && toplevel.wl_surface().client().is_some())
     }
 
     fn window_root_surface_has_buffer(window: &Window) -> bool {
@@ -1140,6 +1159,24 @@ impl Raven {
         }
     }
 
+    pub(crate) fn map_window_to_initial_location(&mut self, window: &Window, activate: bool) {
+        let loc = self.initial_map_location_for_window(window);
+        self.space.map_element(window.clone(), loc, activate);
+    }
+
+    pub(crate) fn map_window_to_initial_location_if_mappable(
+        &mut self,
+        window: &Window,
+        activate: bool,
+    ) -> bool {
+        // Workspaces may contain unmapped toplevel entries; those map only via root commit.
+        if self.window_is_unmapped_toplevel(window) {
+            return false;
+        }
+        self.map_window_to_initial_location(window, activate);
+        true
+    }
+
     pub(crate) fn pre_layout_tiled_slot_for_window(
         &self,
         window: &Window,
@@ -1416,6 +1453,7 @@ impl Raven {
     }
 
     pub fn queue_initial_configure_for_surface(&mut self, surface: &WlSurface) {
+        // Mark that this root surface still needs its initial configure.
         self.pending_initial_configure_ids.insert(surface.clone());
     }
 
@@ -1489,6 +1527,7 @@ impl Raven {
     }
 
     pub fn clear_pending_unmapped_state_for_surface(&mut self, surface: &WlSurface) {
+        // Full reset for unmapped->mapped bookkeeping on this root surface.
         self.pending_unmapped_fullscreen_ids.remove(surface);
         self.pending_unmapped_maximized_ids.remove(surface);
         self.pending_initial_configure_ids.remove(surface);
@@ -1663,20 +1702,14 @@ impl Raven {
                 if source_workspace == self.current_workspace {
                     self.space.unmap_elem(window);
                 }
-                if target_workspace == self.current_workspace
-                    && !self.window_is_unmapped_toplevel(window)
-                {
-                    let loc = self.initial_map_location_for_window(window);
-                    self.space.map_element(window.clone(), loc, false);
+                if target_workspace == self.current_workspace {
+                    self.map_window_to_initial_location_if_mappable(window, false);
                 }
             }
             None => {
                 self.add_window_to_workspace(target_workspace, window.clone());
-                if target_workspace == self.current_workspace
-                    && !self.window_is_unmapped_toplevel(window)
-                {
-                    let loc = self.initial_map_location_for_window(window);
-                    self.space.map_element(window.clone(), loc, false);
+                if target_workspace == self.current_workspace {
+                    self.map_window_to_initial_location_if_mappable(window, false);
                 }
             }
         }
@@ -1690,7 +1723,6 @@ impl Raven {
             return;
         }
         let (app_id, title) = Self::surface_app_id_and_title(surface);
-        let nautilus_debug = app_id.as_deref() == Some("org.gnome.Nautilus");
 
         let Some(window) = self.window_for_surface(surface) else {
             self.pending_window_rule_recheck_ids.remove(&surface_id);
@@ -1787,19 +1819,6 @@ impl Raven {
         } else {
             None
         };
-        if nautilus_debug {
-            let current_size = window.geometry().size;
-            tracing::info!(
-                stage = "deferred_eval",
-                surface_id = surface.id().protocol_id(),
-                ?app_id,
-                ?title,
-                on_current_workspace,
-                decision_floating = decision.floating,
-                has_tiled_slot = tiled_slot.is_some(),
-                current_geo = %format!("{}x{}", current_size.w, current_size.h),
-            );
-        }
         if let Some((_, desired_size, desired_bounds)) = tiled_slot
             && let Some(toplevel) = window.toplevel()
         {
@@ -2171,12 +2190,8 @@ impl Raven {
 
         let target_windows = self.workspaces[target_workspace].clone();
         for window in target_windows {
-            if self.window_is_unmapped_toplevel(&window) {
-                continue;
-            }
-            let loc = self.initial_map_location_for_window(&window);
-            self.space.map_element(window.clone(), loc, false);
-            if let Some(toplevel) = window.toplevel()
+            if self.map_window_to_initial_location_if_mappable(&window, false)
+                && let Some(toplevel) = window.toplevel()
                 && toplevel.is_initial_configure_sent()
             {
                 toplevel.send_pending_configure();
@@ -2231,9 +2246,7 @@ impl Raven {
             self.apply_layout()?;
             self.refocus_visible_window();
         } else if target_workspace == self.current_workspace {
-            if !self.window_is_unmapped_toplevel(&window) {
-                let loc = self.initial_map_location_for_window(&window);
-                self.space.map_element(window, loc, false);
+            if self.map_window_to_initial_location_if_mappable(&window, false) {
                 self.apply_layout()?;
             }
         }
@@ -3440,8 +3453,7 @@ org.freedesktop.impl.portal.Secret=gnome-keyring;\n"
         let currently_floating = self.is_window_floating(&window);
         self.set_window_floating(&window, !currently_floating);
         if !currently_floating && self.is_window_mapped(&window) {
-            let loc = self.initial_map_location_for_window(&window);
-            self.space.map_element(window.clone(), loc, true);
+            self.map_window_to_initial_location(&window, true);
         }
 
         self.apply_layout()

@@ -128,7 +128,6 @@ impl CompositorHandler for Raven {
         xdg_shell::handle_commit(&mut self.popups, &self.space, surface);
         if let Some(root_surface) = root_surface.as_ref() {
             if let Some(window) = self.window_for_surface(root_surface) {
-                let (app_id, title) = crate::state::Raven::surface_app_id_and_title(root_surface);
                 // Match niri's mapping signal for precise unmap timing.
                 let root_is_mapped = with_renderer_surface_state(root_surface, |state| {
                     state.buffer().is_some()
@@ -144,20 +143,6 @@ impl CompositorHandler for Raven {
                 });
                 let tracked_mapped = self.is_window_mapped(&window);
                 let tracked_unmapped = self.is_surface_unmapped_toplevel(root_surface);
-                let nautilus_debug = app_id.as_deref() == Some("org.gnome.Nautilus");
-                if nautilus_debug {
-                    tracing::info!(
-                        stage = "root_commit_eval",
-                        surface_id = root_surface.id().protocol_id(),
-                        ?app_id,
-                        ?title,
-                        root_is_mapped,
-                        root_has_buffer,
-                        tracked_mapped,
-                        tracked_unmapped,
-                        window_geo = %format!("{}x{}", window.geometry().size.w, window.geometry().size.h),
-                    );
-                }
 
                 if tracked_unmapped {
                     if root_is_mapped && root_has_buffer {
@@ -167,14 +152,6 @@ impl CompositorHandler for Raven {
                         self.clear_initial_configure_for_surface(root_surface);
                     } else {
                         if self.pending_initial_configure_ids.contains(root_surface) {
-                            if nautilus_debug {
-                                tracing::info!(
-                                    stage = "root_commit_initial_configure_queued",
-                                    surface_id = root_surface.id().protocol_id(),
-                                    ?app_id,
-                                    ?title
-                                );
-                            }
                             self.queue_initial_configure_idle_for_surface(root_surface);
                         }
                         // Ignore unmapped commits for layout mapping/unmapping synchronization.
@@ -189,14 +166,6 @@ impl CompositorHandler for Raven {
                 // Without this, an unmapped toplevel can still occupy a tiling slot ("ghost window").
                 if tracked_mapped && !root_is_mapped {
                     self.space.unmap_elem(&window);
-                    if nautilus_debug {
-                        tracing::info!(
-                            stage = "root_commit_unmap",
-                            surface_id = root_surface.id().protocol_id(),
-                            ?app_id,
-                            ?title
-                        );
-                    }
                     self.clear_fullscreen_ready_for_window(&window);
                     self.mark_surface_unmapped_toplevel(root_surface);
                     self.queue_initial_configure_for_surface(root_surface);
@@ -207,15 +176,6 @@ impl CompositorHandler for Raven {
                     self.refocus_visible_window();
                 } else if !tracked_mapped && root_is_mapped && root_has_buffer {
                     let defer_pending = self.pending_window_rule_recheck_ids.contains(root_surface);
-                    if nautilus_debug {
-                        tracing::info!(
-                            stage = "root_commit_remap_check",
-                            surface_id = root_surface.id().protocol_id(),
-                            ?app_id,
-                            ?title,
-                            defer_pending
-                        );
-                    }
                     // Match niri: resolve pending unmapped metadata/rules first, then map.
                     if defer_pending {
                         self.maybe_apply_deferred_window_rules(root_surface);
@@ -223,18 +183,7 @@ impl CompositorHandler for Raven {
                     let on_current_workspace =
                         self.workspace_contains_window(self.current_workspace, &window);
                     if on_current_workspace {
-                        let loc = self.initial_map_location_for_window(&window);
-                        if nautilus_debug {
-                            tracing::info!(
-                                stage = "root_commit_remap_direct",
-                                surface_id = root_surface.id().protocol_id(),
-                                ?app_id,
-                                ?title,
-                                map_x = loc.0,
-                                map_y = loc.1
-                            );
-                        }
-                        self.space.map_element(window.clone(), loc, false);
+                        self.map_window_to_initial_location(&window, false);
                         if let Err(err) = self.apply_layout() {
                             tracing::warn!("failed to apply layout after root remap: {err}");
                         }
@@ -298,6 +247,12 @@ impl CompositorHandler for Raven {
             // Subsurface commit - still need to redraw, but be more targeted
             crate::backend::udev::queue_redraw_all(self);
         }
+    }
+
+    fn destroyed(&mut self, _surface: &WlSurface) {
+        // Match niri lifecycle ownership: role-specific teardown (e.g. xdg toplevel removal)
+        // belongs in role handlers, not in WlSurface::destroyed. Handling both here and in
+        // toplevel_destroyed causes duplicate close/removal paths and visible close-time artifacts.
     }
 }
 
