@@ -127,6 +127,7 @@ impl CompositorHandler for Raven {
 
         xdg_shell::handle_commit(&mut self.popups, &self.space, surface);
         if let Some(root_surface) = root_surface.as_ref() {
+            let mut lifecycle_transition = false;
             if let Some(window) = self.window_for_surface(root_surface) {
                 // Match niri's mapping signal for precise unmap timing.
                 let root_is_mapped =
@@ -147,9 +148,10 @@ impl CompositorHandler for Raven {
                     if root_is_mapped && root_has_buffer {
                         // niri-style transition: an explicitly tracked unmapped toplevel now has
                         // a real root buffer, so it may enter the mapped layout path.
-                        self.promote_window_to_mapped_workspace(&window);
                         self.clear_surface_unmapped_toplevel(root_surface);
                         self.clear_initial_configure_for_surface(root_surface);
+                        self.promote_window_to_mapped_workspace(&window);
+                        lifecycle_transition = true;
                     } else {
                         if self.pending_initial_configure_ids.contains(root_surface) {
                             self.queue_initial_configure_idle_for_surface(root_surface);
@@ -175,6 +177,7 @@ impl CompositorHandler for Raven {
                         tracing::warn!("failed to apply layout after root unmap: {err}");
                     }
                     self.refocus_visible_window();
+                    lifecycle_transition = true;
                 } else if !tracked_mapped && root_is_mapped && root_has_buffer {
                     let defer_pending = self.pending_window_rule_recheck_ids.contains(root_surface);
                     // Match niri: resolve pending unmapped metadata/rules first, then map.
@@ -188,12 +191,16 @@ impl CompositorHandler for Raven {
                         if let Err(err) = self.apply_layout() {
                             tracing::warn!("failed to apply layout after root remap: {err}");
                         }
+                        lifecycle_transition = true;
                     }
                 }
             }
             self.maybe_apply_deferred_window_rules(root_surface);
             self.maybe_apply_pending_unmapped_state_for_surface(root_surface);
             self.maybe_recenter_floating_window_after_commit(root_surface);
+            if lifecycle_transition {
+                self.debug_assert_state_invariants("compositor_root_commit_transition");
+            }
         }
         resize_grab::handle_commit(&mut self.space, surface);
         let current_focus = self

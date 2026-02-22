@@ -122,6 +122,22 @@ If something's broken for you and you actually want to help — open an issue an
 
 ---
 
+## Reliability Tools
+
+If you're changing core lifecycle/fullscreen behavior, run:
+
+```bash
+./scripts/smoke-daily-driver.sh
+```
+
+Lifecycle contract (mapped/unmapped/fullscreen transitions):
+
+```text
+docs/window-lifecycle.md
+```
+
+---
+
 ## Source Layout
 
 ```

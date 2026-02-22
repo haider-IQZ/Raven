@@ -1047,17 +1047,20 @@ fn render_surface(state: &mut Raven, node: DrmNode, crtc: crtc::Handle) {
         surface_data.output.clone()
     };
     let fullscreen_requested_on_output = state.output_has_fullscreen_window(&output);
-    let fullscreen_on_output = state.output_has_ready_fullscreen_window(&output);
+    let fullscreen_ready_on_output = state.output_has_ready_fullscreen_window(&output);
     let transition_full_redraw = state.take_fullscreen_transition_redraw_for_output(&output);
     let transition_clip_active =
-        fullscreen_requested_on_output && (!fullscreen_on_output || transition_full_redraw);
+        fullscreen_requested_on_output && (!fullscreen_ready_on_output || transition_full_redraw);
 
     if fullscreen_requested_on_output {
         if !scanout_enabled() {
             state.record_scanout_rejection(&output, "scanout-disabled");
-        } else if let Some(reason) =
-            scanout_rejection_reason(state, &output, fullscreen_on_output, transition_clip_active)
-        {
+        } else if let Some(reason) = scanout_rejection_reason(
+            state,
+            &output,
+            fullscreen_ready_on_output,
+            transition_clip_active,
+        ) {
             state.record_scanout_rejection(&output, reason);
         }
     }
@@ -1141,7 +1144,7 @@ fn render_surface(state: &mut Raven, node: DrmNode, crtc: crtc::Handle) {
                 Vec::new()
             }
         };
-    if fullscreen_on_output {
+    if fullscreen_requested_on_output {
         let mut window_elements = Vec::new();
         let mut lower_layer_elements = Vec::new();
         let mut saw_window_element = false;

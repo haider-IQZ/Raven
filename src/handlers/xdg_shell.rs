@@ -106,6 +106,7 @@ impl XdgShellHandler for Raven {
             }
         }
         self.queue_window_rule_recheck_for_surface(surface.wl_surface());
+        self.debug_assert_state_invariants("xdg_new_toplevel");
     }
 
     fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {
@@ -313,13 +314,26 @@ impl XdgShellHandler for Raven {
         self.clear_floating_recenter_for_surface(wl_surface);
 
         let Some(window) = window else {
+            self.debug_assert_state_invariants("xdg_toplevel_destroyed_no_window");
             return;
         };
 
         // Match niri semantics: if the toplevel was already in the unmapped phase, destroy should
         // only clean bookkeeping, not trigger another layout/remap cycle.
         if was_tracked_unmapped || !self.is_window_mapped(&window) {
+            let on_current_workspace =
+                self.workspace_contains_window(self.current_workspace, &window);
             self.remove_window_from_workspaces(&window);
+            if on_current_workspace {
+                if let Err(err) = self.apply_layout() {
+                    tracing::warn!(
+                        "failed to apply layout after xdg toplevel destroy (unmapped path): {err}"
+                    );
+                }
+                self.refocus_visible_window();
+                crate::backend::udev::queue_redraw_all(self);
+            }
+            self.debug_assert_state_invariants("xdg_toplevel_destroyed_unmapped");
             return;
         }
 
@@ -332,6 +346,7 @@ impl XdgShellHandler for Raven {
         }
         self.refocus_visible_window();
         self.queue_redraw_for_outputs_or_all(outputs);
+        self.debug_assert_state_invariants("xdg_toplevel_destroyed_mapped");
     }
 }
 

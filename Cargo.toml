@@ -23,7 +23,7 @@ smithay = { git = "https://github.com/Smithay/smithay/", default-features = fals
   "wayland_frontend",
 ] }
 smithay-drm-extras = { git = "https://github.com/Smithay/smithay/" }
-tracing = "0.1"
+tracing = { version = "0.1", features = ["max_level_trace", "release_max_level_debug"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 bitflags = "2.10"

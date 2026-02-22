@@ -198,6 +198,7 @@ fn is_nested() -> bool {
 }
 
 const DEFAULT_LOG_FILTER: &str = concat!(
+    // Keep default logs useful but quiet in daily-driver runs.
     "raven=info,",
     "raven::backend::udev=info,",
     "raven::handlers=info,",
@@ -222,12 +223,16 @@ fn init_logging() -> Result<()> {
         .with(env_filter)
         .with(
             tracing_subscriber::fmt::layer()
+                .compact()
                 .with_ansi(true)
+                .with_target(false)
                 .with_writer(std::io::stderr),
         )
         .with(
             tracing_subscriber::fmt::layer()
+                .compact()
                 .with_ansi(false)
+                .with_target(true)
                 .with_writer(file_appender),
         )
         .init();
