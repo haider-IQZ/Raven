@@ -20,20 +20,26 @@ use smithay::{
         egl::{EGLDevice, EGLDisplay},
         libinput::{LibinputInputBackend, LibinputSessionInterface},
         renderer::{
-            ImportAll, ImportDma, ImportMem, ImportMemWl,
+            Bind, ExportMem, Frame, ImportAll, ImportDma, ImportMem, ImportMemWl, Offscreen,
+            Renderer,
             element::{
-                AsRenderElements, Kind, default_primary_scanout_output_compare,
-                memory::MemoryRenderBuffer, surface::WaylandSurfaceRenderElement,
-                utils::CropRenderElement,
+                AsRenderElements, Element, Id, Kind, default_primary_scanout_output_compare,
+                memory::{MemoryRenderBuffer, MemoryRenderBufferRenderElement},
+                surface::WaylandSurfaceRenderElement,
+                utils::{
+                    ConstrainAlign, ConstrainScaleBehavior, CropRenderElement,
+                    RelocateRenderElement, RescaleRenderElement, constrain_as_render_elements,
+                },
             },
             gles::GlesRenderer,
             multigpu::{GpuManager, MultiRenderer, gbm::GbmGlesBackend},
+            utils::draw_render_elements,
         },
         session::{Event as SessionEvent, Session, libseat::LibSeatSession},
         udev::{UdevBackend, UdevEvent, all_gpus, primary_gpu},
     },
     desktop::{
-        layer_map_for_output,
+        Window, layer_map_for_output,
         space::{SpaceRenderElements, space_render_elements},
         utils::{
             OutputPresentationFeedback, surface_presentation_feedback_flags_from_states,
@@ -53,7 +59,7 @@ use smithay::{
         wayland_protocols::wp::presentation_time::server::wp_presentation_feedback,
         wayland_server::{backend::GlobalId, protocol::wl_surface::WlSurface},
     },
-    utils::{DeviceFd, IsAlive, Rectangle, Scale, Transform},
+    utils::{DeviceFd, IsAlive, Point, Rectangle, Scale, Size, Transform},
     wayland::{
         compositor,
         dmabuf::{DmabufFeedbackBuilder, DmabufState},
@@ -124,9 +130,14 @@ fn scanout_rejection_reason(
     output: &Output,
     fullscreen_on_output: bool,
     transition_clip_active: bool,
+    fullscreen_geometry_animation_active: bool,
 ) -> Option<&'static str> {
     if !fullscreen_on_output {
         return Some("fullscreen-not-ready");
+    }
+
+    if fullscreen_geometry_animation_active {
+        return Some("fullscreen-geometry-animation-active");
     }
 
     if transition_clip_active {
@@ -168,12 +179,15 @@ smithay::backend::renderer::element::render_elements! {
     Backdrop=SolidColorRenderElement,
     Space=SpaceRenderElements<R, E>,
     Pointer=PointerRenderElement<R>,
+    Memory=MemoryRenderBufferRenderElement<R>,
 }
 
 smithay::backend::renderer::element::render_elements! {
     pub UdevCompositeRenderElement<R, E> where R: ImportAll + ImportMem;
     Base=UdevRenderElement<R, E>,
     Cropped=CropRenderElement<UdevRenderElement<R, E>>,
+    Animated=CropRenderElement<RelocateRenderElement<RescaleRenderElement<UdevRenderElement<R, E>>>>,
+    AnimatedWindow=CropRenderElement<RelocateRenderElement<RescaleRenderElement<WaylandSurfaceRenderElement<R>>>>,
 }
 
 /// Per-GPU device state
@@ -1032,6 +1046,125 @@ fn device_removed(state: &mut Raven, node: DrmNode) {
     }
 }
 
+fn collect_window_surface_ids(window: &Window) -> HashSet<Id> {
+    let mut ids = HashSet::new();
+    window.with_surfaces(|wl_surface, _| {
+        ids.insert(Id::from_wayland_resource(wl_surface));
+    });
+    ids
+}
+
+fn capture_fullscreen_exit_snapshot(
+    request: &crate::state::PendingFullscreenExitSnapshotRequest,
+    window: &Window,
+    renderer: &mut GlesRenderer,
+    output_scale: Scale<f64>,
+) -> Result<MemoryRenderBuffer, ()> {
+    let snapshot_size = request
+        .snapshot_rect
+        .size
+        .to_f64()
+        .to_physical(output_scale)
+        .to_i32_round();
+    if snapshot_size.w <= 0 || snapshot_size.h <= 0 {
+        tracing::warn!(output = %request.output_name, "fullscreen-exit snapshot capture has invalid size");
+        return Err(());
+    }
+
+    let buffer_size = snapshot_size.to_logical(1).to_buffer(1, Transform::Normal);
+    let capture_rect = Rectangle::from_size(snapshot_size);
+    let snapshot_elements: Vec<
+        UdevCompositeRenderElement<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>,
+    > = constrain_as_render_elements::<
+        GlesRenderer,
+        Window,
+        UdevCompositeRenderElement<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>,
+    >(
+        &window,
+        renderer,
+        Point::<i32, smithay::utils::Physical>::from((0, 0)),
+        1.0,
+        capture_rect,
+        capture_rect,
+        ConstrainScaleBehavior::CutOff,
+        ConstrainAlign::TOP_LEFT,
+        output_scale,
+    )
+    .collect();
+
+    if snapshot_elements.is_empty() {
+        tracing::warn!(output = %request.output_name, "fullscreen-exit snapshot capture produced no elements");
+        return Err(());
+    }
+
+    let mut offscreen = match renderer.create_buffer(Fourcc::Argb8888, buffer_size) {
+        Ok(buffer) => buffer,
+        Err(err) => {
+            tracing::warn!(output = %request.output_name, ?err, "fullscreen-exit snapshot offscreen allocation failed");
+            return Err(());
+        }
+    };
+
+    let mut target = match renderer.bind(&mut offscreen) {
+        Ok(target) => target,
+        Err(err) => {
+            tracing::warn!(output = %request.output_name, ?err, "fullscreen-exit snapshot bind failed");
+            return Err(());
+        }
+    };
+
+    let damage = [Rectangle::from_size(snapshot_size)];
+    let mut frame = match renderer.render(&mut target, snapshot_size, Transform::Normal) {
+        Ok(frame) => frame,
+        Err(err) => {
+            tracing::warn!(output = %request.output_name, ?err, "fullscreen-exit snapshot frame creation failed");
+            return Err(());
+        }
+    };
+
+    if let Err(err) = frame.clear([0.0, 0.0, 0.0, 0.0].into(), &damage) {
+        tracing::warn!(output = %request.output_name, ?err, "fullscreen-exit snapshot clear failed");
+        return Err(());
+    }
+
+    if let Err(err) =
+        draw_render_elements::<GlesRenderer, _, _>(&mut frame, Scale::from(1.0), &snapshot_elements, &damage)
+    {
+        tracing::warn!(output = %request.output_name, ?err, "fullscreen-exit snapshot draw failed");
+        return Err(());
+    }
+    drop(frame);
+    drop(target);
+
+    let mapping = match renderer.copy_texture(
+        &offscreen,
+        Rectangle::from_size(buffer_size),
+        Fourcc::Argb8888,
+    ) {
+        Ok(mapping) => mapping,
+        Err(err) => {
+            tracing::warn!(output = %request.output_name, ?err, "fullscreen-exit snapshot copy failed");
+            return Err(());
+        }
+    };
+    let bytes = match renderer.map_texture(&mapping) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            tracing::warn!(output = %request.output_name, ?err, "fullscreen-exit snapshot map failed");
+            return Err(());
+        }
+    };
+
+    Ok(MemoryRenderBuffer::from_slice(
+        bytes,
+        Fourcc::Argb8888,
+        buffer_size,
+        1,
+        Transform::Normal,
+        None,
+    ))
+}
+
 /// Render a surface for the given device and CRTC
 fn render_surface(state: &mut Raven, node: DrmNode, crtc: crtc::Handle) {
     state.flush_interactive_frame_updates();
@@ -1046,6 +1179,9 @@ fn render_surface(state: &mut Raven, node: DrmNode, crtc: crtc::Handle) {
         };
         surface_data.output.clone()
     };
+    let fullscreen_geometry_animation_windows =
+        state.active_fullscreen_geometry_animation_windows_for_output(&output);
+    let fullscreen_geometry_animation_active = !fullscreen_geometry_animation_windows.is_empty();
     let fullscreen_requested_on_output = state.output_has_fullscreen_window(&output);
     let fullscreen_ready_on_output = state.output_has_ready_fullscreen_window(&output);
     let transition_full_redraw = state.take_fullscreen_transition_redraw_for_output(&output);
@@ -1060,8 +1196,82 @@ fn render_surface(state: &mut Raven, node: DrmNode, crtc: crtc::Handle) {
             &output,
             fullscreen_ready_on_output,
             transition_clip_active,
+            fullscreen_geometry_animation_active,
         ) {
             state.record_scanout_rejection(&output, reason);
+        }
+    }
+
+    let output_scale = Scale::from(output.current_scale().fractional_scale());
+    let output_geo = state.space.output_geometry(&output);
+    let pending_fullscreen_exit_snapshot_request =
+        state.pending_fullscreen_exit_snapshot_request_for_output(&output);
+    let pending_fullscreen_exit_snapshot_window = pending_fullscreen_exit_snapshot_request
+        .as_ref()
+        .and_then(|request| state.window_for_surface(&request.surface));
+    let active_fullscreen_exit_snapshot = state.active_fullscreen_exit_snapshot_for_output(&output);
+    let active_fullscreen_exit_snapshot_window = active_fullscreen_exit_snapshot
+        .as_ref()
+        .and_then(|snapshot| state.window_for_surface(&snapshot.surface));
+    struct FullscreenAnimationEntry {
+        window: Window,
+        ids: HashSet<Id>,
+        reference_rect: Rectangle<i32, smithay::utils::Physical>,
+        current_rect: Rectangle<i32, smithay::utils::Physical>,
+    }
+    struct FullscreenClipEntry {
+        window: Window,
+        ids: HashSet<Id>,
+        reference_rect: Rectangle<i32, smithay::utils::Physical>,
+        clip_rect: Rectangle<i32, smithay::utils::Physical>,
+    }
+    struct FullscreenSnapshotEntry {
+        ids: HashSet<Id>,
+        buffer: MemoryRenderBuffer,
+        physical_loc: Point<i32, smithay::utils::Physical>,
+        logical_size: Size<i32, smithay::utils::Logical>,
+    }
+    let mut fullscreen_animation_entries: Vec<FullscreenAnimationEntry> = Vec::new();
+    if let Some(output_geo) = output_geo {
+        for (surface, reference_logical, current_logical) in fullscreen_geometry_animation_windows {
+            let Some(window) = state.window_for_surface(&surface) else {
+                continue;
+            };
+            let mut ids = HashSet::new();
+            window.with_surfaces(|wl_surface, _| {
+                ids.insert(Id::from_wayland_resource(wl_surface));
+            });
+            if ids.is_empty() {
+                continue;
+            }
+            let reference_physical = Rectangle::new(
+                (reference_logical.loc - output_geo.loc)
+                    .to_f64()
+                    .to_physical(output_scale)
+                    .to_i32_round(),
+                reference_logical
+                    .size
+                    .to_f64()
+                    .to_physical(output_scale)
+                    .to_i32_round(),
+            );
+            let current_physical = Rectangle::new(
+                (current_logical.loc - output_geo.loc)
+                    .to_f64()
+                    .to_physical(output_scale)
+                    .to_i32_round(),
+                current_logical
+                    .size
+                    .to_f64()
+                    .to_physical(output_scale)
+                    .to_i32_round(),
+            );
+            fullscreen_animation_entries.push(FullscreenAnimationEntry {
+                window,
+                ids,
+                reference_rect: reference_physical,
+                current_rect: current_physical,
+            });
         }
     }
 
@@ -1125,6 +1335,19 @@ fn render_surface(state: &mut Raven, node: DrmNode, crtc: crtc::Handle) {
             return;
         }
     };
+    let captured_fullscreen_exit_snapshot =
+        if active_fullscreen_exit_snapshot.is_none() {
+            if let (Some(request), Some(window)) = (
+                pending_fullscreen_exit_snapshot_request.as_ref(),
+                pending_fullscreen_exit_snapshot_window.as_ref(),
+            ) {
+                capture_fullscreen_exit_snapshot(request, window, renderer.as_mut(), output_scale).ok()
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
     // Collect render elements from the space (windows + layer surfaces).
     //
@@ -1195,45 +1418,259 @@ fn render_surface(state: &mut Raven, node: DrmNode, crtc: crtc::Handle) {
         reordered.extend(lower_layer_elements);
         space_elements = reordered;
     }
-    let output_scale = Scale::from(output.current_scale().fractional_scale());
-    let fullscreen_window_crop_rect = state
-        .fullscreen_windows
-        .iter()
-        .find(|window| {
-            state
-                .space
-                .outputs_for_element(window)
-                .iter()
-                .any(|candidate| candidate == &output)
+    let fullscreen_snapshot_entry = active_fullscreen_exit_snapshot.as_ref().and_then(|snapshot| {
+        let output_geo = output_geo?;
+        let window = active_fullscreen_exit_snapshot_window.as_ref()?;
+        let ids = collect_window_surface_ids(&window);
+        if ids.is_empty() {
+            return None;
+        }
+        Some(FullscreenSnapshotEntry {
+            ids,
+            buffer: snapshot.buffer.clone(),
+            physical_loc: (snapshot.snapshot_rect.loc - output_geo.loc)
+                .to_f64()
+                .to_physical(output_scale)
+                .to_i32_round(),
+            logical_size: snapshot.snapshot_rect.size,
         })
-        .and_then(|window| {
-            let output_geo = state.space.output_geometry(&output)?;
-            let bbox = state.space.element_bbox(window)?;
-            Some(Rectangle::new(
-                (bbox.loc - output_geo.loc)
-                    .to_f64()
-                    .to_physical(output_scale)
-                    .to_i32_round(),
-                bbox.size.to_f64().to_physical(output_scale).to_i32_round(),
-            ))
-        });
+    });
+    let fullscreen_clip_entry = if transition_clip_active && fullscreen_snapshot_entry.is_none() {
+        state
+            .fullscreen_windows
+            .iter()
+            .find(|window| {
+                state
+                    .space
+                    .outputs_for_element(window)
+                    .iter()
+                    .any(|candidate| candidate == &output)
+            })
+            .and_then(|window| {
+                let output_geo = output_geo?;
+                let reference_bbox = state.space.element_bbox(window).or_else(|| {
+                    let loc = state.space.element_location(window)?;
+                    let size = state
+                        .space
+                        .element_geometry(window)
+                        .unwrap_or_else(|| window.geometry())
+                        .size;
+                    Some(Rectangle::new(
+                        loc,
+                        Size::from((size.w.max(1), size.h.max(1))),
+                    ))
+                })?;
+                // Use the frozen clip rect captured at fullscreen entry to prevent intermediate
+                // subsurface repositioning from escaping the expected fullscreen bounds.
+                let clip_bbox = window
+                    .toplevel()
+                    .and_then(|t| state.fullscreen_transition_clips.get(t.wl_surface()).copied())
+                    .unwrap_or(reference_bbox);
+                let mut ids = HashSet::new();
+                window.with_surfaces(|wl_surface, _| {
+                    ids.insert(Id::from_wayland_resource(wl_surface));
+                });
+                if ids.is_empty() {
+                    return None;
+                }
+                Some(FullscreenClipEntry {
+                    window: window.clone(),
+                    ids,
+                    reference_rect: Rectangle::new(
+                        (reference_bbox.loc - output_geo.loc)
+                            .to_f64()
+                            .to_physical(output_scale)
+                            .to_i32_round(),
+                        reference_bbox
+                            .size
+                            .to_f64()
+                            .to_physical(output_scale)
+                            .to_i32_round(),
+                    ),
+                    clip_rect: Rectangle::new(
+                        (clip_bbox.loc - output_geo.loc)
+                            .to_f64()
+                            .to_physical(output_scale)
+                            .to_i32_round(),
+                        clip_bbox
+                            .size
+                            .to_f64()
+                            .to_physical(output_scale)
+                            .to_i32_round(),
+                    ),
+                })
+            })
+    } else {
+        None
+    };
+    let fullscreen_clip_is_animated = fullscreen_clip_entry.as_ref().is_some_and(|clip_entry| {
+        fullscreen_animation_entries
+            .iter()
+            .any(|entry| entry.ids.iter().any(|id| clip_entry.ids.contains(id)))
+    });
     let mut space_elements_converted: Vec<
         UdevCompositeRenderElement<UdevRenderer<'_>, WaylandSurfaceRenderElement<UdevRenderer<'_>>>,
     > = Vec::new();
+    let mut rendered_animation_entries = vec![false; fullscreen_animation_entries.len()];
+    let mut rendered_fullscreen_snapshot = false;
+    let mut rendered_fullscreen_clip = false;
     for element in space_elements {
         let is_window_element = matches!(element, SpaceRenderElements::Element(_));
-        if transition_clip_active
-            && is_window_element
-            && let Some(crop_rect) = fullscreen_window_crop_rect
+        let base = UdevRenderElement::from(element);
+
+        if is_window_element
+            && let Some(entry) = fullscreen_snapshot_entry.as_ref()
+            && entry.ids.contains(base.id())
         {
-            let base = UdevRenderElement::from(element);
-            if let Some(cropped) = CropRenderElement::from_element(base, output_scale, crop_rect) {
-                space_elements_converted.push(UdevCompositeRenderElement::from(cropped));
+            if !rendered_fullscreen_snapshot {
+                space_elements_converted.retain(|element| !entry.ids.contains(element.id()));
+                if let Ok(snapshot_element) = MemoryRenderBufferRenderElement::from_buffer(
+                    &mut renderer,
+                    entry.physical_loc.to_f64(),
+                    &entry.buffer,
+                    None,
+                    None,
+                    Some(entry.logical_size),
+                    Kind::Unspecified,
+                ) {
+                    space_elements_converted
+                        .push(UdevCompositeRenderElement::from(UdevRenderElement::from(snapshot_element)));
+                }
+                rendered_fullscreen_snapshot = true;
             }
             continue;
         }
-        let base = UdevRenderElement::from(element);
+
+        if is_window_element
+            && let Some(entry_index) = fullscreen_animation_entries
+                .iter()
+                .position(|entry| entry.ids.contains(base.id()))
+        {
+            if !rendered_animation_entries[entry_index] {
+                let entry = &fullscreen_animation_entries[entry_index];
+                space_elements_converted.retain(|element| !entry.ids.contains(element.id()));
+                let animated_iter = constrain_as_render_elements::<
+                    UdevRenderer<'_>,
+                    Window,
+                    UdevCompositeRenderElement<UdevRenderer<'_>, WaylandSurfaceRenderElement<UdevRenderer<'_>>>,
+                >(
+                    &entry.window,
+                    &mut renderer,
+                    entry.reference_rect.loc,
+                    1.0,
+                    entry.current_rect,
+                    entry.reference_rect,
+                    ConstrainScaleBehavior::Stretch,
+                    ConstrainAlign::TOP_LEFT,
+                    output_scale,
+                );
+                space_elements_converted.extend(animated_iter);
+                rendered_animation_entries[entry_index] = true;
+            }
+            continue;
+        }
+
+        if transition_clip_active
+            && is_window_element
+            && !fullscreen_clip_is_animated
+            && let Some(entry) = fullscreen_clip_entry.as_ref()
+            && entry.ids.contains(base.id())
+        {
+            if !rendered_fullscreen_clip {
+                space_elements_converted.retain(|element| !entry.ids.contains(element.id()));
+                let clipped_iter = constrain_as_render_elements::<
+                    UdevRenderer<'_>,
+                    Window,
+                    UdevCompositeRenderElement<UdevRenderer<'_>, WaylandSurfaceRenderElement<UdevRenderer<'_>>>,
+                >(
+                    &entry.window,
+                    &mut renderer,
+                    entry.reference_rect.loc,
+                    1.0,
+                    entry.clip_rect,
+                    entry.reference_rect,
+                    ConstrainScaleBehavior::CutOff,
+                    ConstrainAlign::TOP_LEFT,
+                    output_scale,
+                );
+                space_elements_converted.extend(clipped_iter);
+                rendered_fullscreen_clip = true;
+            }
+            continue;
+        }
         space_elements_converted.push(UdevCompositeRenderElement::from(base));
+    }
+
+    if !rendered_fullscreen_snapshot
+        && let Some(entry) = fullscreen_snapshot_entry.as_ref()
+    {
+        space_elements_converted.retain(|element| !entry.ids.contains(element.id()));
+        if let Ok(snapshot_element) = MemoryRenderBufferRenderElement::from_buffer(
+            &mut renderer,
+            entry.physical_loc.to_f64(),
+            &entry.buffer,
+            None,
+            None,
+            Some(entry.logical_size),
+            Kind::Unspecified,
+        ) {
+            space_elements_converted
+                .push(UdevCompositeRenderElement::from(UdevRenderElement::from(snapshot_element)));
+        }
+    }
+
+    // Fallback path: if an animated window never appeared in the collected elements this frame,
+    // synthesize the full window tree directly so GTK/Qt subsurfaces still stay constrained.
+    for (entry_index, entry) in fullscreen_animation_entries.iter().enumerate() {
+        if rendered_animation_entries[entry_index] {
+            continue;
+        }
+        if fullscreen_snapshot_entry.as_ref().is_some_and(|snapshot| {
+            entry.ids.iter().any(|id| snapshot.ids.contains(id))
+        }) {
+            continue;
+        }
+        space_elements_converted.retain(|element| !entry.ids.contains(element.id()));
+        let fallback_iter = constrain_as_render_elements::<
+            UdevRenderer<'_>,
+            Window,
+            UdevCompositeRenderElement<UdevRenderer<'_>, WaylandSurfaceRenderElement<UdevRenderer<'_>>>,
+        >(
+            &entry.window,
+            &mut renderer,
+            entry.reference_rect.loc,
+            1.0,
+            entry.current_rect,
+            entry.reference_rect,
+            ConstrainScaleBehavior::Stretch,
+            ConstrainAlign::TOP_LEFT,
+            output_scale,
+        );
+        space_elements_converted.extend(fallback_iter);
+    }
+
+    if transition_clip_active
+        && !fullscreen_clip_is_animated
+        && !rendered_fullscreen_clip
+        && let Some(entry) = fullscreen_clip_entry.as_ref()
+    {
+        space_elements_converted.retain(|element| !entry.ids.contains(element.id()));
+        let clipped_iter = constrain_as_render_elements::<
+            UdevRenderer<'_>,
+            Window,
+            UdevCompositeRenderElement<UdevRenderer<'_>, WaylandSurfaceRenderElement<UdevRenderer<'_>>>,
+        >(
+            &entry.window,
+            &mut renderer,
+            entry.reference_rect.loc,
+            1.0,
+            entry.clip_rect,
+            entry.reference_rect,
+            ConstrainScaleBehavior::CutOff,
+            ConstrainAlign::TOP_LEFT,
+            output_scale,
+        );
+        space_elements_converted.extend(clipped_iter);
     }
 
     // Render order is front-to-back, so cursor elements must come first.
@@ -1383,11 +1820,65 @@ fn render_surface(state: &mut Raven, node: DrmNode, crtc: crtc::Handle) {
 
             state.space.refresh();
             state.display_handle.flush_clients().unwrap();
+
+            if active_fullscreen_exit_snapshot.is_none()
+                && let Some(request) = pending_fullscreen_exit_snapshot_request.as_ref()
+            {
+                if let Some(snapshot_buffer) = captured_fullscreen_exit_snapshot.clone() {
+                    if !state.activate_fullscreen_exit_snapshot_for_output(
+                        &request.output_name,
+                        snapshot_buffer,
+                    ) {
+                        tracing::warn!(
+                            output = %request.output_name,
+                            "fullscreen-exit snapshot activation failed"
+                        );
+                        let _ = state.fallback_begin_fullscreen_exit_without_snapshot_for_output(
+                            &request.output_name,
+                        );
+                    }
+                } else {
+                    let _ = state.fallback_begin_fullscreen_exit_without_snapshot_for_output(
+                        &request.output_name,
+                    );
+                }
+            }
         }
         Err(e) => {
             tracing::error!("Failed to render frame: {e:?}");
             surface_data.redraw_state = RedrawState::Queued;
+            let _ = surface_data;
+            let _ = device;
+            let _ = udev;
+
+            if active_fullscreen_exit_snapshot.is_none()
+                && let Some(request) = pending_fullscreen_exit_snapshot_request.as_ref()
+            {
+                if let Some(snapshot_buffer) = captured_fullscreen_exit_snapshot {
+                    if !state.activate_fullscreen_exit_snapshot_for_output(
+                        &request.output_name,
+                        snapshot_buffer,
+                    ) {
+                        tracing::warn!(
+                            output = %request.output_name,
+                            "fullscreen-exit snapshot activation failed"
+                        );
+                        let _ = state.fallback_begin_fullscreen_exit_without_snapshot_for_output(
+                            &request.output_name,
+                        );
+                    }
+                } else {
+                    let _ = state.fallback_begin_fullscreen_exit_without_snapshot_for_output(
+                        &request.output_name,
+                    );
+                }
+            }
         }
+    }
+
+    // Keep redrawing while geometry animations are active so motion stays smooth.
+    if fullscreen_geometry_animation_active {
+        queue_redraw_for_output(state, &output);
     }
 }
 

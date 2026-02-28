@@ -111,22 +111,23 @@ impl CompositorHandler for Raven {
         // the render pipeline and causes frame jitter with heavy clients (Brave).
         crate::backend::udev::early_import(self, surface);
 
-        let mut root_surface = None;
-        if !is_sync_subsurface(surface) {
-            let mut root = surface.clone();
-            while let Some(parent) = get_parent(&root) {
-                root = parent;
-            }
+        let mut commit_root_surface = surface.clone();
+        while let Some(parent) = get_parent(&commit_root_surface) {
+            commit_root_surface = parent;
+        }
 
-            if let Some(window) = self.window_for_surface(&root) {
+        let mut lifecycle_root_surface = None;
+        if !is_sync_subsurface(surface) {
+            if let Some(window) = self.window_for_surface(&commit_root_surface) {
                 window.on_commit();
             }
-            self.mark_fullscreen_ready_for_surface(&root);
-            root_surface = Some(root);
+            lifecycle_root_surface = Some(commit_root_surface.clone());
         }
 
         xdg_shell::handle_commit(&mut self.popups, &self.space, surface);
-        if let Some(root_surface) = root_surface.as_ref() {
+        let mut fullscreen_exit_completed = false;
+        let mut fullscreen_exit_snapshot_completed = false;
+        if let Some(root_surface) = lifecycle_root_surface.as_ref() {
             let mut lifecycle_transition = false;
             if let Some(window) = self.window_for_surface(root_surface) {
                 // Match niri's mapping signal for precise unmap timing.
@@ -198,6 +199,12 @@ impl CompositorHandler for Raven {
             self.maybe_apply_deferred_window_rules(root_surface);
             self.maybe_apply_pending_unmapped_state_for_surface(root_surface);
             self.maybe_recenter_floating_window_after_commit(root_surface);
+            self.note_surface_last_acked_configure(root_surface);
+            self.mark_fullscreen_ready_for_surface(root_surface);
+            fullscreen_exit_completed =
+                self.maybe_finalize_fullscreen_exit_transition_for_surface(root_surface);
+            fullscreen_exit_snapshot_completed =
+                self.maybe_finalize_fullscreen_exit_snapshot_for_surface(root_surface);
             if lifecycle_transition {
                 self.debug_assert_state_invariants("compositor_root_commit_transition");
             }
@@ -236,23 +243,22 @@ impl CompositorHandler for Raven {
             self.set_keyboard_focus(Some(layer_focus), serial);
         }
 
-        // Queue redraw only for the output that contains this surface,
+        if fullscreen_exit_completed || fullscreen_exit_snapshot_completed {
+            return;
+        }
+
+        // Queue redraw only for the output that contains this surface tree,
         // not all outputs. This prevents excessive redraws that cause flickering with
         // heavy clients like Brave/Steam.
-        if let Some(root) = root_surface {
-            if let Some(window) = self.window_for_surface(&root) {
-                if let Some(output) = self.space.outputs_for_element(&window).into_iter().next() {
-                    crate::backend::udev::queue_redraw_for_output(self, &output);
-                } else {
-                    // Window not on any output yet, queue all
-                    crate::backend::udev::queue_redraw_all(self);
-                }
+        if let Some(window) = self.window_for_surface(&commit_root_surface) {
+            if let Some(output) = self.space.outputs_for_element(&window).into_iter().next() {
+                crate::backend::udev::queue_redraw_for_output(self, &output);
             } else {
-                // No window found, queue all outputs
+                // Window not on any output yet, queue all
                 crate::backend::udev::queue_redraw_all(self);
             }
         } else {
-            // Subsurface commit - still need to redraw, but be more targeted
+            // No window found for the root surface, queue all outputs.
             crate::backend::udev::queue_redraw_all(self);
         }
     }
