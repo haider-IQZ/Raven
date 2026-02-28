@@ -1560,7 +1560,7 @@ fn render_surface(state: &mut Raven, node: DrmNode, crtc: crtc::Handle) {
                     1.0,
                     entry.current_rect,
                     entry.reference_rect,
-                    ConstrainScaleBehavior::Stretch,
+                    ConstrainScaleBehavior::CutOff,
                     ConstrainAlign::TOP_LEFT,
                     output_scale,
                 );
@@ -1642,7 +1642,7 @@ fn render_surface(state: &mut Raven, node: DrmNode, crtc: crtc::Handle) {
             1.0,
             entry.current_rect,
             entry.reference_rect,
-            ConstrainScaleBehavior::Stretch,
+            ConstrainScaleBehavior::CutOff,
             ConstrainAlign::TOP_LEFT,
             output_scale,
         );

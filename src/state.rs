@@ -2379,8 +2379,6 @@ impl Raven {
             self.space.map_element(window.clone(), output_geo.loc, true);
         }
         if let Some(from_bbox) = entry_from {
-            let mut animation_windows: HashMap<WlSurface, FullscreenGeometryAnimationWindow> =
-                HashMap::new();
             let fullscreen_bbox = Rectangle::new(output_geo.loc, output_geo.size);
             // Start from the real tiled footprint so fullscreen enter has visible motion,
             // but keep the animated size bounded by the fullscreen target.
@@ -2391,15 +2389,19 @@ impl Raven {
                     from_bbox.size.h.clamp(1, fullscreen_bbox.size.h),
                 )),
             );
-            animation_windows.insert(
-                surface_id.clone(),
-                FullscreenGeometryAnimationWindow {
-                    from: edge_fill_from,
-                    to: fullscreen_bbox,
-                    reference: fullscreen_bbox,
-                },
-            );
-            self.start_fullscreen_geometry_animation_for_output(output.name(), animation_windows);
+            if edge_fill_from != fullscreen_bbox {
+                let mut animation_windows: HashMap<WlSurface, FullscreenGeometryAnimationWindow> =
+                    HashMap::new();
+                animation_windows.insert(
+                    surface_id.clone(),
+                    FullscreenGeometryAnimationWindow {
+                        from: edge_fill_from,
+                        to: fullscreen_bbox,
+                        reference: fullscreen_bbox,
+                    },
+                );
+                self.start_fullscreen_geometry_animation_for_output(output.name(), animation_windows);
+            }
         }
         self.mark_fullscreen_transition_redraw_for_window(&window);
     }
@@ -2435,7 +2437,7 @@ impl Raven {
         should_redraw
     }
 
-    pub fn enter_fullscreen_window(&mut self, window: &Window) -> bool {
+    fn begin_fullscreen_enter_transition(&mut self, window: &Window) -> bool {
         let target_workspace = self
             .workspace_index_for_window(window)
             .unwrap_or(self.current_workspace);
@@ -2483,8 +2485,18 @@ impl Raven {
         }
         self.set_window_fullscreen_state(window, true);
         self.mark_fullscreen_transition_redraw_for_window(window);
-        self.debug_assert_state_invariants("enter_fullscreen_window");
         !already_owner
+    }
+
+    pub fn enter_fullscreen_window(&mut self, window: &Window) -> bool {
+        let already_owner = self.window_is_workspace_fullscreen_owner(window);
+        if already_owner {
+            return false;
+        }
+
+        let activated = self.begin_fullscreen_enter_transition(window);
+        self.debug_assert_state_invariants("enter_fullscreen_window");
+        activated
     }
 
     pub fn exit_fullscreen_window(&mut self, window: &Window) -> bool {
