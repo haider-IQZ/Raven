@@ -21,6 +21,7 @@ pub(super) struct FullscreenSlot {
 #[derive(Clone, Debug)]
 pub(super) struct FullscreenRestoreState {
     pub(super) rect: Option<Rectangle<i32, Logical>>,
+    pub(super) floating: bool,
     pub(super) maximized: bool,
     pub(super) geometry: Rectangle<i32, Logical>,
     pub(super) bbox: Rectangle<i32, Logical>,
@@ -197,6 +198,12 @@ impl Raven {
             if restore_state.maximized {
                 return self.work_area_rect_for_window(window);
             }
+            if !restore_state.floating {
+                return self
+                    .compute_workspace_layout_target(window)
+                    .map(|(target_geometry, _)| target_geometry)
+                    .or(restore_state.rect);
+            }
             if let Some(rect) = restore_state.rect {
                 return Some(rect);
             }
@@ -223,6 +230,7 @@ impl Raven {
             .or_else(|| self.space.element_geometry(window));
         let restore_state = FullscreenRestoreState {
             rect: restore_rect,
+            floating: self.is_window_floating(window),
             maximized: self.window_is_marked_maximized(window),
             geometry: window.geometry(),
             bbox: window.bbox(),
@@ -298,17 +306,32 @@ impl Raven {
         window: &Window,
         transition: &PendingFullscreenTransition,
     ) -> bool {
+        let Some(target_rect) = self.pending_fullscreen_transition_target_rect(window, transition)
+        else {
+            return true;
+        };
+
         if let PendingFullscreenTransition::Exit = transition
             && let Some(surface_id) = Self::window_surface_id(window)
             && let Some(restore_state) = self.fullscreen.restore_state_by_surface.get(&surface_id)
         {
             let current_geometry = window.geometry();
-            let geometry_size_matches =
-                Self::sizes_match_target(current_geometry.size, restore_state.geometry.size);
-            let geometry_loc_matches = current_geometry.loc == restore_state.geometry.loc;
             let current_bbox = window.bbox();
+            let expected_geometry_size = if restore_state.floating {
+                restore_state.geometry.size
+            } else {
+                target_rect.size
+            };
+            let expected_bbox_size = if restore_state.floating {
+                restore_state.bbox.size
+            } else {
+                target_rect.size
+            };
+            let geometry_size_matches =
+                Self::sizes_match_target(current_geometry.size, expected_geometry_size);
+            let geometry_loc_matches = current_geometry.loc == restore_state.geometry.loc;
             let bbox_size_matches =
-                Self::sizes_match_target(current_bbox.size, restore_state.bbox.size);
+                Self::sizes_match_target(current_bbox.size, expected_bbox_size);
             let bbox_loc_matches = current_bbox.loc == restore_state.bbox.loc;
             if !geometry_size_matches
                 || !geometry_loc_matches
@@ -318,11 +341,6 @@ impl Raven {
                 return false;
             }
         }
-
-        let Some(target_rect) = self.pending_fullscreen_transition_target_rect(window, transition)
-        else {
-            return true;
-        };
 
         let actual_size = self
             .committed_reported_size_for_window(window)
