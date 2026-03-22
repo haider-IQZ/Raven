@@ -125,8 +125,6 @@ impl CompositorHandler for Raven {
         }
 
         xdg_shell::handle_commit(&mut self.popups, &self.space, surface);
-        let mut fullscreen_exit_completed = false;
-        let mut fullscreen_exit_snapshot_completed = false;
         if let Some(root_surface) = lifecycle_root_surface.as_ref() {
             let mut lifecycle_transition = false;
             if let Some(window) = self.window_for_surface(root_surface) {
@@ -168,8 +166,7 @@ impl CompositorHandler for Raven {
                 // Keep Space mapping in sync with real surface mapping.
                 // Without this, an unmapped toplevel can still occupy a tiling slot ("ghost window").
                 if tracked_mapped && !root_is_mapped {
-                    self.space.unmap_elem(&window);
-                    self.clear_fullscreen_ready_for_window(&window);
+                    self.unmap_window(&window);
                     self.demote_window_to_unmapped_workspace(&window);
                     self.mark_surface_unmapped_toplevel(root_surface);
                     self.queue_initial_configure_for_surface(root_surface);
@@ -198,13 +195,8 @@ impl CompositorHandler for Raven {
             }
             self.maybe_apply_deferred_window_rules(root_surface);
             self.maybe_apply_pending_unmapped_state_for_surface(root_surface);
+            self.maybe_apply_pending_fullscreen_transition_for_surface(root_surface);
             self.maybe_recenter_floating_window_after_commit(root_surface);
-            self.note_surface_last_acked_configure(root_surface);
-            self.mark_fullscreen_ready_for_surface(root_surface);
-            fullscreen_exit_completed =
-                self.maybe_finalize_fullscreen_exit_transition_for_surface(root_surface);
-            fullscreen_exit_snapshot_completed =
-                self.maybe_finalize_fullscreen_exit_snapshot_for_surface(root_surface);
             if lifecycle_transition {
                 self.debug_assert_state_invariants("compositor_root_commit_transition");
             }
@@ -241,10 +233,6 @@ impl CompositorHandler for Raven {
                 pointer.frame(self);
             }
             self.set_keyboard_focus(Some(layer_focus), serial);
-        }
-
-        if fullscreen_exit_completed || fullscreen_exit_snapshot_completed {
-            return;
         }
 
         // Queue redraw only for the output that contains this surface tree,

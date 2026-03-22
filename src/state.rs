@@ -1,18 +1,8 @@
 use smithay::{
-    backend::renderer::{
-        element::memory::MemoryRenderBuffer,
-        utils::{RendererSurfaceStateUserData, with_renderer_surface_state},
-    },
-    desktop::{PopupManager, Space, Window, WindowSurfaceType, layer_map_for_output},
-    input::{
-        Seat, SeatState,
-        pointer::{CursorImageStatus, MotionEvent, PointerHandle},
-    },
+    desktop::{PopupManager, Space, Window, layer_map_for_output},
+    input::{Seat, SeatState, pointer::CursorImageStatus},
     reexports::{
-        calloop::{
-            Interest, LoopHandle, LoopSignal, Mode, PostAction, generic::Generic,
-            timer::{TimeoutAction, Timer},
-        },
+        calloop::{Interest, LoopHandle, LoopSignal, Mode, PostAction, generic::Generic},
         wayland_protocols::xdg::{
             decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as XdgDecorationMode,
             shell::server::xdg_toplevel,
@@ -24,7 +14,7 @@ use smithay::{
             protocol::wl_surface::WlSurface,
         },
     },
-    utils::{Clock, Logical, Monotonic, Point, Rectangle, SERIAL_COUNTER, Serial, Size},
+    utils::{Clock, Logical, Monotonic, Point, Rectangle, Serial, Size},
     wayland::{
         compositor::{CompositorClientState, CompositorState, with_states},
         dmabuf::DmabufState,
@@ -38,7 +28,7 @@ use smithay::{
         selection::{data_device::DataDeviceState, primary_selection::PrimarySelectionState},
         shell::{
             kde::decoration::KdeDecorationState,
-            wlr_layer::{Layer as WlrLayer, WlrLayerShellState},
+            wlr_layer::WlrLayerShellState,
             xdg::{
                 SurfaceCachedState, XdgShellState, XdgToplevelSurfaceData,
                 decoration::XdgDecorationState,
@@ -54,7 +44,7 @@ use std::{
     ffi::OsString,
     fs,
     fs::OpenOptions,
-    io::{Read, Write},
+    io::Write,
     os::fd::AsRawFd,
     os::unix::net::{UnixListener, UnixStream},
     path::{Path, PathBuf},
@@ -69,7 +59,7 @@ use std::{
 
 use crate::{
     CompositorError,
-    config::{self, RuntimeConfig, WallpaperConfig, WindowRule},
+    config::{self, RuntimeConfig, WallpaperConfig},
     layout::{GapConfig, LayoutBox, LayoutType},
     protocols::{
         ext_workspace::ExtWorkspaceManagerState,
@@ -77,6 +67,14 @@ use crate::{
         wlr_screencopy::{Screencopy, ScreencopyManagerState},
     },
 };
+
+mod fullscreen;
+mod ipc;
+mod rules;
+mod runtime;
+mod workspaces;
+
+use fullscreen::{FullscreenState, WindowFullscreenMode};
 
 pub const WORKSPACE_COUNT: usize = 10;
 
@@ -100,67 +98,6 @@ struct PendingInteractiveMove {
 struct PendingInteractiveResize {
     window: Window,
     size: smithay::utils::Size<i32, Logical>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum FullscreenExitMode {
-    Immediate,
-    Guarded,
-}
-
-#[derive(Clone, Debug)]
-struct FullscreenExitTransition {
-    output_name: String,
-    pre_exit_loc: Point<i32, Logical>,
-    pre_exit_size: Size<i32, Logical>,
-    configure_serial: Option<Serial>,
-    started_at: Instant,
-    mode: FullscreenExitMode,
-    unstable_signals: u8,
-    stable_nonfullscreen_commits: u8,
-    commits_after_ack: u8,
-    last_committed_bbox: Option<Rectangle<i32, Logical>>,
-    app_profile_key: String,
-}
-
-#[derive(Clone, Debug, Default)]
-struct ExitStabilityProfile {
-    prefer_guarded_until: Option<Instant>,
-    unstable_count: u32,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct PendingFullscreenExitSnapshotRequest {
-    pub(crate) output_name: String,
-    pub(crate) surface: WlSurface,
-    pub(crate) snapshot_rect: Rectangle<i32, Logical>,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct FullscreenExitSnapshot {
-    pub(crate) surface: WlSurface,
-    pub(crate) buffer: MemoryRenderBuffer,
-    pub(crate) snapshot_rect: Rectangle<i32, Logical>,
-    pub(crate) target_rect: Rectangle<i32, Logical>,
-    pub(crate) started_at: Instant,
-    pub(crate) configure_serial: Option<Serial>,
-    pub(crate) ready_commits: u8,
-}
-
-#[derive(Clone, Debug)]
-struct FullscreenGeometryAnimationWindow {
-    from: Rectangle<i32, Logical>,
-    to: Rectangle<i32, Logical>,
-    // Geometry used as the render reference for constrain_* elements. This should match the
-    // window bbox used to produce base render elements when the animation starts.
-    reference: Rectangle<i32, Logical>,
-}
-
-#[derive(Clone, Debug)]
-struct FullscreenGeometryAnimation {
-    duration: Duration,
-    started_at: Instant,
-    windows: HashMap<WlSurface, FullscreenGeometryAnimationWindow>,
 }
 
 #[derive(Default, Clone, PartialEq)]
@@ -217,29 +154,10 @@ pub struct Raven {
     pub workspaces: Vec<Vec<Window>>,
     // Unmapped toplevels tracked per-workspace until their first real map commit.
     unmapped_workspaces: Vec<Vec<Window>>,
-    pub fullscreen_windows: Vec<Window>,
-    // Niri-style fullscreen ownership: one fullscreen owner surface per workspace.
-    fullscreen_owner_surfaces_by_workspace: Vec<Option<WlSurface>>,
-    // Root surfaces that have committed a fullscreen-sized buffer.
-    ready_fullscreen_surfaces: HashSet<WlSurface>,
-    // Remaining redraw budget for fullscreen transitions per output name.
-    fullscreen_transition_redraw_by_output: HashMap<String, u8>,
-    // Frozen element bbox captured at fullscreen entry; used as the crop rect until the
-    // client commits a fullscreen-sized buffer. Prevents intermediate subsurface repositioning
-    // (e.g. Firefox) from expanding the clip region and exposing the backdrop.
-    pub(crate) fullscreen_transition_clips: HashMap<WlSurface, Rectangle<i32, Logical>>,
-    // Fullscreen exit transition state keyed by toplevel root surface.
-    fullscreen_exit_transitions: HashMap<WlSurface, FullscreenExitTransition>,
-    // Last observed xdg_toplevel acked configure serial per root surface.
-    last_acked_configure_serial_by_surface: HashMap<WlSurface, Serial>,
-    // Adaptive app-level stability profile for fullscreen exits.
-    fullscreen_exit_stability_profiles: HashMap<String, ExitStabilityProfile>,
-    // Snapshot capture requested before we actually send the unfullscreen configure.
-    fullscreen_exit_snapshot_requests_by_output: HashMap<String, PendingFullscreenExitSnapshotRequest>,
-    // Active snapshot handoff shown while the live window settles into its tiled state.
-    fullscreen_exit_snapshots_by_output: HashMap<String, FullscreenExitSnapshot>,
-    // Short-lived per-output geometry interpolation for fullscreen transitions.
-    fullscreen_geometry_animations_by_output: HashMap<String, FullscreenGeometryAnimation>,
+    // Fullscreen ownership/transition bookkeeping.
+    fullscreen: FullscreenState,
+    assigned_rects_by_surface: HashMap<WlSurface, Rectangle<i32, Logical>>,
+    reported_sizes_by_surface: HashMap<WlSurface, Size<i32, Logical>>,
     // Track scanout rejection reasons per output to aid debugging/perf tuning.
     scanout_reject_counters: HashMap<String, u64>,
     pub floating_windows: Vec<Window>,
@@ -253,7 +171,6 @@ pub struct Raven {
     pub pending_initial_configure_ids: HashSet<WlSurface>,
     pending_initial_configure_idle_ids: HashSet<WlSurface>,
     pub unmapped_toplevel_ids: HashSet<WlSurface>,
-    pending_unmapped_fullscreen_ids: HashSet<WlSurface>,
     pending_unmapped_maximized_ids: HashSet<WlSurface>,
     pub autostart_started: bool,
     pub wallpaper_task_inflight: Arc<AtomicBool>,
@@ -273,15 +190,6 @@ pub struct Raven {
 
 impl Raven {
     const SWWW_NAMESPACE: &'static str = "raven";
-    const FULLSCREEN_READY_TOLERANCE: i32 = 2;
-    const FULLSCREEN_TRANSITION_REDRAW_FRAMES: u8 = 4;
-    const FULLSCREEN_EXIT_TRANSITION_TIMEOUT: Duration = Duration::from_millis(450);
-    const FULLSCREEN_EXIT_UNSTABLE_THRESHOLD: u8 = 2;
-    const FULLSCREEN_EXIT_STABLE_BBOX_TOLERANCE: i32 = 4;
-    const FULLSCREEN_EXIT_GUARDED_DECAY: Duration = Duration::from_secs(10 * 60);
-    const FULLSCREEN_GEOMETRY_ANIMATION_DURATION: Duration = Duration::from_millis(180);
-    const FULLSCREEN_EXIT_SNAPSHOT_TIMEOUT: Duration = Duration::from_millis(80);
-    const FULLSCREEN_EXIT_SNAPSHOT_READY_COMMITS: u8 = 1;
     pub fn new(
         display: Display<Self>,
         loop_handle: LoopHandle<'static, Raven>,
@@ -393,17 +301,9 @@ impl Raven {
             current_workspace: 0,
             workspaces: vec![Vec::new(); WORKSPACE_COUNT],
             unmapped_workspaces: vec![Vec::new(); WORKSPACE_COUNT],
-            fullscreen_windows: Vec::new(),
-            fullscreen_owner_surfaces_by_workspace: vec![None; WORKSPACE_COUNT],
-            ready_fullscreen_surfaces: HashSet::new(),
-            fullscreen_transition_redraw_by_output: HashMap::new(),
-            fullscreen_transition_clips: HashMap::new(),
-            fullscreen_exit_transitions: HashMap::new(),
-            last_acked_configure_serial_by_surface: HashMap::new(),
-            fullscreen_exit_stability_profiles: HashMap::new(),
-            fullscreen_exit_snapshot_requests_by_output: HashMap::new(),
-            fullscreen_exit_snapshots_by_output: HashMap::new(),
-            fullscreen_geometry_animations_by_output: HashMap::new(),
+            fullscreen: FullscreenState::new(),
+            assigned_rects_by_surface: HashMap::new(),
+            reported_sizes_by_surface: HashMap::new(),
             scanout_reject_counters: HashMap::new(),
             floating_windows: Vec::new(),
             pending_floating_recenter_ids: HashSet::new(),
@@ -411,7 +311,6 @@ impl Raven {
             pending_initial_configure_ids: HashSet::new(),
             pending_initial_configure_idle_ids: HashSet::new(),
             unmapped_toplevel_ids: HashSet::new(),
-            pending_unmapped_fullscreen_ids: HashSet::new(),
             pending_unmapped_maximized_ids: HashSet::new(),
             autostart_started: false,
             wallpaper_task_inflight: Arc::new(AtomicBool::new(false)),
@@ -437,8 +336,6 @@ impl Raven {
 
     pub fn apply_layout(&mut self) -> Result<(), CompositorError> {
         self.prune_windows_without_live_client();
-        self.clear_expired_fullscreen_exit_transitions();
-        self.clear_expired_fullscreen_geometry_animations();
 
         // Ensure visible windows tracked on the current workspace are mapped into Space before
         // layout decisions. Without this, a fullscreen owner unmap/destroy can leave sibling
@@ -451,7 +348,7 @@ impl Raven {
             if self.window_is_unmapped_toplevel(window) {
                 continue;
             }
-            if !self.window_root_surface_has_buffer_or_exit_transition(window) {
+            if !Self::window_root_surface_has_buffer(window) {
                 continue;
             }
             self.map_window_to_initial_location(window, false);
@@ -460,7 +357,7 @@ impl Raven {
         let mut windows: Vec<smithay::desktop::Window> = self
             .space
             .elements()
-            .filter(|window| self.window_root_surface_has_buffer_or_exit_transition(window))
+            .filter(|window| Self::window_root_surface_has_buffer(window))
             .cloned()
             .collect();
         if windows.is_empty() {
@@ -475,15 +372,14 @@ impl Raven {
                 continue;
             };
             if !seen_surface_ids.insert(surface_id) {
-                self.space.unmap_elem(window);
-                self.clear_fullscreen_ready_for_window(window);
+                self.unmap_window(window);
             }
         }
 
         windows = self
             .space
             .elements()
-            .filter(|window| self.window_root_surface_has_buffer_or_exit_transition(window))
+            .filter(|window| Self::window_root_surface_has_buffer(window))
             .cloned()
             .collect();
         if windows.is_empty() {
@@ -502,142 +398,7 @@ impl Raven {
             .output_geometry(&output)
             .ok_or_else(|| CompositorError::Backend("no output geometry".into()))?;
 
-        let workspace_owner_surface = self
-            .workspace_fullscreen_owner_surface(self.current_workspace)
-            .cloned();
-        let mut fullscreen_window = workspace_owner_surface.as_ref().and_then(|owner_surface| {
-            windows
-                .iter()
-                .find(|mapped| Self::window_matches_surface(mapped, owner_surface))
-                .cloned()
-        });
-        let mut allow_owner_recovery = workspace_owner_surface.is_none();
-
-        if let Some(owner_surface) = workspace_owner_surface.as_ref()
-            && fullscreen_window.is_none()
-        {
-            if let Some(owner_window) = self.window_for_surface(owner_surface) {
-                // Keep ownership strict only while the owner is in the explicit unmapped
-                // transition. This mirrors niri's commit-synchronized mapping behavior.
-                if self.window_is_unmapped_toplevel(&owner_window) {
-                    for window in &windows {
-                        if !Self::window_matches_surface(window, owner_surface) {
-                            self.space.unmap_elem(window);
-                        }
-                    }
-                    return Ok(());
-                }
-
-                if self.window_root_surface_has_buffer_or_exit_transition(&owner_window) {
-                    // Owner is live and mappable but currently absent from Space mapping; map it
-                    // directly at fullscreen origin instead of a pre-layout tiled slot.
-                    let owner_surface_id = Self::window_surface_id(&owner_window);
-                    if owner_surface_id.as_ref().is_none_or(|surface| {
-                        !self.surface_in_fullscreen_exit_transition(surface)
-                    }) {
-                        self.set_window_fullscreen_state(&owner_window, true);
-                    }
-                    let target_loc = owner_surface_id
-                        .as_ref()
-                        .and_then(|surface| {
-                            self.fullscreen_exit_transitions
-                                .get(surface)
-                                .map(|transition| transition.pre_exit_loc)
-                        })
-                        .unwrap_or(out_geo.loc);
-                    self.space
-                        .map_element(owner_window.clone(), target_loc, false);
-                    fullscreen_window = Some(owner_window);
-                } else {
-                    // Stale owner with no root buffer and no tracked-unmapped transition.
-                    self.clear_fullscreen_owner_for_surface(owner_surface);
-                    allow_owner_recovery = true;
-                }
-            } else {
-                // Owner surface disappeared entirely; clear stale ownership and continue recovery.
-                self.clear_fullscreen_owner_for_surface(owner_surface);
-                allow_owner_recovery = true;
-            }
-        }
-
-        if fullscreen_window.is_none() && allow_owner_recovery {
-            // Recovery path: rebuild owner from tracked fullscreen stack, then from raw
-            // surface state if bookkeeping is temporarily missing.
-            fullscreen_window = self
-                .fullscreen_windows
-                .iter()
-                .rev()
-                .filter_map(|tracked| {
-                    windows
-                        .iter()
-                        .find(|mapped| Self::windows_match(mapped, tracked))
-                        .cloned()
-                })
-                .find(|window| self.window_effective_fullscreen_state(window))
-                .or_else(|| {
-                    windows
-                        .iter()
-                        .find(|window| self.window_effective_fullscreen_state(window))
-                        .cloned()
-                });
-
-            if let Some(window) = fullscreen_window.as_ref() {
-                self.assign_workspace_fullscreen_owner(self.current_workspace, window);
-            }
-        }
-
-        if let Some(fullscreen_window) = fullscreen_window {
-            if let Some(surface_id) = Self::window_surface_id(&fullscreen_window)
-                && self.surface_in_fullscreen_exit_transition(&surface_id)
-            {
-                if !Self::window_root_surface_has_buffer(&fullscreen_window) {
-                    self.mark_fullscreen_exit_profile_unstable_for_surface(&surface_id);
-                    self.clear_fullscreen_owner_for_surface(&surface_id);
-                    return self.apply_layout();
-                }
-            }
-            for window in &windows {
-                if !Self::windows_match(window, &fullscreen_window) {
-                    self.space.unmap_elem(window);
-                }
-            }
-
-            if let Some(surface_id) = Self::window_surface_id(&fullscreen_window)
-                && let Some(transition) = self.fullscreen_exit_transitions.get(&surface_id)
-            {
-                if self.space.element_location(&fullscreen_window) != Some(transition.pre_exit_loc) {
-                    self.space
-                        .map_element(fullscreen_window.clone(), transition.pre_exit_loc, true);
-                }
-                self.space.raise_element(&fullscreen_window, true);
-                return Ok(());
-            }
-
-            let fullscreen_ready =
-                self.window_is_ready_fullscreen_on_output(&fullscreen_window, &output);
-            let current_location = self.space.element_location(&fullscreen_window);
-            let current_geometry = self
-                .space
-                .element_geometry(&fullscreen_window)
-                .unwrap_or_else(|| fullscreen_window.geometry());
-            let is_mapped = current_location.is_some();
-            let needs_resize = current_geometry.size != out_geo.size;
-            let needs_reposition = current_location != Some(out_geo.loc);
-            // Avoid repeatedly reconfiguring/remapping an already-correct fullscreen window.
-            if !is_mapped || needs_resize {
-                self.set_window_fullscreen_state(&fullscreen_window, true);
-            }
-            // Keep the window's previous position until it has committed a fullscreen-sized frame.
-            // mark_fullscreen_ready_for_surface() repositions atomically when the buffer is ready.
-            // Moving the window earlier (while the buffer is still old-sized) exposes the bottom/right
-            // of the screen through the render clip, causing a visible flash.
-            if !is_mapped || (needs_reposition && fullscreen_ready) {
-                self.space
-                    .map_element(fullscreen_window.clone(), out_geo.loc, true);
-            }
-            // Workspace switches can remap another window after the fullscreen owner and leave it
-            // above in z-order. Keep the active fullscreen owner on top every layout pass.
-            self.space.raise_element(&fullscreen_window, true);
+        if self.apply_fullscreen_layout_if_needed(&windows, &output, out_geo)? {
             return Ok(());
         }
 
@@ -651,9 +412,13 @@ impl Raven {
             if self.window_is_unmapped_toplevel(window) {
                 continue;
             }
+            let target_rect = self
+                .space
+                .element_geometry(window)
+                .unwrap_or_else(|| self.initial_map_rect_for_window(window));
+            self.record_assigned_rect_for_window(window, target_rect);
             if self.space.element_location(window).is_none() {
-                let loc = self.initial_map_location_for_window(window);
-                self.space.map_element(window.clone(), loc, false);
+                self.map_window_to_rect(window, target_rect, false);
             }
         }
 
@@ -710,24 +475,15 @@ impl Raven {
             let is_mapped = current_location.is_some();
             let needs_resize = current_geometry.size != desired_size;
             let needs_reposition = current_location != Some(loc);
+            let target_geometry = Rectangle::new(loc, desired_size);
+            self.record_assigned_rect_for_window(&window, target_geometry);
 
-            if let Some(toplevel) = window.toplevel()
-                && (!is_mapped || needs_resize)
-            {
-                toplevel.with_pending_state(|state| {
-                    state.size = Some(desired_size);
-                    state.bounds = Some(layout_geo.size);
-                    state.states.unset(xdg_toplevel::State::Fullscreen);
-                    state.states.set(xdg_toplevel::State::TiledLeft);
-                    state.states.set(xdg_toplevel::State::TiledRight);
-                    state.states.set(xdg_toplevel::State::TiledTop);
-                    state.states.set(xdg_toplevel::State::TiledBottom);
-                });
-                toplevel.send_pending_configure();
+            if !is_mapped || needs_resize {
+                self.configure_window_for_tiled_layout(&window, target_geometry, layout_geo.size);
             }
 
-            if !is_mapped || needs_reposition {
-                self.space.map_element(window, loc, false);
+            if !is_mapped || needs_resize || needs_reposition {
+                self.map_window_to_rect(&window, target_geometry, false);
             }
         }
 
@@ -742,13 +498,10 @@ impl Raven {
             return;
         }
 
-        // Keep fullscreen stacking untouched.
-        let has_mapped_fullscreen = windows.iter().any(|window| {
-            self.fullscreen_windows
-                .iter()
-                .any(|candidate| Self::windows_match(candidate, window))
-        });
-        if has_mapped_fullscreen {
+        // Keep exclusive-mode stacking untouched while the current workspace has an owner.
+        if self.workspace_effective_exclusive_mode(self.current_workspace)
+            != WindowFullscreenMode::NONE
+        {
             return;
         }
 
@@ -863,41 +616,20 @@ impl Raven {
             );
         }
 
-        let mut fullscreen_surfaces: HashSet<WlSurface> = HashSet::new();
-        for window in &self.fullscreen_windows {
-            let Some(surface) = Self::window_surface_id(window) else {
-                continue;
-            };
-            debug_assert!(
-                fullscreen_surfaces.insert(surface.clone()),
-                "state invariant failed ({context}): duplicate fullscreen entry surface={:?}",
-                surface.id()
-            );
-            debug_assert!(
-                mapped_surfaces.contains(&surface) || unmapped_surfaces.contains(&surface),
-                "state invariant failed ({context}): fullscreen window missing workspace tracking surface={:?}",
-                surface.id()
-            );
-        }
-
         let mut owner_surfaces: HashSet<WlSurface> = HashSet::new();
-        for (workspace_index, owner_surface) in self
-            .fullscreen_owner_surfaces_by_workspace
+        for (workspace_index, owner_slot) in self
+            .fullscreen
+            .owner_surfaces_by_workspace
             .iter()
             .enumerate()
         {
-            let Some(owner_surface) = owner_surface else {
+            let Some(owner_slot) = owner_slot else {
                 continue;
             };
+            let owner_surface = &owner_slot.surface;
             debug_assert!(
                 owner_surfaces.insert(owner_surface.clone()),
                 "state invariant failed ({context}): fullscreen owner surface assigned to multiple workspaces surface={:?}",
-                owner_surface.id()
-            );
-            debug_assert!(
-                fullscreen_surfaces.contains(owner_surface),
-                "state invariant failed ({context}): fullscreen owner missing fullscreen tracking workspace={} surface={:?}",
-                workspace_index,
                 owner_surface.id()
             );
             debug_assert!(
@@ -936,171 +668,6 @@ impl Raven {
     #[inline]
     pub(crate) fn debug_assert_state_invariants(&self, _context: &str) {}
 
-    pub fn window_for_surface(&self, surface: &WlSurface) -> Option<Window> {
-        self.workspace_windows()
-            .find(|window| {
-                window
-                    .toplevel()
-                    .is_some_and(|tl| tl.wl_surface() == surface)
-            })
-            .cloned()
-            .or_else(|| {
-                self.space
-                    .elements()
-                    .find(|window| {
-                        window
-                            .toplevel()
-                            .is_some_and(|tl| tl.wl_surface() == surface)
-                    })
-                    .cloned()
-            })
-    }
-
-    pub fn window_under_pointer(&self) -> Option<(Window, Point<i32, Logical>)> {
-        self.space
-            .element_under(self.pointer_location)
-            .map(|(w, p)| (w.clone(), p))
-    }
-
-    pub fn contents_under(&self, position: Point<f64, Logical>) -> PointContents {
-        let Some(output) = self.space.output_under(position).next() else {
-            return PointContents::default();
-        };
-        let Some(output_geo) = self.space.output_geometry(output) else {
-            return PointContents::default();
-        };
-
-        let layer_map = layer_map_for_output(output);
-        let position_within_output = position - output_geo.loc.to_f64();
-        let fullscreen_on_output = self.output_has_fullscreen_window(output);
-
-        let layer_surface_under = |layer: WlrLayer, popup: bool| -> Option<PointContents> {
-            layer_map.layers_on(layer).rev().find_map(|layer_surface| {
-                let layer_geo = layer_map.layer_geometry(layer_surface)?;
-                let surface_type = (if popup {
-                    WindowSurfaceType::POPUP
-                } else {
-                    WindowSurfaceType::TOPLEVEL
-                }) | WindowSurfaceType::SUBSURFACE;
-
-                layer_surface
-                    .surface_under(
-                        position_within_output - layer_geo.loc.to_f64(),
-                        surface_type,
-                    )
-                    .map(|(surface, local_pos)| PointContents {
-                        output: Some(output.clone()),
-                        surface: Some((
-                            surface,
-                            output_geo.loc.to_f64() + layer_geo.loc.to_f64() + local_pos.to_f64(),
-                        )),
-                        window: None,
-                        layer: Some(layer_surface.wl_surface().clone()),
-                    })
-            })
-        };
-
-        let window_under = || -> Option<PointContents> {
-            self.space
-                .element_under(position)
-                .and_then(|(window, render_location)| {
-                    window
-                        .surface_under(position - render_location.to_f64(), WindowSurfaceType::ALL)
-                        .map(|(surface, local_pos)| PointContents {
-                            output: Some(output.clone()),
-                            surface: Some((surface, (local_pos + render_location).to_f64())),
-                            window: Some(window.clone()),
-                            layer: None,
-                        })
-                })
-        };
-
-        if fullscreen_on_output {
-            layer_surface_under(WlrLayer::Overlay, true)
-                .or_else(|| layer_surface_under(WlrLayer::Overlay, false))
-                .or_else(window_under)
-                .or_else(|| layer_surface_under(WlrLayer::Top, true))
-                .or_else(|| layer_surface_under(WlrLayer::Top, false))
-                .or_else(|| layer_surface_under(WlrLayer::Bottom, true))
-                .or_else(|| layer_surface_under(WlrLayer::Background, true))
-                .or_else(|| layer_surface_under(WlrLayer::Bottom, false))
-                .or_else(|| layer_surface_under(WlrLayer::Background, false))
-                .unwrap_or_else(|| PointContents {
-                    output: Some(output.clone()),
-                    surface: None,
-                    window: None,
-                    layer: None,
-                })
-        } else {
-            layer_surface_under(WlrLayer::Overlay, true)
-                .or_else(|| layer_surface_under(WlrLayer::Overlay, false))
-                .or_else(|| layer_surface_under(WlrLayer::Top, true))
-                .or_else(|| layer_surface_under(WlrLayer::Top, false))
-                .or_else(window_under)
-                .or_else(|| layer_surface_under(WlrLayer::Bottom, true))
-                .or_else(|| layer_surface_under(WlrLayer::Background, true))
-                .or_else(|| layer_surface_under(WlrLayer::Bottom, false))
-                .or_else(|| layer_surface_under(WlrLayer::Background, false))
-                .unwrap_or_else(|| PointContents {
-                    output: Some(output.clone()),
-                    surface: None,
-                    window: None,
-                    layer: None,
-                })
-        }
-    }
-
-    pub fn update_pointer_contents(&mut self, time_msec: u32) -> bool {
-        let pointer = self.pointer();
-        let location = pointer.current_location();
-        self.pointer_location = location;
-        let under = self.contents_under(location);
-        if self.pointer_contents == under {
-            return false;
-        }
-
-        self.pointer_contents.clone_from(&under);
-
-        pointer.motion(
-            self,
-            under.surface,
-            &MotionEvent {
-                location,
-                serial: SERIAL_COUNTER.next_serial(),
-                time: time_msec,
-            },
-        );
-        self.maybe_activate_pointer_constraint();
-
-        true
-    }
-
-    pub fn refresh_pointer_contents(&mut self) -> bool {
-        let time_msec = self.start_time.elapsed().as_millis() as u32;
-        if !self.update_pointer_contents(time_msec) {
-            return false;
-        }
-
-        self.pointer().frame(self);
-        self.queue_redraw_for_pointer_output();
-        true
-    }
-
-    pub fn queue_redraw_for_pointer_output(&mut self) {
-        let output = self.pointer_contents.output.clone().or_else(|| {
-            self.space
-                .output_under(self.pointer_location)
-                .next()
-                .cloned()
-        });
-
-        if let Some(output) = output {
-            crate::backend::udev::queue_redraw_for_output(self, &output);
-        } else {
-            crate::backend::udev::queue_redraw_all(self);
-        }
-    }
-
     pub(crate) fn queue_redraw_for_outputs_or_all<I>(&mut self, outputs: I)
     where
         I: IntoIterator<Item = smithay::output::Output>,
@@ -1113,46 +680,6 @@ impl Raven {
         if !had_output {
             crate::backend::udev::queue_redraw_all(self);
         }
-    }
-
-    /// Activate a pointer constraint if one is available for the current pointer focus.
-    /// Make sure the pointer location and contents are up to date before calling this.
-    pub fn maybe_activate_pointer_constraint(&self) {
-        let Some((surface, surface_loc)) = &self.pointer_contents.surface else {
-            return;
-        };
-
-        let pointer = self.pointer();
-        if Some(surface) != pointer.current_focus().as_ref() {
-            return;
-        }
-
-        smithay::wayland::pointer_constraints::with_pointer_constraint(
-            surface,
-            &pointer,
-            |constraint| {
-                let Some(constraint) = constraint else { return };
-
-                if constraint.is_active() {
-                    return;
-                }
-
-                // Constraint does not apply if not within region.
-                if let Some(region) = constraint.region() {
-                    let pointer_pos = pointer.current_location();
-                    let pos_within_surface = pointer_pos - *surface_loc;
-                    if !region.contains(pos_within_surface.to_i32_round()) {
-                        return;
-                    }
-                }
-
-                constraint.activate();
-            },
-        );
-    }
-
-    pub fn pointer(&self) -> PointerHandle<Self> {
-        self.seat.get_pointer().expect("pointer not initialized")
     }
 
     pub fn record_scanout_rejection(
@@ -1244,192 +771,6 @@ impl Raven {
             .is_some_and(|candidate| candidate == surface)
     }
 
-    fn workspace_fullscreen_owner_surface(&self, workspace_index: usize) -> Option<&WlSurface> {
-        self.fullscreen_owner_surfaces_by_workspace
-            .get(workspace_index)
-            .and_then(|surface| surface.as_ref())
-    }
-
-    fn surface_is_workspace_fullscreen_owner(
-        &self,
-        workspace_index: usize,
-        surface: &WlSurface,
-    ) -> bool {
-        self.workspace_fullscreen_owner_surface(workspace_index)
-            .is_some_and(|owner| owner == surface)
-    }
-
-    fn window_is_workspace_fullscreen_owner(&self, window: &Window) -> bool {
-        let Some(surface_id) = Self::window_surface_id(window) else {
-            return false;
-        };
-        let Some(workspace_index) = self.workspace_index_for_window(window) else {
-            return false;
-        };
-        self.surface_is_workspace_fullscreen_owner(workspace_index, &surface_id)
-    }
-
-    fn clear_fullscreen_owner_for_workspace(
-        &mut self,
-        workspace_index: usize,
-        clear_window_state: bool,
-    ) {
-        let Some(owner_surface) = self
-            .fullscreen_owner_surfaces_by_workspace
-            .get_mut(workspace_index)
-            .and_then(Option::take)
-        else {
-            return;
-        };
-
-        self.fullscreen_windows
-            .retain(|candidate| !Self::window_matches_surface(candidate, &owner_surface));
-        self.ready_fullscreen_surfaces.remove(&owner_surface);
-        self.clear_fullscreen_transition_state_for_surface(&owner_surface);
-
-        if clear_window_state && let Some(owner_window) = self.window_for_surface(&owner_surface) {
-            self.clear_fullscreen_ready_for_window(&owner_window);
-            self.set_window_fullscreen_state(&owner_window, false);
-        }
-    }
-
-    fn clear_fullscreen_owner_for_surface(&mut self, surface: &WlSurface) {
-        let mut removed = false;
-        for owner in &mut self.fullscreen_owner_surfaces_by_workspace {
-            if owner.as_ref().is_some_and(|candidate| candidate == surface) {
-                *owner = None;
-                removed = true;
-            }
-        }
-        if removed {
-            self.fullscreen_windows
-                .retain(|candidate| !Self::window_matches_surface(candidate, surface));
-            self.ready_fullscreen_surfaces.remove(surface);
-            self.clear_fullscreen_transition_state_for_surface(surface);
-            return;
-        }
-        self.clear_fullscreen_transition_state_for_surface(surface);
-    }
-
-    fn clear_fullscreen_owner_for_surface_preserving_exit_snapshot(&mut self, surface: &WlSurface) {
-        let mut removed = false;
-        for owner in &mut self.fullscreen_owner_surfaces_by_workspace {
-            if owner.as_ref().is_some_and(|candidate| candidate == surface) {
-                *owner = None;
-                removed = true;
-            }
-        }
-        if removed {
-            self.fullscreen_windows
-                .retain(|candidate| !Self::window_matches_surface(candidate, surface));
-            self.ready_fullscreen_surfaces.remove(surface);
-        }
-        self.fullscreen_transition_clips.remove(surface);
-        self.fullscreen_exit_transitions.remove(surface);
-        self.clear_fullscreen_geometry_animation_for_surface(surface);
-        self.last_acked_configure_serial_by_surface.remove(surface);
-        self.fullscreen_exit_snapshot_requests_by_output
-            .retain(|_, request| request.surface != *surface);
-    }
-
-    fn clear_fullscreen_transition_state_for_surface(&mut self, surface: &WlSurface) {
-        self.fullscreen_transition_clips.remove(surface);
-        self.fullscreen_exit_transitions.remove(surface);
-        self.clear_fullscreen_geometry_animation_for_surface(surface);
-        self.last_acked_configure_serial_by_surface.remove(surface);
-        self.clear_fullscreen_exit_snapshot_state_for_surface(surface);
-    }
-
-    fn clear_fullscreen_geometry_animation_for_surface(&mut self, surface: &WlSurface) {
-        let output_names: Vec<String> = self
-            .fullscreen_geometry_animations_by_output
-            .iter()
-            .filter(|(_, animation)| animation.windows.contains_key(surface))
-            .map(|(name, _)| name.clone())
-            .collect();
-        for output_name in output_names {
-            let should_remove_output = if let Some(animation) = self
-                .fullscreen_geometry_animations_by_output
-                .get_mut(&output_name)
-            {
-                animation.windows.remove(surface);
-                animation.windows.is_empty()
-            } else {
-                false
-            };
-            if should_remove_output {
-                self.fullscreen_geometry_animations_by_output
-                    .remove(&output_name);
-            }
-        }
-    }
-
-    fn assign_workspace_fullscreen_owner(&mut self, workspace_index: usize, window: &Window) {
-        if workspace_index >= self.fullscreen_owner_surfaces_by_workspace.len() {
-            return;
-        }
-
-        let Some(surface_id) = Self::window_surface_id(window) else {
-            return;
-        };
-
-        if self
-            .workspace_fullscreen_owner_surface(workspace_index)
-            .is_some_and(|owner| owner != &surface_id)
-        {
-            self.clear_fullscreen_owner_for_workspace(workspace_index, true);
-        }
-
-        self.fullscreen_owner_surfaces_by_workspace[workspace_index] = Some(surface_id.clone());
-
-        // Keep ownership unique across workspaces.
-        for (index, owner) in self
-            .fullscreen_owner_surfaces_by_workspace
-            .iter_mut()
-            .enumerate()
-        {
-            if index != workspace_index
-                && owner
-                    .as_ref()
-                    .is_some_and(|candidate| candidate == &surface_id)
-            {
-                *owner = None;
-            }
-        }
-    }
-
-    fn move_workspace_fullscreen_owner_surface(
-        &mut self,
-        surface: &WlSurface,
-        target_workspace: usize,
-    ) {
-        if target_workspace >= self.fullscreen_owner_surfaces_by_workspace.len() {
-            return;
-        }
-
-        let source_workspace = self
-            .fullscreen_owner_surfaces_by_workspace
-            .iter()
-            .position(|owner| owner.as_ref().is_some_and(|candidate| candidate == surface));
-
-        let Some(source_workspace) = source_workspace else {
-            return;
-        };
-        if source_workspace == target_workspace {
-            return;
-        }
-
-        if self
-            .workspace_fullscreen_owner_surface(target_workspace)
-            .is_some_and(|owner| owner != surface)
-        {
-            self.clear_fullscreen_owner_for_workspace(target_workspace, true);
-        }
-
-        self.fullscreen_owner_surfaces_by_workspace[source_workspace] = None;
-        self.fullscreen_owner_surfaces_by_workspace[target_workspace] = Some(surface.clone());
-    }
-
     pub(crate) fn promote_window_to_mapped_workspace(&mut self, window: &Window) {
         let workspace_index =
             Self::remove_window_from_workspace_list(&mut self.unmapped_workspaces, window)
@@ -1467,53 +808,6 @@ impl Raven {
         })
     }
 
-    fn window_root_surface_has_buffer(window: &Window) -> bool {
-        window.toplevel().is_some_and(|toplevel| {
-            with_renderer_surface_state(toplevel.wl_surface(), |state| state.buffer().is_some())
-                .unwrap_or(false)
-        })
-    }
-
-    fn window_root_surface_has_buffer_or_exit_transition(&self, window: &Window) -> bool {
-        if Self::window_root_surface_has_buffer(window) {
-            return true;
-        }
-        Self::window_surface_id(window)
-            .as_ref()
-            .is_some_and(|surface| self.surface_in_fullscreen_exit_transition(surface))
-    }
-
-    fn window_bbox_or_geometry(&self, window: &Window) -> Option<Rectangle<i32, Logical>> {
-        self.space.element_bbox(window).or_else(|| {
-            let loc = self.space.element_location(window)?;
-            let size = self
-                .space
-                .element_geometry(window)
-                .unwrap_or_else(|| window.geometry())
-                .size;
-            Some(Rectangle::new(
-                loc,
-                Size::from((size.w.max(1), size.h.max(1))),
-            ))
-        })
-    }
-
-    fn fullscreen_cover_geometry_for_window(
-        &self,
-        window: &Window,
-    ) -> Option<(String, Rectangle<i32, Logical>)> {
-        let output = self
-            .space
-            .outputs_for_element(window)
-            .into_iter()
-            .next()
-            .or_else(|| self.active_output_for_pointer())
-            .or_else(|| self.space.outputs().next().cloned())?;
-        let output_name = output.name();
-        let output_geo = self.space.output_geometry(&output)?;
-        Some((output_name, Rectangle::new(output_geo.loc, output_geo.size)))
-    }
-
     fn prune_windows_without_live_client(&mut self) {
         let mut dead_windows: Vec<Window> = Vec::new();
         let mut seen_surface_ids: HashSet<WlSurface> = HashSet::new();
@@ -1538,7 +832,7 @@ impl Raven {
         }
 
         for window in &dead_windows {
-            self.space.unmap_elem(window);
+            self.unmap_window(window);
             self.remove_window_from_workspaces(window);
             if let Some(toplevel) = window.toplevel() {
                 let surface = toplevel.wl_surface().clone();
@@ -1604,1007 +898,6 @@ impl Raven {
             .any(|candidate| Self::windows_match(candidate, window))
     }
 
-    pub fn output_has_fullscreen_window(&self, output: &smithay::output::Output) -> bool {
-        self.fullscreen_owner_surfaces_by_workspace
-            .iter()
-            .flatten()
-            .any(|surface| {
-                self.window_for_surface(surface).is_some_and(|window| {
-                    self.space
-                        .outputs_for_element(&window)
-                        .iter()
-                        .any(|candidate| candidate == output)
-                })
-            })
-    }
-
-    pub fn output_has_ready_fullscreen_window(&self, output: &smithay::output::Output) -> bool {
-        self.fullscreen_owner_surfaces_by_workspace
-            .iter()
-            .flatten()
-            .any(|surface| {
-                self.window_for_surface(surface).is_some_and(|window| {
-                    self.window_is_ready_fullscreen_on_output(&window, output)
-                })
-            })
-    }
-
-    pub(crate) fn surface_in_fullscreen_exit_transition(&self, surface: &WlSurface) -> bool {
-        self.fullscreen_exit_transitions.contains_key(surface)
-    }
-
-    pub(crate) fn pending_fullscreen_exit_snapshot_request_for_output(
-        &self,
-        output: &smithay::output::Output,
-    ) -> Option<PendingFullscreenExitSnapshotRequest> {
-        self.fullscreen_exit_snapshot_requests_by_output
-            .get(&output.name())
-            .cloned()
-    }
-
-    pub(crate) fn active_fullscreen_exit_snapshot_for_output(
-        &self,
-        output: &smithay::output::Output,
-    ) -> Option<FullscreenExitSnapshot> {
-        self.fullscreen_exit_snapshots_by_output
-            .get(&output.name())
-            .cloned()
-    }
-
-    fn surface_in_fullscreen_exit_snapshot(&self, surface: &WlSurface) -> bool {
-        self.fullscreen_exit_snapshots_by_output
-            .values()
-            .any(|snapshot| snapshot.surface == *surface)
-    }
-
-    fn clear_fullscreen_exit_snapshot_state_for_surface(&mut self, surface: &WlSurface) {
-        self.fullscreen_exit_snapshot_requests_by_output
-            .retain(|_, request| request.surface != *surface);
-        self.fullscreen_exit_snapshots_by_output
-            .retain(|_, snapshot| snapshot.surface != *surface);
-    }
-
-    fn queue_redraw_for_output_name_or_all(&mut self, output_name: &str) {
-        let target_output = self
-            .space
-            .outputs()
-            .find(|candidate| candidate.name() == output_name)
-            .cloned();
-        if let Some(output) = target_output {
-            self.queue_redraw_for_outputs_or_all(std::iter::once(output));
-        } else {
-            crate::backend::udev::queue_redraw_all(self);
-        }
-    }
-
-    fn schedule_fullscreen_exit_snapshot_timeout(&mut self, output_name: String) {
-        let timer = Timer::from_duration(Self::FULLSCREEN_EXIT_SNAPSHOT_TIMEOUT);
-        let _ = self.loop_handle.insert_source(timer, move |_, _, state| {
-            state.expire_fullscreen_exit_snapshot_for_output(&output_name);
-            TimeoutAction::Drop
-        });
-    }
-
-    fn expire_fullscreen_exit_snapshot_for_output(&mut self, output_name: &str) -> bool {
-        let Some(snapshot) = self.fullscreen_exit_snapshots_by_output.get(output_name) else {
-            return false;
-        };
-        if snapshot.started_at.elapsed() < Self::FULLSCREEN_EXIT_SNAPSHOT_TIMEOUT {
-            return false;
-        }
-        self.fullscreen_exit_snapshots_by_output.remove(output_name);
-        self.queue_redraw_for_output_name_or_all(output_name);
-        true
-    }
-
-    fn compute_fullscreen_exit_target_rect(&self, window: &Window) -> Option<Rectangle<i32, Logical>> {
-        let workspace_index = self
-            .workspace_index_for_window(window)
-            .unwrap_or(self.current_workspace);
-        let output = self.space.outputs_for_element(window).into_iter().next()?;
-        let out_geo = self.space.output_geometry(&output)?;
-        let mut layer_map = layer_map_for_output(&output);
-        layer_map.arrange();
-        let work_geo = layer_map.non_exclusive_zone();
-        let layout_geo = if work_geo.size.w > 0 && work_geo.size.h > 0 {
-            work_geo
-        } else {
-            out_geo
-        };
-
-        let workspace_windows = self.workspaces[workspace_index].clone();
-        let tiled_windows: Vec<Window> = workspace_windows
-            .iter()
-            .filter(|candidate| !self.is_window_floating(candidate))
-            .filter(|candidate| !self.window_is_unmapped_toplevel(candidate))
-            .filter(|candidate| Self::window_has_live_client(candidate))
-            .cloned()
-            .collect();
-        if tiled_windows.is_empty() {
-            return None;
-        }
-
-        let gaps = GapConfig {
-            outer_horizontal: self.config.gaps_outer_horizontal,
-            outer_vertical: self.config.gaps_outer_vertical,
-            inner_horizontal: self.config.gaps_inner_horizontal,
-            inner_vertical: self.config.gaps_inner_vertical,
-        };
-
-        let geometries = self.layout.arrange(
-            &tiled_windows,
-            layout_geo.size.w as u32,
-            layout_geo.size.h as u32,
-            &gaps,
-            self.config.master_factor,
-            self.config.num_master,
-            self.config.smart_gaps,
-        );
-
-        tiled_windows
-            .into_iter()
-            .zip(geometries)
-            .find(|(candidate, _)| Self::windows_match(candidate, window))
-            .map(|(_, geom)| {
-                Rectangle::new(
-                    Point::<i32, Logical>::from((
-                        layout_geo.loc.x + geom.x_coordinate,
-                        layout_geo.loc.y + geom.y_coordinate,
-                    )),
-                    Size::<i32, Logical>::from((geom.width as i32, geom.height as i32)),
-                )
-            })
-    }
-
-    fn request_fullscreen_exit_snapshot_for_window(
-        &mut self,
-        surface: &WlSurface,
-        window: &Window,
-    ) -> bool {
-        if self.surface_in_fullscreen_exit_snapshot(surface)
-            || self.surface_in_fullscreen_exit_transition(surface)
-        {
-            return true;
-        }
-        if self
-            .fullscreen_exit_snapshot_requests_by_output
-            .values()
-            .any(|request| request.surface == *surface)
-        {
-            return true;
-        }
-
-        let cover = self.fullscreen_cover_geometry_for_window(window);
-        let output_name = cover
-            .as_ref()
-            .map(|(name, _)| name.clone())
-            .unwrap_or_else(|| "<unknown>".to_owned());
-        if output_name == "<unknown>" {
-            return false;
-        }
-        let fallback_bbox = self.window_bbox_or_geometry(window).unwrap_or_else(|| {
-            let fallback_size = self
-                .space
-                .element_geometry(window)
-                .unwrap_or_else(|| window.geometry())
-                .size;
-            let fallback_loc = self.space.element_location(window).unwrap_or((0, 0).into());
-            Rectangle::new(
-                fallback_loc,
-                Size::from((fallback_size.w.max(1), fallback_size.h.max(1))),
-            )
-        });
-        let snapshot_rect = cover
-            .as_ref()
-            .map(|(_, geometry)| *geometry)
-            .unwrap_or(fallback_bbox);
-
-        self.fullscreen_exit_snapshot_requests_by_output.insert(
-            output_name.clone(),
-            PendingFullscreenExitSnapshotRequest {
-                output_name,
-                surface: surface.clone(),
-                snapshot_rect,
-            },
-        );
-        self.mark_fullscreen_transition_redraw_for_window(window);
-        self.queue_redraw_for_outputs_or_all(self.space.outputs_for_element(window));
-        true
-    }
-
-    pub(crate) fn activate_fullscreen_exit_snapshot_for_output(
-        &mut self,
-        output_name: &str,
-        buffer: MemoryRenderBuffer,
-    ) -> bool {
-        let Some(request) = self.fullscreen_exit_snapshot_requests_by_output.remove(output_name) else {
-            return false;
-        };
-        let Some(window) = self.window_for_surface(&request.surface) else {
-            return false;
-        };
-        let target_rect = self
-            .compute_fullscreen_exit_target_rect(&window)
-            .unwrap_or_else(|| {
-                self.window_bbox_or_geometry(&window)
-                    .unwrap_or(request.snapshot_rect)
-            });
-        let serial = self.set_window_fullscreen_state(&window, false);
-        self.begin_fullscreen_exit_transition(&request.surface, &window, serial);
-        self.fullscreen_exit_snapshots_by_output.insert(
-            output_name.to_owned(),
-            FullscreenExitSnapshot {
-                surface: request.surface,
-                buffer,
-                snapshot_rect: request.snapshot_rect,
-                target_rect,
-                started_at: Instant::now(),
-                configure_serial: serial,
-                ready_commits: 0,
-            },
-        );
-        self.schedule_fullscreen_exit_snapshot_timeout(output_name.to_owned());
-        self.debug_assert_state_invariants("exit_fullscreen_window_snapshot_transition");
-        true
-    }
-
-    pub(crate) fn fallback_begin_fullscreen_exit_without_snapshot_for_output(
-        &mut self,
-        output_name: &str,
-    ) -> bool {
-        let Some(request) = self.fullscreen_exit_snapshot_requests_by_output.remove(output_name) else {
-            return false;
-        };
-        let Some(window) = self.window_for_surface(&request.surface) else {
-            return false;
-        };
-        let serial = self.set_window_fullscreen_state(&window, false);
-        self.begin_fullscreen_exit_transition(&request.surface, &window, serial);
-        self.debug_assert_state_invariants("exit_fullscreen_window_transition_fallback");
-        true
-    }
-
-    pub(crate) fn maybe_finalize_fullscreen_exit_snapshot_for_surface(
-        &mut self,
-        surface: &WlSurface,
-    ) -> bool {
-        let matching_output = self
-            .fullscreen_exit_snapshots_by_output
-            .iter()
-            .find(|(_, snapshot)| snapshot.surface == *surface)
-            .map(|(output_name, _)| output_name.clone());
-        let Some(output_name) = matching_output else {
-            return false;
-        };
-
-        let Some(mut snapshot) = self
-            .fullscreen_exit_snapshots_by_output
-            .get(&output_name)
-            .cloned()
-        else {
-            return false;
-        };
-
-        let Some(window) = self.window_for_surface(surface) else {
-            self.fullscreen_exit_snapshots_by_output.remove(&output_name);
-            self.queue_redraw_for_output_name_or_all(&output_name);
-            return true;
-        };
-
-        let configure_acked = snapshot
-            .configure_serial
-            .is_none_or(|serial| self.is_configure_serial_acked(surface, serial));
-        let has_root_buffer = Self::window_root_surface_has_buffer(&window);
-        let bbox_matches_target = self.window_bbox_or_geometry(&window).is_some_and(|bbox| {
-            (bbox.loc.x - snapshot.target_rect.loc.x).abs()
-                <= Self::FULLSCREEN_EXIT_STABLE_BBOX_TOLERANCE
-                && (bbox.loc.y - snapshot.target_rect.loc.y).abs()
-                    <= Self::FULLSCREEN_EXIT_STABLE_BBOX_TOLERANCE
-                && (bbox.size.w - snapshot.target_rect.size.w).abs()
-                    <= Self::FULLSCREEN_EXIT_STABLE_BBOX_TOLERANCE
-                && (bbox.size.h - snapshot.target_rect.size.h).abs()
-                    <= Self::FULLSCREEN_EXIT_STABLE_BBOX_TOLERANCE
-        });
-        let qualifying = !self.surface_in_fullscreen_exit_transition(surface)
-            && configure_acked
-            && has_root_buffer
-            && bbox_matches_target;
-
-        if qualifying {
-            snapshot.ready_commits = snapshot.ready_commits.saturating_add(1);
-        } else {
-            snapshot.ready_commits = 0;
-        }
-
-        let timed_out = snapshot.started_at.elapsed() >= Self::FULLSCREEN_EXIT_SNAPSHOT_TIMEOUT;
-        if snapshot.ready_commits >= Self::FULLSCREEN_EXIT_SNAPSHOT_READY_COMMITS || timed_out {
-            self.fullscreen_exit_snapshots_by_output.remove(&output_name);
-            self.queue_redraw_for_output_name_or_all(&output_name);
-            return true;
-        }
-
-        self.fullscreen_exit_snapshots_by_output
-            .insert(output_name, snapshot);
-        false
-    }
-
-    fn window_committed_fullscreen_state(window: &Window) -> bool {
-        let (_, committed_has) =
-            Self::window_pending_and_committed_state(window, xdg_toplevel::State::Fullscreen);
-        committed_has
-    }
-
-    fn fullscreen_exit_profile_key_for_surface(surface: &WlSurface) -> String {
-        with_states(surface, |states| {
-            states
-                .data_map
-                .get::<XdgToplevelSurfaceData>()
-                .and_then(|data| data.lock().ok())
-                .and_then(|role| role.app_id.clone().or(role.title.clone()))
-                .map(|value| value.trim().to_owned())
-                .filter(|value| !value.is_empty())
-                .unwrap_or_else(|| "<unknown>".to_owned())
-        })
-    }
-
-    fn fullscreen_exit_mode_for_surface(&mut self, surface: &WlSurface) -> (String, FullscreenExitMode) {
-        let key = Self::fullscreen_exit_profile_key_for_surface(surface);
-        let now = Instant::now();
-        let profile = self
-            .fullscreen_exit_stability_profiles
-            .entry(key.clone())
-            .or_default();
-        if profile
-            .prefer_guarded_until
-            .is_some_and(|until| until <= now)
-        {
-            profile.prefer_guarded_until = None;
-        }
-        let mode = if profile
-            .prefer_guarded_until
-            .is_some_and(|until| until > now)
-        {
-            FullscreenExitMode::Guarded
-        } else {
-            FullscreenExitMode::Immediate
-        };
-        (key, mode)
-    }
-
-    fn mark_fullscreen_exit_profile_unstable(&mut self, profile_key: &str) {
-        let profile = self
-            .fullscreen_exit_stability_profiles
-            .entry(profile_key.to_owned())
-            .or_default();
-        profile.unstable_count = profile.unstable_count.saturating_add(1);
-        profile.prefer_guarded_until = Some(Instant::now() + Self::FULLSCREEN_EXIT_GUARDED_DECAY);
-    }
-
-    fn mark_fullscreen_exit_profile_unstable_for_surface(&mut self, surface: &WlSurface) {
-        let profile_key = self
-            .fullscreen_exit_transitions
-            .get(surface)
-            .map(|transition| transition.app_profile_key.clone())
-            .unwrap_or_else(|| Self::fullscreen_exit_profile_key_for_surface(surface));
-        self.mark_fullscreen_exit_profile_unstable(&profile_key);
-    }
-
-    fn clear_expired_fullscreen_exit_transitions(&mut self) {
-        let mut expired_surfaces = Vec::new();
-        for (surface, transition) in &self.fullscreen_exit_transitions {
-            if transition.started_at.elapsed() >= Self::FULLSCREEN_EXIT_TRANSITION_TIMEOUT {
-                expired_surfaces.push(surface.clone());
-            }
-        }
-
-        for surface in expired_surfaces {
-            self.mark_fullscreen_exit_profile_unstable_for_surface(&surface);
-            if self.surface_in_fullscreen_exit_snapshot(&surface) {
-                self.clear_fullscreen_owner_for_surface_preserving_exit_snapshot(&surface);
-            } else {
-                self.clear_fullscreen_owner_for_surface(&surface);
-            }
-        }
-    }
-
-    fn clear_expired_fullscreen_geometry_animations(&mut self) {
-        let expired_outputs: Vec<String> = self
-            .fullscreen_geometry_animations_by_output
-            .iter()
-            .filter(|(_, animation)| animation.started_at.elapsed() >= animation.duration)
-            .map(|(output_name, _)| output_name.clone())
-            .collect();
-        for output_name in expired_outputs {
-            self.fullscreen_geometry_animations_by_output
-                .remove(&output_name);
-        }
-    }
-
-    fn start_fullscreen_geometry_animation_for_output(
-        &mut self,
-        output_name: String,
-        windows: HashMap<WlSurface, FullscreenGeometryAnimationWindow>,
-    ) {
-        let requested_count = windows.len();
-        let windows: HashMap<WlSurface, FullscreenGeometryAnimationWindow> = windows
-            .into_iter()
-            .filter_map(|(surface, window_animation)| {
-                if window_animation.from == window_animation.to {
-                    return None;
-                }
-                if window_animation.reference.size.w <= 0 || window_animation.reference.size.h <= 0 {
-                    return None;
-                }
-                Some((surface, window_animation))
-            })
-            .collect();
-        if windows.is_empty() {
-            tracing::debug!(
-                output = %output_name,
-                requested_count,
-                "fullscreen geometry animation skipped (no non-trivial pairs)"
-            );
-            return;
-        }
-        tracing::debug!(
-            output = %output_name,
-            requested_count,
-            accepted_count = windows.len(),
-            "starting fullscreen geometry animation"
-        );
-        self.fullscreen_geometry_animations_by_output.insert(
-            output_name.clone(),
-            FullscreenGeometryAnimation {
-                duration: Self::FULLSCREEN_GEOMETRY_ANIMATION_DURATION,
-                started_at: Instant::now(),
-                windows,
-            },
-        );
-        let target_output = self
-            .space
-            .outputs()
-            .find(|candidate| candidate.name() == output_name)
-            .cloned();
-        if let Some(output) = target_output {
-            self.queue_redraw_for_outputs_or_all(std::iter::once(output));
-        } else {
-            crate::backend::udev::queue_redraw_all(self);
-        }
-    }
-
-    fn lerp_i32(from: i32, to: i32, progress: f32) -> i32 {
-        let delta = (to - from) as f32;
-        (from as f32 + delta * progress).round() as i32
-    }
-
-    pub(crate) fn active_fullscreen_geometry_animation_windows_for_output(
-        &mut self,
-        output: &smithay::output::Output,
-    ) -> Vec<(WlSurface, Rectangle<i32, Logical>, Rectangle<i32, Logical>)> {
-        self.clear_expired_fullscreen_geometry_animations();
-        let output_name = output.name();
-        let Some(animation) = self
-            .fullscreen_geometry_animations_by_output
-            .get(&output_name)
-            .cloned()
-        else {
-            return Vec::new();
-        };
-
-        let duration_secs = animation.duration.as_secs_f32().max(0.001);
-        let linear_progress = (animation.started_at.elapsed().as_secs_f32() / duration_secs).clamp(0.0, 1.0);
-        let eased_progress = 1.0 - (1.0 - linear_progress).powi(3);
-
-        let mut windows = Vec::with_capacity(animation.windows.len());
-        for (surface, window_animation) in animation.windows {
-            let from = window_animation.from;
-            let to = window_animation.to;
-            let reference = window_animation.reference;
-            let current_loc = Point::from((
-                Self::lerp_i32(from.loc.x, to.loc.x, eased_progress),
-                Self::lerp_i32(from.loc.y, to.loc.y, eased_progress),
-            ));
-            let current_size = Size::from((
-                Self::lerp_i32(from.size.w, to.size.w, eased_progress).max(1),
-                Self::lerp_i32(from.size.h, to.size.h, eased_progress).max(1),
-            ));
-            windows.push((surface, reference, Rectangle::new(current_loc, current_size)));
-        }
-        windows
-    }
-
-    pub(crate) fn note_surface_last_acked_configure(&mut self, surface: &WlSurface) {
-        let last_acked = with_states(surface, |states| {
-            states
-                .data_map
-                .get::<XdgToplevelSurfaceData>()
-                .and_then(|data| data.lock().ok())
-                .and_then(|role| role.last_acked.as_ref().map(|configure| configure.serial))
-        });
-        if let Some(serial) = last_acked {
-            self.last_acked_configure_serial_by_surface
-                .insert(surface.clone(), serial);
-        }
-    }
-
-    fn is_configure_serial_acked(&self, surface: &WlSurface, serial: Serial) -> bool {
-        self.last_acked_configure_serial_by_surface
-            .get(surface)
-            .copied()
-            .or_else(|| {
-                with_states(surface, |states| {
-                    states
-                        .data_map
-                        .get::<XdgToplevelSurfaceData>()
-                        .and_then(|data| data.lock().ok())
-                        .and_then(|role| role.last_acked.as_ref().map(|configure| configure.serial))
-                })
-            })
-            .is_some_and(|acked| acked.is_no_older_than(&serial))
-    }
-
-    fn bbox_delta_exceeds_tolerance(
-        previous: Rectangle<i32, Logical>,
-        current: Rectangle<i32, Logical>,
-    ) -> bool {
-        (previous.loc.x - current.loc.x).abs() > Self::FULLSCREEN_EXIT_STABLE_BBOX_TOLERANCE
-            || (previous.loc.y - current.loc.y).abs() > Self::FULLSCREEN_EXIT_STABLE_BBOX_TOLERANCE
-            || (previous.size.w - current.size.w).abs() > Self::FULLSCREEN_EXIT_STABLE_BBOX_TOLERANCE
-            || (previous.size.h - current.size.h).abs() > Self::FULLSCREEN_EXIT_STABLE_BBOX_TOLERANCE
-    }
-
-    fn begin_fullscreen_exit_transition(
-        &mut self,
-        surface: &WlSurface,
-        window: &Window,
-        configure_serial: Option<Serial>,
-    ) {
-        let cover = self.fullscreen_cover_geometry_for_window(window);
-        let output_name = cover
-            .as_ref()
-            .map(|(name, _)| name.clone())
-            .unwrap_or_else(|| "<unknown>".to_owned());
-        let fallback_bbox = self.window_bbox_or_geometry(window).unwrap_or_else(|| {
-            let fallback_size = self
-                .space
-                .element_geometry(window)
-                .unwrap_or_else(|| window.geometry())
-                .size;
-            let fallback_loc = self
-                .space
-                .element_location(window)
-                .unwrap_or((0, 0).into());
-            Rectangle::new(
-                fallback_loc,
-                Size::from((fallback_size.w.max(1), fallback_size.h.max(1))),
-            )
-        });
-        // Cover the whole output on fullscreen exit to prevent edge leaks.
-        let cover_bbox = cover
-            .as_ref()
-            .map(|(_, geometry)| *geometry)
-            .unwrap_or(fallback_bbox);
-        let (app_profile_key, mode) = self.fullscreen_exit_mode_for_surface(surface);
-        self.fullscreen_transition_clips
-            .insert(surface.clone(), cover_bbox);
-        self.fullscreen_exit_transitions.insert(
-            surface.clone(),
-            FullscreenExitTransition {
-                output_name,
-                pre_exit_loc: cover_bbox.loc,
-                pre_exit_size: cover_bbox.size,
-                configure_serial,
-                started_at: Instant::now(),
-                mode,
-                unstable_signals: 0,
-                stable_nonfullscreen_commits: 0,
-                commits_after_ack: 0,
-                last_committed_bbox: Some(fallback_bbox),
-                app_profile_key,
-            },
-        );
-        self.ready_fullscreen_surfaces.remove(surface);
-        self.mark_fullscreen_transition_redraw_for_window(window);
-        self.queue_redraw_for_outputs_or_all(self.space.outputs_for_element(window));
-    }
-
-    pub(crate) fn maybe_finalize_fullscreen_exit_transition_for_surface(
-        &mut self,
-        surface: &WlSurface,
-    ) -> bool {
-        let Some(mut transition) = self.fullscreen_exit_transitions.get(surface).cloned() else {
-            return false;
-        };
-        let elapsed = transition.started_at.elapsed();
-
-        let configure_acked = transition
-            .configure_serial
-            .is_none_or(|serial| self.is_configure_serial_acked(surface, serial));
-        if configure_acked {
-            transition.commits_after_ack = transition.commits_after_ack.saturating_add(1);
-        }
-
-        let Some(window) = self.window_for_surface(surface) else {
-            self.clear_fullscreen_owner_for_surface(surface);
-            return false;
-        };
-
-        let committed_fullscreen = Self::window_committed_fullscreen_state(&window);
-        let has_root_buffer = Self::window_root_surface_has_buffer(&window);
-        let current_bbox = self.window_bbox_or_geometry(&window);
-        let visually_nonfullscreen = current_bbox.is_some_and(|bbox| {
-            bbox.size.w + Self::FULLSCREEN_EXIT_STABLE_BBOX_TOLERANCE < transition.pre_exit_size.w
-                || bbox.size.h + Self::FULLSCREEN_EXIT_STABLE_BBOX_TOLERANCE
-                    < transition.pre_exit_size.h
-        });
-        let bbox_jumped = match (transition.last_committed_bbox, current_bbox) {
-            (Some(previous), Some(current)) => Self::bbox_delta_exceeds_tolerance(previous, current),
-            _ => false,
-        };
-        if configure_acked && committed_fullscreen {
-            transition.unstable_signals = transition.unstable_signals.saturating_add(1);
-        }
-        if configure_acked && committed_fullscreen && bbox_jumped && !visually_nonfullscreen {
-            transition.unstable_signals = transition.unstable_signals.saturating_add(1);
-        }
-        if configure_acked && !committed_fullscreen && has_root_buffer {
-            transition.stable_nonfullscreen_commits =
-                transition.stable_nonfullscreen_commits.saturating_add(1);
-        }
-        if let Some(current_bbox) = current_bbox {
-            transition.last_committed_bbox = Some(current_bbox);
-        }
-
-        if transition.mode == FullscreenExitMode::Immediate
-            && transition.unstable_signals >= Self::FULLSCREEN_EXIT_UNSTABLE_THRESHOLD
-        {
-            tracing::debug!(
-                app_id = %transition.app_profile_key,
-                output = %transition.output_name,
-                pre_exit_w = transition.pre_exit_size.w,
-                pre_exit_h = transition.pre_exit_size.h,
-                "fullscreen-exit escalated to guarded mode"
-            );
-            transition.mode = FullscreenExitMode::Guarded;
-            self.mark_fullscreen_exit_profile_unstable(&transition.app_profile_key);
-        }
-
-        let stable_and_ready = has_root_buffer
-            && (visually_nonfullscreen || (configure_acked && !committed_fullscreen));
-        let timed_out = elapsed >= Self::FULLSCREEN_EXIT_TRANSITION_TIMEOUT;
-
-        if !(stable_and_ready || timed_out) {
-            self.fullscreen_exit_transitions
-                .insert(surface.clone(), transition);
-            return false;
-        }
-
-        tracing::debug!(
-            app_id = %transition.app_profile_key,
-            output = %transition.output_name,
-            timed_out,
-            stable_and_ready,
-            "fullscreen-exit finalized"
-        );
-        if timed_out && !stable_and_ready {
-            self.mark_fullscreen_exit_profile_unstable(&transition.app_profile_key);
-        }
-
-        self.fullscreen_exit_transitions.remove(surface);
-        if self.surface_in_fullscreen_exit_snapshot(surface) {
-            self.clear_fullscreen_owner_for_surface_preserving_exit_snapshot(surface);
-        } else {
-            self.clear_fullscreen_owner_for_surface(surface);
-        }
-        if let Err(err) = self.apply_layout() {
-            tracing::warn!("failed to apply layout after fullscreen exit finalize: {err}");
-        }
-        crate::backend::udev::queue_redraw_all(self);
-        true
-    }
-
-    fn window_is_ready_fullscreen_on_output(
-        &self,
-        window: &Window,
-        output: &smithay::output::Output,
-    ) -> bool {
-        let Some(surface_id) = Self::window_surface_id(window) else {
-            return false;
-        };
-        self.ready_fullscreen_surfaces.contains(&surface_id)
-            && self
-                .space
-                .outputs_for_element(window)
-                .iter()
-                .any(|candidate| candidate == output)
-    }
-
-    pub fn mark_fullscreen_ready_for_surface(&mut self, surface: &WlSurface) {
-        let surface_id = surface.clone();
-        let Some(window) = self.window_for_surface(surface) else {
-            return;
-        };
-        if self.surface_in_fullscreen_exit_transition(surface) {
-            self.ready_fullscreen_surfaces.remove(&surface_id);
-            return;
-        }
-        if !self.window_is_workspace_fullscreen_owner(&window) {
-            return;
-        }
-
-        let Some(output) = self.space.outputs_for_element(&window).into_iter().next() else {
-            return;
-        };
-        let Some(output_geo) = self.space.output_geometry(&output) else {
-            return;
-        };
-        let window_geo = self
-            .space
-            .element_geometry(&window)
-            .unwrap_or_else(|| window.geometry());
-        let fullscreen_sized = window_geo.size.w + Self::FULLSCREEN_READY_TOLERANCE
-            >= output_geo.size.w
-            && window_geo.size.h + Self::FULLSCREEN_READY_TOLERANCE >= output_geo.size.h;
-        let surface_buffer_sized = with_states(surface, |states| {
-            states
-                .data_map
-                .get::<RendererSurfaceStateUserData>()
-                .and_then(|data| data.lock().ok())
-                .and_then(|data| data.buffer_size())
-                .is_some_and(|size| {
-                    size.w + Self::FULLSCREEN_READY_TOLERANCE >= output_geo.size.w
-                        && size.h + Self::FULLSCREEN_READY_TOLERANCE >= output_geo.size.h
-                })
-        });
-
-        if !self.window_effective_fullscreen_state(&window)
-            || !fullscreen_sized
-            || !surface_buffer_sized
-        {
-            self.ready_fullscreen_surfaces.remove(&surface_id);
-            return;
-        }
-
-        if !self.ready_fullscreen_surfaces.insert(surface_id.clone()) {
-            return;
-        }
-        let entry_from = self
-            .fullscreen_transition_clips
-            .get(&surface_id)
-            .copied()
-            .or_else(|| self.window_bbox_or_geometry(&window));
-        self.fullscreen_transition_clips.remove(&surface_id); // unfreeze clip
-
-        if self.space.element_location(&window) != Some(output_geo.loc) {
-            self.space.map_element(window.clone(), output_geo.loc, true);
-        }
-        if let Some(from_bbox) = entry_from {
-            let fullscreen_bbox = Rectangle::new(output_geo.loc, output_geo.size);
-            // Start from the real tiled footprint so fullscreen enter has visible motion,
-            // but keep the animated size bounded by the fullscreen target.
-            let edge_fill_from = Rectangle::new(
-                from_bbox.loc,
-                Size::from((
-                    from_bbox.size.w.clamp(1, fullscreen_bbox.size.w),
-                    from_bbox.size.h.clamp(1, fullscreen_bbox.size.h),
-                )),
-            );
-            if edge_fill_from != fullscreen_bbox {
-                let mut animation_windows: HashMap<WlSurface, FullscreenGeometryAnimationWindow> =
-                    HashMap::new();
-                animation_windows.insert(
-                    surface_id.clone(),
-                    FullscreenGeometryAnimationWindow {
-                        from: edge_fill_from,
-                        to: fullscreen_bbox,
-                        reference: fullscreen_bbox,
-                    },
-                );
-                self.start_fullscreen_geometry_animation_for_output(output.name(), animation_windows);
-            }
-        }
-        self.mark_fullscreen_transition_redraw_for_window(&window);
-    }
-
-    pub fn clear_fullscreen_ready_for_window(&mut self, window: &Window) {
-        if let Some(surface_id) = Self::window_surface_id(window) {
-            self.ready_fullscreen_surfaces.remove(&surface_id);
-            if !self.surface_in_fullscreen_exit_transition(&surface_id) {
-                self.fullscreen_transition_clips.remove(&surface_id);
-            }
-        }
-        for output in self.space.outputs_for_element(window) {
-            self.fullscreen_transition_redraw_by_output
-                .remove(&output.name());
-        }
-    }
-
-    pub fn take_fullscreen_transition_redraw_for_output(
-        &mut self,
-        output: &smithay::output::Output,
-    ) -> bool {
-        let key = output.name();
-        let Some(redraw_budget) = self.fullscreen_transition_redraw_by_output.get_mut(&key) else {
-            return false;
-        };
-
-        let should_redraw = *redraw_budget > 0;
-        if *redraw_budget <= 1 {
-            self.fullscreen_transition_redraw_by_output.remove(&key);
-        } else {
-            *redraw_budget -= 1;
-        }
-        should_redraw
-    }
-
-    fn begin_fullscreen_enter_transition(&mut self, window: &Window) -> bool {
-        let target_workspace = self
-            .workspace_index_for_window(window)
-            .unwrap_or(self.current_workspace);
-        let already_owner = self.window_is_workspace_fullscreen_owner(window);
-
-        self.assign_workspace_fullscreen_owner(target_workspace, window);
-        if !self
-            .fullscreen_windows
-            .iter()
-            .any(|candidate| Self::windows_match(candidate, window))
-        {
-            self.fullscreen_windows.push(window.clone());
-        }
-        self.set_window_floating(window, false);
-        if let Some(surface_id) = Self::window_surface_id(window) {
-            self.clear_fullscreen_transition_state_for_surface(&surface_id);
-            self.clear_floating_recenter_for_surface(&surface_id);
-            self.clear_fullscreen_ready_for_window(window);
-            // Freeze bbox now; subsurface moves during transition must not expand the crop rect.
-            // If bbox isn't available yet, synthesize one from current location/geometry.
-            let frozen_clip = self.space.element_bbox(window).or_else(|| {
-                let loc = self.space.element_location(window).or_else(|| {
-                    self.space
-                        .outputs_for_element(window)
-                        .into_iter()
-                        .next()
-                        .and_then(|output| self.space.output_geometry(&output).map(|geo| geo.loc))
-                })?;
-                let size = self
-                    .space
-                    .element_geometry(window)
-                    .unwrap_or_else(|| window.geometry())
-                    .size;
-                Some(Rectangle::new(
-                    loc,
-                    Size::from((size.w.max(1), size.h.max(1))),
-                ))
-            });
-            if let Some(frozen_clip) = frozen_clip {
-                self.fullscreen_transition_clips
-                    .insert(surface_id.clone(), frozen_clip);
-            }
-        } else {
-            self.clear_fullscreen_ready_for_window(window);
-        }
-        self.set_window_fullscreen_state(window, true);
-        self.mark_fullscreen_transition_redraw_for_window(window);
-        !already_owner
-    }
-
-    pub fn enter_fullscreen_window(&mut self, window: &Window) -> bool {
-        let already_owner = self.window_is_workspace_fullscreen_owner(window);
-        if already_owner {
-            return false;
-        }
-
-        let activated = self.begin_fullscreen_enter_transition(window);
-        self.debug_assert_state_invariants("enter_fullscreen_window");
-        activated
-    }
-
-    pub fn exit_fullscreen_window(&mut self, window: &Window) -> bool {
-        let was_owner = self.window_is_workspace_fullscreen_owner(window);
-        let was_tracked = self
-            .fullscreen_windows
-            .iter()
-            .any(|candidate| Self::windows_match(candidate, window));
-        if !was_owner && !was_tracked {
-            return false;
-        }
-
-        if let Some(surface_id) = Self::window_surface_id(window) {
-            self.clear_fullscreen_geometry_animation_for_surface(&surface_id);
-            if was_owner {
-                if self.request_fullscreen_exit_snapshot_for_window(&surface_id, window) {
-                    self.debug_assert_state_invariants("exit_fullscreen_window_snapshot_request");
-                    return true;
-                }
-                let serial = self.set_window_fullscreen_state(window, false);
-                self.begin_fullscreen_exit_transition(&surface_id, window, serial);
-                self.debug_assert_state_invariants("exit_fullscreen_window_transition");
-                return true;
-            }
-            self.clear_fullscreen_owner_for_surface(&surface_id);
-        }
-        self.fullscreen_windows
-            .retain(|candidate| !Self::windows_match(candidate, window));
-        self.clear_fullscreen_ready_for_window(window);
-        self.set_window_fullscreen_state(window, false);
-        self.debug_assert_state_invariants("exit_fullscreen_window");
-        true
-    }
-
-    fn window_surface_id(window: &Window) -> Option<WlSurface> {
-        window
-            .toplevel()
-            .map(|toplevel| toplevel.wl_surface().clone())
-    }
-
-    fn window_pending_and_committed_state(
-        window: &Window,
-        state_flag: xdg_toplevel::State,
-    ) -> (bool, bool) {
-        let Some(toplevel) = window.toplevel() else {
-            return (false, false);
-        };
-
-        let pending_has = toplevel.with_pending_state(|state| state.states.contains(state_flag));
-        let committed_has = toplevel.with_committed_state(|state| {
-            state
-                .as_ref()
-                .is_some_and(|state| state.states.contains(state_flag))
-        });
-        (pending_has, committed_has)
-    }
-
-    fn window_has_pending_or_committed_state(
-        window: &Window,
-        state_flag: xdg_toplevel::State,
-    ) -> bool {
-        let (pending_has, committed_has) =
-            Self::window_pending_and_committed_state(window, state_flag);
-        pending_has || committed_has
-    }
-
-    fn window_effective_fullscreen_state(&self, window: &Window) -> bool {
-        let (pending_has, committed_has) =
-            Self::window_pending_and_committed_state(window, xdg_toplevel::State::Fullscreen);
-
-        // During transitions where pending/committed diverge:
-        // - prefer pending=true (entering fullscreen),
-        // - keep fullscreen=true only for the workspace fullscreen owner,
-        // - otherwise treat as exiting fullscreen.
-        if pending_has != committed_has {
-            if pending_has {
-                return true;
-            }
-            return self.window_is_workspace_fullscreen_owner(window);
-        }
-
-        pending_has || committed_has
-    }
-
-    fn window_has_exclusive_layout_state(&self, window: &Window) -> bool {
-        self.window_is_workspace_fullscreen_owner(window)
-            || self.window_effective_fullscreen_state(window)
-            || Self::window_has_pending_or_committed_state(window, xdg_toplevel::State::Maximized)
-    }
-
-    fn mark_fullscreen_transition_redraw_for_window(&mut self, window: &Window) {
-        let mut outputs = self.space.outputs_for_element(window);
-        if outputs.is_empty() {
-            // During some transitions the window/output mapping can lag by a commit.
-            // Fall back to all outputs so we don't miss the first fullscreen frames.
-            outputs = self.space.outputs().cloned().collect();
-        }
-        for output in outputs {
-            let key = output.name();
-            self.fullscreen_transition_redraw_by_output
-                .entry(key)
-                .and_modify(|frames| {
-                    *frames = (*frames).max(Self::FULLSCREEN_TRANSITION_REDRAW_FRAMES);
-                })
-                .or_insert(Self::FULLSCREEN_TRANSITION_REDRAW_FRAMES);
-        }
-    }
-
     fn active_output_for_pointer(&self) -> Option<smithay::output::Output> {
         self.space
             .outputs()
@@ -2648,27 +941,156 @@ impl Raven {
             .unwrap_or((80, 80))
     }
 
-    pub fn initial_map_location_for_window(&self, window: &Window) -> (i32, i32) {
-        if (self.window_is_workspace_fullscreen_owner(window)
-            || self.window_effective_fullscreen_state(window))
-            && let Some(output) = self.space.outputs().next()
-            && let Some(out_geo) = self.space.output_geometry(output)
-        {
-            return (out_geo.loc.x, out_geo.loc.y);
-        }
+    pub(crate) fn assigned_rect_for_surface(
+        &self,
+        surface: &WlSurface,
+    ) -> Option<Rectangle<i32, Logical>> {
+        self.assigned_rects_by_surface.get(surface).copied()
+    }
 
-        if self.is_window_floating(window) {
-            self.default_floating_location(window)
-        } else {
-            self.pre_layout_tiled_slot_for_window(window)
-                .map(|(loc, _, _)| (loc.x, loc.y))
-                .unwrap_or((0, 0))
+    pub(crate) fn assigned_rect_for_window(
+        &self,
+        window: &Window,
+    ) -> Option<Rectangle<i32, Logical>> {
+        Self::window_surface_id(window).and_then(|surface| self.assigned_rect_for_surface(&surface))
+    }
+
+    pub(crate) fn record_assigned_rect_for_window(
+        &mut self,
+        window: &Window,
+        rect: Rectangle<i32, Logical>,
+    ) {
+        let Some(surface) = Self::window_surface_id(window) else {
+            return;
+        };
+        self.assigned_rects_by_surface.insert(surface, rect);
+    }
+
+    pub(crate) fn clear_assigned_rect_for_surface(&mut self, surface: &WlSurface) {
+        self.assigned_rects_by_surface.remove(surface);
+    }
+
+    pub(crate) fn reported_size_for_surface(
+        &self,
+        surface: &WlSurface,
+    ) -> Option<Size<i32, Logical>> {
+        self.reported_sizes_by_surface.get(surface).copied()
+    }
+
+    pub(crate) fn committed_reported_size_for_window(
+        &self,
+        window: &Window,
+    ) -> Option<Size<i32, Logical>> {
+        let toplevel = window.toplevel()?;
+        toplevel.with_committed_state(|state| state.and_then(|state| state.size))
+    }
+
+    pub(crate) fn reported_size_for_window(&self, window: &Window) -> Option<Size<i32, Logical>> {
+        self.committed_reported_size_for_window(window).or_else(|| {
+            Self::window_surface_id(window)
+                .and_then(|surface| self.reported_size_for_surface(&surface))
+        })
+    }
+
+    pub(crate) fn record_reported_size_for_window(
+        &mut self,
+        window: &Window,
+        size: Size<i32, Logical>,
+    ) {
+        let Some(surface) = Self::window_surface_id(window) else {
+            return;
+        };
+        self.reported_sizes_by_surface.insert(surface, size);
+    }
+
+    pub(crate) fn clear_reported_size_for_surface(&mut self, surface: &WlSurface) {
+        self.reported_sizes_by_surface.remove(surface);
+    }
+
+    pub(crate) fn sync_reported_size_from_pending_state(
+        &mut self,
+        window: &Window,
+        fallback_size: Option<Size<i32, Logical>>,
+    ) -> Option<Size<i32, Logical>> {
+        let Some(toplevel) = window.toplevel() else {
+            return None;
+        };
+        let requested_size = toplevel
+            .with_pending_state(|state| state.size)
+            .or(fallback_size);
+        if let Some(size) = requested_size {
+            self.record_reported_size_for_window(window, size);
+        }
+        self.reported_size_for_window(window).or(requested_size)
+    }
+
+    fn fallback_window_size(&self, window: &Window) -> Size<i32, Logical> {
+        self.assigned_rect_for_window(window)
+            .map(|rect| rect.size)
+            .or_else(|| self.space.element_geometry(window).map(|rect| rect.size))
+            .unwrap_or_else(|| window.geometry().size)
+    }
+
+    pub(crate) fn map_window_to_rect(
+        &mut self,
+        window: &Window,
+        rect: Rectangle<i32, Logical>,
+        activate: bool,
+    ) {
+        self.record_assigned_rect_for_window(window, rect);
+        self.space.map_element(window.clone(), rect.loc, activate);
+    }
+
+    pub(crate) fn map_window_to_location(
+        &mut self,
+        window: &Window,
+        loc: Point<i32, Logical>,
+        activate: bool,
+    ) {
+        self.map_window_to_rect(
+            window,
+            Rectangle::new(loc, self.fallback_window_size(window)),
+            activate,
+        );
+    }
+
+    pub(crate) fn unmap_window(&mut self, window: &Window) {
+        self.space.unmap_elem(window);
+        if let Some(surface) = Self::window_surface_id(window) {
+            self.clear_assigned_rect_for_surface(&surface);
+            self.clear_reported_size_for_surface(&surface);
         }
     }
 
+    pub(crate) fn initial_map_rect_for_window(&self, window: &Window) -> Rectangle<i32, Logical> {
+        if let Some(rect) = self.window_exclusive_target_rect(window) {
+            return rect;
+        }
+
+        if let Some(rect) = self.window_visual_or_assigned_rect(window) {
+            return rect;
+        }
+
+        if self.is_window_floating(window) {
+            return Rectangle::new(
+                self.default_floating_location(window).into(),
+                self.fallback_window_size(window),
+            );
+        }
+
+        self.pre_layout_tiled_slot_for_window(window)
+            .map(|(loc, size, _)| Rectangle::new(loc, size))
+            .unwrap_or_else(|| Rectangle::new((0, 0).into(), self.fallback_window_size(window)))
+    }
+
+    pub fn initial_map_location_for_window(&self, window: &Window) -> (i32, i32) {
+        let rect = self.initial_map_rect_for_window(window);
+        (rect.loc.x, rect.loc.y)
+    }
+
     pub(crate) fn map_window_to_initial_location(&mut self, window: &Window, activate: bool) {
-        let loc = self.initial_map_location_for_window(window);
-        self.space.map_element(window.clone(), loc, activate);
+        let rect = self.initial_map_rect_for_window(window);
+        self.map_window_to_rect(window, rect, activate);
     }
 
     pub(crate) fn map_window_to_initial_location_if_mappable(
@@ -2707,7 +1129,7 @@ impl Raven {
             .elements()
             .filter(|candidate| !self.is_window_floating(candidate))
             .filter(|candidate| Self::window_has_live_client(candidate))
-            .filter(|candidate| self.window_root_surface_has_buffer_or_exit_transition(candidate))
+            .filter(|candidate| Self::window_root_surface_has_buffer(candidate))
             .cloned()
             .collect();
 
@@ -2812,8 +1234,7 @@ impl Raven {
     pub fn flush_interactive_frame_updates(&mut self) {
         let pending_moves = std::mem::take(&mut self.pending_interactive_moves);
         for pending in pending_moves {
-            self.space
-                .map_element(pending.window, pending.location, false);
+            self.map_window_to_location(&pending.window, pending.location, false);
         }
 
         let pending_resizes = std::mem::take(&mut self.pending_interactive_resizes);
@@ -2825,6 +1246,7 @@ impl Raven {
                 state.states.set(xdg_toplevel::State::Resizing);
                 state.size = Some(pending.size);
             });
+            self.sync_reported_size_from_pending_state(&pending.window, Some(pending.size));
             toplevel.send_pending_configure();
         }
     }
@@ -2942,60 +1364,32 @@ impl Raven {
     }
 
     pub fn queue_window_rule_recheck_for_surface(&mut self, surface: &WlSurface) {
-        if self.should_defer_window_rules_for_surface(surface) {
-            self.pending_window_rule_recheck_ids.insert(surface.clone());
-        }
+        rules::queue_window_rule_recheck_for_surface(self, surface);
     }
 
     pub fn queue_floating_recenter_for_surface(&mut self, surface: &WlSurface) {
-        self.pending_floating_recenter_ids.insert(surface.clone());
+        rules::queue_floating_recenter_for_surface(self, surface);
     }
 
     pub fn clear_floating_recenter_for_surface(&mut self, surface: &WlSurface) {
-        self.pending_floating_recenter_ids.remove(surface);
+        rules::clear_floating_recenter_for_surface(self, surface);
     }
 
     pub fn clear_window_rule_recheck_for_surface(&mut self, surface: &WlSurface) {
-        self.pending_window_rule_recheck_ids.remove(surface);
+        rules::clear_window_rule_recheck_for_surface(self, surface);
     }
 
     pub fn queue_initial_configure_for_surface(&mut self, surface: &WlSurface) {
-        // Mark that this root surface still needs its initial configure.
-        self.pending_initial_configure_ids.insert(surface.clone());
+        rules::queue_initial_configure_for_surface(self, surface);
     }
 
     pub fn clear_initial_configure_for_surface(&mut self, surface: &WlSurface) {
-        self.pending_initial_configure_ids.remove(surface);
+        rules::clear_initial_configure_for_surface(self, surface);
     }
 
     // Match niri's behavior: send initial configure from an idle callback while still unmapped.
     pub fn queue_initial_configure_idle_for_surface(&mut self, surface: &WlSurface) {
-        if !self.pending_initial_configure_ids.contains(surface) {
-            return;
-        }
-        if !self
-            .pending_initial_configure_idle_ids
-            .insert(surface.clone())
-        {
-            return;
-        }
-
-        let surface_id = surface.clone();
-        self.loop_handle.insert_idle(move |state| {
-            state.pending_initial_configure_idle_ids.remove(&surface_id);
-            if !surface_id.is_alive() {
-                return;
-            }
-            if !state.pending_initial_configure_ids.contains(&surface_id) {
-                return;
-            }
-            if !state.unmapped_toplevel_ids.contains(&surface_id) {
-                return;
-            }
-
-            state.send_initial_configure_for_surface(&surface_id);
-            state.clear_initial_configure_for_surface(&surface_id);
-        });
+        rules::queue_initial_configure_idle_for_surface(self, surface);
     }
 
     pub fn mark_surface_unmapped_toplevel(&mut self, surface: &WlSurface) {
@@ -3016,14 +1410,6 @@ impl Raven {
             .is_some_and(|surface| self.unmapped_toplevel_ids.contains(surface))
     }
 
-    pub fn queue_pending_unmapped_fullscreen_for_surface(&mut self, surface: &WlSurface) {
-        self.pending_unmapped_fullscreen_ids.insert(surface.clone());
-    }
-
-    pub fn clear_pending_unmapped_fullscreen_for_surface(&mut self, surface: &WlSurface) {
-        self.pending_unmapped_fullscreen_ids.remove(surface);
-    }
-
     pub fn queue_pending_unmapped_maximized_for_surface(&mut self, surface: &WlSurface) {
         self.pending_unmapped_maximized_ids.insert(surface.clone());
     }
@@ -3038,65 +1424,25 @@ impl Raven {
 
     pub fn clear_pending_unmapped_state_for_surface(&mut self, surface: &WlSurface) {
         // Full reset for unmapped->mapped bookkeeping on this root surface.
-        self.pending_unmapped_fullscreen_ids.remove(surface);
+        self.fullscreen.pending_unmapped_ids.remove(surface);
+        self.fullscreen.pending_transition_by_surface.remove(surface);
+        self.fullscreen.restore_state_by_surface.remove(surface);
+        self.fullscreen.maximized_surfaces.remove(surface);
+        self.clear_fullscreen_owner_for_surface(surface);
+        self.clear_assigned_rect_for_surface(surface);
+        self.clear_reported_size_for_surface(surface);
         self.pending_unmapped_maximized_ids.remove(surface);
         self.pending_initial_configure_ids.remove(surface);
         self.pending_initial_configure_idle_ids.remove(surface);
         self.unmapped_toplevel_ids.remove(surface);
-        self.clear_fullscreen_transition_state_for_surface(surface);
     }
 
     pub(crate) fn should_defer_window_rules_for_surface(&self, surface: &WlSurface) -> bool {
-        let (app_id, title) = Self::surface_app_id_and_title(surface);
-        if self.has_window_rule_metadata_gap(app_id.as_deref(), title.as_deref()) {
-            return true;
-        }
-
-        // Re-evaluate floating once the client commits real metadata/size hints.
-        !self.has_matching_explicit_floating_rule(app_id.as_deref(), title.as_deref())
+        rules::should_defer_window_rules_for_surface(self, surface)
     }
 
     pub fn resolve_window_rules_for_surface(&self, surface: &WlSurface) -> NewWindowRuleDecision {
-        let (app_id, title) = Self::surface_app_id_and_title(surface);
-
-        let mut decision = NewWindowRuleDecision {
-            workspace_index: self.current_workspace,
-            floating: false,
-            fullscreen: false,
-            focus: true,
-            width: None,
-            height: None,
-        };
-
-        for rule in &self.config.window_rules {
-            if !rule.matches(app_id.as_deref(), title.as_deref()) {
-                continue;
-            }
-            Self::apply_window_rule_to_decision(rule, &mut decision);
-        }
-
-        decision
-    }
-
-    fn apply_window_rule_to_decision(rule: &WindowRule, decision: &mut NewWindowRuleDecision) {
-        if let Some(workspace_index) = rule.workspace {
-            decision.workspace_index = workspace_index;
-        }
-        if let Some(floating) = rule.floating {
-            decision.floating = floating;
-        }
-        if let Some(fullscreen) = rule.fullscreen {
-            decision.fullscreen = fullscreen;
-        }
-        if let Some(focus) = rule.focus {
-            decision.focus = focus;
-        }
-        if let Some(width) = rule.width {
-            decision.width = Some(width);
-        }
-        if let Some(height) = rule.height {
-            decision.height = Some(height);
-        }
+        rules::resolve_window_rules_for_surface(self, surface)
     }
 
     pub fn apply_window_rule_size_to_window(
@@ -3104,88 +1450,15 @@ impl Raven {
         window: &Window,
         decision: &NewWindowRuleDecision,
     ) {
-        let (Some(width), Some(height)) = (decision.width, decision.height) else {
-            return;
-        };
-
-        let width = width.clamp(1, i32::MAX as u32) as i32;
-        let height = height.clamp(1, i32::MAX as u32) as i32;
-
-        let Some(toplevel) = window.toplevel() else {
-            return;
-        };
-        toplevel.with_pending_state(|state| {
-            state.size = Some((width, height).into());
-        });
+        rules::apply_window_rule_size_to_window(self, window, decision);
     }
 
     pub fn send_initial_configure_for_surface(&mut self, surface: &WlSurface) {
-        let Some(window) = self.window_for_surface(surface) else {
-            return;
-        };
-
-        let mut decision = self.resolve_window_rules_for_surface(surface);
-        let (effective_floating, _, _, _) =
-            self.resolve_effective_floating_for_surface(surface, &window, decision.floating);
-        let window_has_exclusive_state = self.window_has_exclusive_layout_state(&window);
-        decision.floating = if window_has_exclusive_state {
-            false
-        } else {
-            effective_floating
-        };
-
-        if let Err(err) = self.move_window_to_workspace_internal(&window, decision.workspace_index)
-        {
-            tracing::warn!("failed to move window during initial configure: {err}");
-        }
-
-        self.set_window_floating(&window, decision.floating && !window_has_exclusive_state);
-
-        let Some(toplevel) = window.toplevel() else {
-            return;
-        };
-
-        let mode = self.preferred_decoration_mode();
-        toplevel.with_pending_state(|state| {
-            state.decoration_mode = Some(mode);
-            let tiled = (mode == XdgDecorationMode::ServerSide || self.config.no_csd)
-                && !decision.floating
-                && !window_has_exclusive_state;
-            if tiled {
-                state.states.set(xdg_toplevel::State::TiledLeft);
-                state.states.set(xdg_toplevel::State::TiledRight);
-                state.states.set(xdg_toplevel::State::TiledTop);
-                state.states.set(xdg_toplevel::State::TiledBottom);
-            } else {
-                state.states.unset(xdg_toplevel::State::TiledLeft);
-                state.states.unset(xdg_toplevel::State::TiledRight);
-                state.states.unset(xdg_toplevel::State::TiledTop);
-                state.states.unset(xdg_toplevel::State::TiledBottom);
-            }
-        });
-
-        self.apply_window_rule_size_to_window(&window, &decision);
-
-        let visible_on_current_workspace = decision.workspace_index == self.current_workspace;
-        if visible_on_current_workspace
-            && !decision.floating
-            && !decision.fullscreen
-            && !window_has_exclusive_state
-            && let Some((_, tiled_size, tiled_bounds)) =
-                self.pre_layout_tiled_slot_for_window(&window)
-        {
-            toplevel.with_pending_state(|state| {
-                state.size = Some(tiled_size);
-                state.bounds = Some(tiled_bounds);
-            });
-        }
-
-        toplevel.send_configure();
+        rules::send_initial_configure_for_surface(self, surface);
     }
 
     fn workspace_index_for_window(&self, window: &Window) -> Option<usize> {
-        self.workspace_index_for_mapped_window(window)
-            .or_else(|| self.workspace_index_for_unmapped_window(window))
+        workspaces::workspace_index_for_window(self, window)
     }
 
     fn move_window_to_workspace_internal(
@@ -3193,609 +1466,38 @@ impl Raven {
         window: &Window,
         target_workspace: usize,
     ) -> Result<(), CompositorError> {
-        if target_workspace >= self.workspaces.len() {
-            return Err(CompositorError::Backend(format!(
-                "invalid workspace index {target_workspace}"
-            )));
-        }
-
-        let source_mapped_workspace = self.workspace_index_for_mapped_window(window);
-        let source_unmapped_workspace = self.workspace_index_for_unmapped_window(window);
-        let tracked_unmapped =
-            self.window_is_unmapped_toplevel(window) || source_unmapped_workspace.is_some();
-
-        if tracked_unmapped {
-            Self::remove_window_from_workspace_list(&mut self.workspaces, window);
-
-            match source_unmapped_workspace {
-                Some(source_workspace) if source_workspace == target_workspace => {}
-                _ => {
-                    Self::remove_window_from_workspace_list(&mut self.unmapped_workspaces, window);
-                    Self::add_window_to_workspace_list(
-                        &mut self.unmapped_workspaces,
-                        target_workspace,
-                        window.clone(),
-                    )?;
-                }
-            }
-
-            if let Some(surface_id) = Self::window_surface_id(window) {
-                self.move_workspace_fullscreen_owner_surface(&surface_id, target_workspace);
-            }
-            self.debug_assert_state_invariants("move_window_to_workspace_internal_unmapped");
-            return Ok(());
-        }
-
-        match source_mapped_workspace {
-            Some(source_workspace) if source_workspace == target_workspace => {}
-            Some(source_workspace) => {
-                Self::remove_window_from_workspace_list(&mut self.workspaces, window);
-                Self::add_window_to_workspace_list(
-                    &mut self.workspaces,
-                    target_workspace,
-                    window.clone(),
-                )?;
-
-                if source_workspace == self.current_workspace {
-                    self.space.unmap_elem(window);
-                }
-                if target_workspace == self.current_workspace {
-                    self.map_window_to_initial_location_if_mappable(window, false);
-                }
-            }
-            None => {
-                self.add_window_to_workspace(target_workspace, window.clone());
-                if target_workspace == self.current_workspace {
-                    self.map_window_to_initial_location_if_mappable(window, false);
-                }
-            }
-        }
-
-        Self::remove_window_from_workspace_list(&mut self.unmapped_workspaces, window);
-        if let Some(surface_id) = Self::window_surface_id(window) {
-            self.move_workspace_fullscreen_owner_surface(&surface_id, target_workspace);
-        }
-        self.debug_assert_state_invariants("move_window_to_workspace_internal");
-
-        Ok(())
+        workspaces::move_window_to_workspace_internal(self, window, target_workspace)
     }
 
     pub fn maybe_apply_deferred_window_rules(&mut self, surface: &WlSurface) {
-        let surface_id = surface.clone();
-        if !self.pending_window_rule_recheck_ids.contains(&surface_id) {
-            return;
-        }
-        let (app_id, title) = Self::surface_app_id_and_title(surface);
-
-        let Some(window) = self.window_for_surface(surface) else {
-            self.pending_window_rule_recheck_ids.remove(&surface_id);
-            return;
-        };
-
-        let is_mapped =
-            with_renderer_surface_state(surface, |state| state.buffer().is_some()).unwrap_or(false);
-        if !is_mapped {
-            // Mirror niri's mapping signal so helper/withdrawn surfaces do not enter Space.
-            return;
-        }
-
-        let has_buffer = with_states(surface, |states| {
-            states
-                .data_map
-                .get::<RendererSurfaceStateUserData>()
-                .and_then(|data| data.lock().ok())
-                .and_then(|data| data.buffer_size())
-                .is_some()
-        });
-        if !has_buffer {
-            // Avoid mapping a placeholder surface before the client commits a real buffer.
-            return;
-        }
-
-        let mut decision = self.resolve_window_rules_for_surface(surface);
-        let (effective_floating, has_explicit_floating_rule, auto_floating, auto_reason) =
-            self.resolve_effective_floating_for_surface(surface, &window, decision.floating);
-        let window_has_exclusive_state = self.window_has_exclusive_layout_state(&window);
-        decision.floating = if window_has_exclusive_state {
-            false
-        } else {
-            effective_floating
-        };
-
-        if let Err(err) = self.move_window_to_workspace_internal(&window, decision.workspace_index)
-        {
-            tracing::warn!("failed to move window after deferred rule resolution: {err}");
-        }
-        if let Some(toplevel) = window.toplevel() {
-            let mode = self.preferred_decoration_mode();
-            let fixed_hint_size = if !has_explicit_floating_rule
-                && auto_floating
-                && decision.width.is_none()
-                && decision.height.is_none()
-                && !window_has_exclusive_state
-            {
-                Self::fixed_hint_size_for_surface(surface)
-            } else {
-                None
-            };
-            toplevel.with_pending_state(|state| {
-                state.decoration_mode = Some(mode);
-                let tiled = (mode == XdgDecorationMode::ServerSide || self.config.no_csd)
-                    && !decision.floating
-                    && !window_has_exclusive_state;
-                if tiled {
-                    state.states.set(xdg_toplevel::State::TiledLeft);
-                    state.states.set(xdg_toplevel::State::TiledRight);
-                    state.states.set(xdg_toplevel::State::TiledTop);
-                    state.states.set(xdg_toplevel::State::TiledBottom);
-                } else {
-                    state.states.unset(xdg_toplevel::State::TiledLeft);
-                    state.states.unset(xdg_toplevel::State::TiledRight);
-                    state.states.unset(xdg_toplevel::State::TiledTop);
-                    state.states.unset(xdg_toplevel::State::TiledBottom);
-                }
-                // If this window switched from a tiled configure to auto-floating and does not
-                // have a strict fixed-size hint, clear stale tiled configure size so the client
-                // can choose its natural dialog size.
-                if !has_explicit_floating_rule
-                    && auto_floating
-                    && decision.width.is_none()
-                    && decision.height.is_none()
-                    && !window_has_exclusive_state
-                {
-                    state.size = fixed_hint_size;
-                }
-            });
-        }
-        self.apply_window_rule_size_to_window(&window, &decision);
-        if let Some(toplevel) = window.toplevel()
-            && toplevel.is_initial_configure_sent()
-        {
-            toplevel.send_pending_configure();
-        }
-
-        let was_floating = self.is_window_floating(&window);
-        self.set_window_floating(&window, decision.floating && !window_has_exclusive_state);
-        let on_current_workspace = self.workspace_contains_window(self.current_workspace, &window);
-        let tiled_slot = if on_current_workspace
-            && !decision.floating
-            && !decision.fullscreen
-            && !window_has_exclusive_state
-        {
-            self.pre_layout_tiled_slot_for_window(&window)
-        } else {
-            None
-        };
-        if let Some((_, desired_size, desired_bounds)) = tiled_slot
-            && let Some(toplevel) = window.toplevel()
-        {
-            let mut needs_configure = false;
-            toplevel.with_pending_state(|state| {
-                if state.size != Some(desired_size) {
-                    state.size = Some(desired_size);
-                    needs_configure = true;
-                }
-                if state.bounds != Some(desired_bounds) {
-                    state.bounds = Some(desired_bounds);
-                    needs_configure = true;
-                }
-            });
-            if needs_configure && toplevel.is_initial_configure_sent() {
-                toplevel.send_pending_configure();
-            }
-        }
-        // Mapping is synchronized from the root-commit path (niri-style), not from deferred
-        // metadata rechecks. This avoids pre-layout/placeholder maps.
-        if decision.floating && self.is_window_mapped(&window) {
-            let loc = self.initial_map_location_for_window(&window);
-            // Re-center when metadata arrives and after first commit size settles.
-            // This centers in the working area after geometry settles.
-            self.space.map_element(window.clone(), loc, !was_floating);
-            self.queue_floating_recenter_for_surface(surface);
-        }
-
-        if decision.fullscreen {
-            self.enter_fullscreen_window(&window);
-        }
-
-        if let Err(err) = self.apply_layout() {
-            tracing::warn!("failed to apply layout after deferred rule resolution: {err}");
-        }
-
-        if decision.focus && decision.workspace_index == self.current_workspace {
-            self.set_keyboard_focus(Some(surface.clone()), SERIAL_COUNTER.next_serial());
-        }
-
-        let current_geo = self
-            .space
-            .element_geometry(&window)
-            .unwrap_or_else(|| window.geometry());
-        let has_real_mapped_size = current_geo.size.w > 1 && current_geo.size.h > 1;
-        let keep_recheck_pending = self
-            .has_window_rule_metadata_gap(app_id.as_deref(), title.as_deref())
-            || (!window_has_exclusive_state
-                && !has_explicit_floating_rule
-                && decision.floating
-                && auto_reason == "fixed-height"
-                && !has_real_mapped_size);
-        if !keep_recheck_pending {
-            self.pending_window_rule_recheck_ids.remove(&surface_id);
-        }
+        rules::maybe_apply_deferred_window_rules(self, surface);
     }
 
     pub fn maybe_recenter_floating_window_after_commit(&mut self, surface: &WlSurface) {
-        let surface_id = surface.clone();
-        if !self.pending_floating_recenter_ids.contains(&surface_id) {
-            return;
-        }
-
-        let Some(window) = self.window_for_surface(surface) else {
-            self.pending_floating_recenter_ids.remove(&surface_id);
-            return;
-        };
-        if !self.is_window_floating(&window) || !self.is_window_mapped(&window) {
-            self.pending_floating_recenter_ids.remove(&surface_id);
-            return;
-        }
-
-        let size = window.geometry().size;
-        if size.w <= 1 || size.h <= 1 {
-            // Wait for the first commit with a real window size.
-            return;
-        }
-
-        let loc = self.initial_map_location_for_window(&window);
-        self.space.map_element(window, loc, false);
-        self.pending_floating_recenter_ids.remove(&surface_id);
-    }
-
-    fn write_ipc_response(stream: &mut UnixStream, message: &str) {
-        if let Err(err) = stream.write_all(message.as_bytes()) {
-            tracing::warn!("failed to write ipc response: {err}");
-        }
+        rules::maybe_recenter_floating_window_after_commit(self, surface);
     }
 
     pub fn handle_ipc_stream(&mut self, mut stream: UnixStream) {
-        let mut request = String::new();
-        if let Err(err) = stream.read_to_string(&mut request) {
-            Self::write_ipc_response(
-                &mut stream,
-                &format!("error: failed to read request: {err}\n"),
-            );
-            return;
-        }
-
-        match request.trim() {
-            "clients" => {
-                let output = self.render_clients_report();
-                Self::write_ipc_response(&mut stream, &output);
-            }
-            "monitors" => {
-                let output = self.render_monitors_report();
-                Self::write_ipc_response(&mut stream, &output);
-            }
-            "reload" => match self.reload_config() {
-                Ok(()) => Self::write_ipc_response(&mut stream, "ok\n"),
-                Err(err) => Self::write_ipc_response(&mut stream, &format!("error: {err}\n")),
-            },
-            "" => {
-                Self::write_ipc_response(
-                    &mut stream,
-                    "error: empty command (supported: clients, monitors, reload)\n",
-                );
-            }
-            other => {
-                Self::write_ipc_response(
-                    &mut stream,
-                    &format!(
-                        "error: unsupported command `{other}` (supported: clients, monitors, reload)\n"
-                    ),
-                );
-            }
-        }
-    }
-
-    fn render_clients_report(&self) -> String {
-        let focused_surface = self
-            .seat
-            .get_keyboard()
-            .and_then(|keyboard| keyboard.current_focus());
-
-        let mut seen_surfaces = HashSet::new();
-        let mut windows = Vec::new();
-        for window in self.workspace_windows().chain(self.space.elements()) {
-            let Some(toplevel) = window.toplevel() else {
-                continue;
-            };
-            let surface = toplevel.wl_surface();
-            if seen_surfaces.insert(surface.clone()) {
-                windows.push(window.clone());
-            }
-        }
-
-        if windows.is_empty() {
-            return "No clients.\n".to_owned();
-        }
-
-        let mut out = String::new();
-        for (index, window) in windows.iter().enumerate() {
-            let Some(toplevel) = window.toplevel() else {
-                continue;
-            };
-            let wl_surface = toplevel.wl_surface().clone();
-
-            let (app_id, title) = with_states(&wl_surface, |states| {
-                let role = states
-                    .data_map
-                    .get::<XdgToplevelSurfaceData>()
-                    .expect("xdg toplevel role data missing")
-                    .lock()
-                    .expect("xdg toplevel role lock poisoned");
-                (role.app_id.clone(), role.title.clone())
-            });
-
-            let workspace = self
-                .workspace_index_for_window(window)
-                .map(|idx| idx + 1)
-                .unwrap_or(self.current_workspace + 1);
-
-            let class = app_id.as_deref().unwrap_or("<unknown>");
-            let title = title.as_deref().unwrap_or("<untitled>");
-            let focused = focused_surface.as_ref() == Some(&wl_surface);
-            let mapped = self.is_window_mapped(window);
-            let floating = self.is_window_floating(window);
-            let fullscreen = self.window_effective_fullscreen_state(window);
-            let surface_id = format!("{:?}", wl_surface.id());
-
-            out.push_str(&format!("Client {}:\n", index + 1));
-            out.push_str(&format!("  surface: {surface_id}\n"));
-            out.push_str(&format!("  class: {class}\n"));
-            out.push_str(&format!("  title: {title}\n"));
-            out.push_str(&format!("  workspace: {workspace}\n"));
-            out.push_str(&format!("  mapped: {mapped}\n"));
-            out.push_str(&format!("  floating: {floating}\n"));
-            out.push_str(&format!("  fullscreen: {fullscreen}\n"));
-            out.push_str(&format!("  focused: {focused}\n"));
-            out.push('\n');
-        }
-
-        out
-    }
-
-    fn render_monitors_report(&self) -> String {
-        let mut outputs: Vec<_> = self.space.outputs().cloned().collect();
-        if outputs.is_empty() {
-            return "No monitors.\n".to_owned();
-        }
-
-        outputs.sort_by_key(|output| {
-            self.space
-                .output_geometry(output)
-                .map(|geo| (geo.loc.x, geo.loc.y))
-                .unwrap_or((i32::MAX, i32::MAX))
-        });
-
-        let mut out = String::new();
-        for (index, output) in outputs.iter().enumerate() {
-            out.push_str(&format!("Monitor {}:\n", index + 1));
-            out.push_str(&format!("  name: {}\n", output.name()));
-
-            if let Some(mode) = output.current_mode() {
-                if mode.refresh > 0 {
-                    out.push_str(&format!(
-                        "  mode: {}x{}@{:.3}\n",
-                        mode.size.w,
-                        mode.size.h,
-                        mode.refresh as f64 / 1000.0
-                    ));
-                } else {
-                    out.push_str(&format!("  mode: {}x{}\n", mode.size.w, mode.size.h));
-                }
-            } else {
-                out.push_str("  mode: <unknown>\n");
-            }
-
-            if let Some(geo) = self.space.output_geometry(output) {
-                out.push_str(&format!("  position: {}, {}\n", geo.loc.x, geo.loc.y));
-                out.push_str(&format!("  logical_size: {}x{}\n", geo.size.w, geo.size.h));
-            } else {
-                out.push_str("  position: <unknown>\n");
-                out.push_str("  logical_size: <unknown>\n");
-            }
-
-            out.push_str(&format!(
-                "  scale: {:.3}\n",
-                output.current_scale().fractional_scale()
-            ));
-            out.push('\n');
-        }
-
-        out
+        ipc::handle_ipc_stream(self, &mut stream);
     }
 
     pub(crate) fn is_window_mapped(&self, window: &Window) -> bool {
         self.space.element_location(window).is_some()
     }
 
-    pub fn sync_window_activation(&self, focused_window: Option<&Window>) {
-        let windows: Vec<Window> = self.space.elements().cloned().collect();
-        for window in windows {
-            let is_focused = focused_window.is_some_and(|focused| focused == &window);
-            if let Some(toplevel) = window.toplevel() {
-                toplevel.with_pending_state(|state| {
-                    if is_focused {
-                        state.states.set(xdg_toplevel::State::Activated);
-                    } else {
-                        state.states.unset(xdg_toplevel::State::Activated);
-                    }
-                });
-                // Avoid sending pending configure before a window got its initial
-                // configure; this can create unstable negotiation on fresh toplevels.
-                if toplevel.is_initial_configure_sent() {
-                    toplevel.send_pending_configure();
-                }
-            }
-        }
-    }
-
-    pub fn set_keyboard_focus(&mut self, target: Option<WlSurface>, serial: Serial) {
-        let current_focus = self
-            .seat
-            .get_keyboard()
-            .and_then(|keyboard| keyboard.current_focus());
-        if current_focus.as_ref() == target.as_ref() {
-            return;
-        }
-
-        let focused_window = target
-            .as_ref()
-            .and_then(|surface| self.window_for_surface(surface));
-        if let Some(window) = focused_window.as_ref()
-            && self.is_window_mapped(window)
-        {
-            self.raise_window_preserving_layer(window);
-        }
-        self.sync_window_activation(focused_window.as_ref());
-
-        if let Some(keyboard) = self.seat.get_keyboard() {
-            keyboard.set_focus(self, target, serial);
-        }
-    }
-
-    pub fn refocus_visible_window(&mut self) {
-        if let Some(focused_surface) = self
-            .seat
-            .get_keyboard()
-            .and_then(|keyboard| keyboard.current_focus())
-            && let Some(window) = self.window_for_surface(&focused_surface)
-            && self.is_window_mapped(&window)
-        {
-            self.sync_window_activation(Some(&window));
-            return;
-        }
-
-        let serial = SERIAL_COUNTER.next_serial();
-        let pointer_target = self.window_under_pointer().and_then(|(window, _)| {
-            window
-                .toplevel()
-                .map(|toplevel| toplevel.wl_surface().clone())
-        });
-
-        let fallback_target = self.space.elements().last().and_then(|window| {
-            window
-                .toplevel()
-                .map(|toplevel| toplevel.wl_surface().clone())
-        });
-
-        let target = pointer_target.or(fallback_target);
-        self.set_keyboard_focus(target, serial);
-    }
-
     pub fn remove_window_from_workspaces(&mut self, window: &Window) {
-        self.clear_fullscreen_ready_for_window(window);
-        if let Some(surface_id) = Self::window_surface_id(window) {
-            self.clear_pending_unmapped_state_for_surface(&surface_id);
-            self.clear_fullscreen_owner_for_surface(&surface_id);
-            self.clear_fullscreen_transition_state_for_surface(&surface_id);
-        }
-        Self::remove_window_from_workspace_list(&mut self.workspaces, window);
-        Self::remove_window_from_workspace_list(&mut self.unmapped_workspaces, window);
-        self.fullscreen_windows
-            .retain(|candidate| !Self::windows_match(candidate, window));
-        self.floating_windows
-            .retain(|candidate| !Self::windows_match(candidate, window));
-        self.debug_assert_state_invariants("remove_window_from_workspaces");
+        workspaces::remove_window_from_workspaces(self, window);
     }
 
     pub fn switch_workspace(&mut self, target_workspace: usize) -> Result<(), CompositorError> {
-        if target_workspace >= self.workspaces.len() {
-            return Err(CompositorError::Backend(format!(
-                "invalid workspace index {target_workspace}"
-            )));
-        }
-
-        if target_workspace == self.current_workspace {
-            return Ok(());
-        }
-
-        self.prune_windows_without_live_client();
-
-        let current_windows = self.workspaces[self.current_workspace].clone();
-        for window in &current_windows {
-            self.space.unmap_elem(window);
-        }
-
-        self.current_workspace = target_workspace;
-
-        let target_windows = self.workspaces[target_workspace].clone();
-        for window in target_windows {
-            let mapped_now = self.map_window_to_initial_location_if_mappable(&window, false);
-            if mapped_now
-                && let Some(toplevel) = window.toplevel()
-                && toplevel.is_initial_configure_sent()
-            {
-                toplevel.send_pending_configure();
-            }
-            if mapped_now && let Some(toplevel) = window.toplevel() {
-                // A window can receive fullscreen/maximize requests while still in our
-                // unmapped-tracking phase. If that phase completed off-workspace, those pending
-                // states won't be replayed on commit anymore; apply them when the window is mapped
-                // during workspace activation.
-                self.maybe_apply_pending_unmapped_state_for_surface(toplevel.wl_surface());
-            }
-        }
-
-        self.apply_layout()?;
-        self.refocus_visible_window();
-        self.refresh_ext_workspace();
-        crate::backend::udev::queue_redraw_all(self);
-        self.debug_assert_state_invariants("switch_workspace");
-        Ok(())
+        workspaces::switch_workspace(self, target_workspace)
     }
 
     pub fn move_focused_window_to_workspace(
         &mut self,
         target_workspace: usize,
     ) -> Result<(), CompositorError> {
-        if target_workspace >= self.workspaces.len() {
-            return Err(CompositorError::Backend(format!(
-                "invalid workspace index {target_workspace}"
-            )));
-        }
-
-        let Some(keyboard) = self.seat.get_keyboard() else {
-            return Ok(());
-        };
-        let Some(focused_surface) = keyboard.current_focus() else {
-            return Ok(());
-        };
-        let Some(window) = self.window_for_surface(&focused_surface) else {
-            return Ok(());
-        };
-
-        let source_workspace = self
-            .workspace_index_for_window(&window)
-            .unwrap_or(self.current_workspace);
-
-        if source_workspace == target_workspace {
-            return Ok(());
-        }
-
-        self.move_window_to_workspace_internal(&window, target_workspace)?;
-
-        if source_workspace == self.current_workspace {
-            self.apply_layout()?;
-            self.refocus_visible_window();
-        } else if target_workspace == self.current_workspace {
-            if self.is_window_mapped(&window)
-                || self.map_window_to_initial_location_if_mappable(&window, false)
-            {
-                self.apply_layout()?;
-            }
-        }
-
-        self.refresh_ext_workspace();
-        Ok(())
+        workspaces::move_focused_window_to_workspace(self, target_workspace)
     }
 
     pub fn spawn_terminal(&self) {
@@ -4122,77 +1824,19 @@ impl Raven {
     }
 
     pub fn spawn_command(&self, command: &str) {
-        if command.trim().is_empty() {
-            return;
-        }
-
-        let command = self.apply_no_csd_spawn_overrides(command);
-        let command = self.apply_wayland_browser_spawn_overrides(&command);
-        let mut cmd = Command::new("sh");
-        cmd.arg("-c").arg(&command);
-        self.apply_wayland_child_env(&mut cmd);
-
-        if let Err(err) = cmd.spawn() {
-            tracing::warn!(command = %command, "failed to spawn command: {err}");
-        }
+        runtime::spawn_command(self, command);
     }
 
     pub fn run_startup_tasks(&mut self) {
-        tracing::info!(
-            output_count = self.space.outputs().count(),
-            socket = ?self.socket_name,
-            "running startup tasks"
-        );
-        if self.ensure_xwayland_display() {
-            self.sync_activation_environment();
-        }
-        self.log_xwayland_satellite_context("startup");
-        self.maintain_xwayland_satellite();
-        self.kick_portal_services_async();
-        self.run_autostart_commands();
-        // Waypaper compatibility path: this can start swww-daemon even when
-        // wallpaper.enabled is false. The gate here is restore_command.
-        self.ensure_waypaper_swww_daemon();
-        self.apply_wallpaper();
-        // Make startup surfaces visible promptly without requiring input events.
-        crate::backend::udev::queue_redraw_all(self);
+        runtime::run_startup_tasks(self);
     }
 
     pub fn preferred_decoration_mode(&self) -> XdgDecorationMode {
-        if self.config.no_csd {
-            XdgDecorationMode::ServerSide
-        } else {
-            XdgDecorationMode::ClientSide
-        }
+        runtime::preferred_decoration_mode(self)
     }
 
     pub fn apply_decoration_preferences(&self) {
-        let mode = self.preferred_decoration_mode();
-        for window in self.space.elements() {
-            let Some(toplevel) = window.toplevel() else {
-                continue;
-            };
-
-            toplevel.with_pending_state(|state| {
-                state.decoration_mode = Some(mode);
-            });
-
-            if toplevel.is_initial_configure_sent() {
-                toplevel.send_pending_configure();
-            }
-        }
-    }
-
-    fn run_autostart_commands(&mut self) {
-        if self.autostart_started {
-            return;
-        }
-        self.autostart_started = true;
-
-        for command in &self.config.autostart {
-            tracing::info!(command, "starting autostart command");
-            self.spawn_command(command);
-        }
+        runtime::apply_decoration_preferences(self);
     }
 
     fn ensure_portal_preferences_file() {
@@ -4941,45 +2585,7 @@ org.freedesktop.impl.portal.Secret=gnome-keyring;\n"
     }
 
     pub fn reload_config(&mut self) -> Result<(), CompositorError> {
-        let config = config::load_from_path(&self.config_path)?;
-        config::apply_environment(&config);
-        self.config = config;
-        self.ensure_xwayland_display();
-        self.sync_activation_environment();
-        self.log_xwayland_satellite_context("reload");
-        self.maintain_xwayland_satellite();
-        self.apply_decoration_preferences();
-
-        if self.udev_data.is_some() {
-            crate::backend::udev::reload_cursor_theme(self);
-        }
-
-        self.apply_layout()?;
-        self.apply_wallpaper();
-        tracing::info!(path = %self.config_path.display(), "reloaded config.lua");
-        Ok(())
-    }
-
-    pub fn toggle_fullscreen_focused_window(&mut self) -> Result<(), CompositorError> {
-        let Some(keyboard) = self.seat.get_keyboard() else {
-            return Ok(());
-        };
-        let Some(focused_surface) = keyboard.current_focus() else {
-            return Ok(());
-        };
-        let Some(window) = self.window_for_surface(&focused_surface) else {
-            return Ok(());
-        };
-
-        if self.exit_fullscreen_window(&window) {
-            return self.apply_layout();
-        }
-
-        if self.enter_fullscreen_window(&window) {
-            self.space.raise_element(&window, true);
-        }
-
-        self.apply_layout()
+        runtime::reload_config(self)
     }
 
     pub fn toggle_floating_focused_window(&mut self) -> Result<(), CompositorError> {
@@ -5000,204 +2606,6 @@ org.freedesktop.impl.portal.Secret=gnome-keyring;\n"
         }
 
         self.apply_layout()
-    }
-
-    pub(crate) fn set_window_maximized_state(&mut self, window: &Window, maximized: bool) {
-        let Some(toplevel) = window.toplevel() else {
-            return;
-        };
-        if maximized && self.window_effective_fullscreen_state(window) {
-            // Fullscreen takes precedence; keep maximize pending requests deferred.
-            return;
-        }
-
-        let output_bounds = self
-            .space
-            .outputs_for_element(window)
-            .into_iter()
-            .next()
-            .or_else(|| self.space.outputs().next().cloned())
-            .and_then(|output| {
-                let mut layer_map = layer_map_for_output(&output);
-                layer_map.arrange();
-                let work_geo = layer_map.non_exclusive_zone();
-                if work_geo.size.w > 0 && work_geo.size.h > 0 {
-                    Some(work_geo.size)
-                } else {
-                    self.space.output_geometry(&output).map(|geo| geo.size)
-                }
-            });
-
-        let mut needs_configure = false;
-        toplevel.with_pending_state(|state| {
-            let maximized_state = xdg_toplevel::State::Maximized;
-            if maximized {
-                if !state.states.contains(maximized_state) {
-                    state.states.set(maximized_state);
-                    needs_configure = true;
-                }
-                if let Some(bounds) = output_bounds
-                    && state.bounds != Some(bounds)
-                {
-                    state.bounds = Some(bounds);
-                    needs_configure = true;
-                }
-            } else {
-                if state.states.contains(maximized_state) {
-                    state.states.unset(maximized_state);
-                    needs_configure = true;
-                }
-                if state.size.is_some() {
-                    state.size = None;
-                    needs_configure = true;
-                }
-                if state.bounds.is_some() {
-                    state.bounds = None;
-                    needs_configure = true;
-                }
-            }
-        });
-
-        if needs_configure && toplevel.is_initial_configure_sent() {
-            toplevel.send_pending_configure();
-        }
-    }
-
-    pub fn maybe_apply_pending_unmapped_state_for_surface(&mut self, surface: &WlSurface) {
-        let wants_fullscreen = self.pending_unmapped_fullscreen_ids.contains(surface);
-        let wants_maximized = self.pending_unmapped_maximized_ids.contains(surface);
-        if !wants_fullscreen && !wants_maximized {
-            return;
-        }
-
-        let Some(window) = self.window_for_surface(surface) else {
-            self.clear_pending_unmapped_state_for_surface(surface);
-            return;
-        };
-        if !self.is_window_mapped(&window) {
-            return;
-        }
-
-        if wants_fullscreen {
-            self.clear_pending_unmapped_state_for_surface(surface);
-            if self.enter_fullscreen_window(&window) {
-                self.space.raise_element(&window, true);
-                if let Err(err) = self.apply_layout() {
-                    tracing::warn!(
-                        "failed to apply layout after pending unmapped fullscreen apply: {err}"
-                    );
-                }
-            } else {
-                self.set_window_fullscreen_state(&window, true);
-            }
-            return;
-        }
-
-        self.pending_unmapped_maximized_ids.remove(surface);
-        self.set_window_maximized_state(&window, true);
-        self.space.raise_element(&window, true);
-    }
-
-    pub(crate) fn set_window_fullscreen_state(
-        &mut self,
-        window: &Window,
-        fullscreen: bool,
-    ) -> Option<Serial> {
-        let Some(toplevel) = window.toplevel() else {
-            return None;
-        };
-
-        let fullscreen_size = if fullscreen {
-            self.space
-                .outputs()
-                .next()
-                .and_then(|output| self.space.output_geometry(output))
-                .map(|geometry| geometry.size)
-        } else {
-            None
-        };
-        let output_bounds = self
-            .space
-            .outputs()
-            .next()
-            .and_then(|output| self.space.output_geometry(output))
-            .map(|geometry| geometry.size);
-
-        let mut needs_configure = false;
-        toplevel.with_pending_state(|state| {
-            if fullscreen {
-                if !state.states.contains(xdg_toplevel::State::Fullscreen) {
-                    state.states.set(xdg_toplevel::State::Fullscreen);
-                    needs_configure = true;
-                }
-                if state.states.contains(xdg_toplevel::State::Maximized) {
-                    state.states.unset(xdg_toplevel::State::Maximized);
-                    needs_configure = true;
-                }
-                if state.states.contains(xdg_toplevel::State::TiledLeft) {
-                    state.states.unset(xdg_toplevel::State::TiledLeft);
-                    needs_configure = true;
-                }
-                if state.states.contains(xdg_toplevel::State::TiledRight) {
-                    state.states.unset(xdg_toplevel::State::TiledRight);
-                    needs_configure = true;
-                }
-                if state.states.contains(xdg_toplevel::State::TiledTop) {
-                    state.states.unset(xdg_toplevel::State::TiledTop);
-                    needs_configure = true;
-                }
-                if state.states.contains(xdg_toplevel::State::TiledBottom) {
-                    state.states.unset(xdg_toplevel::State::TiledBottom);
-                    needs_configure = true;
-                }
-                if let Some(size) = fullscreen_size {
-                    if state.size != Some(size) {
-                        state.size = Some(size);
-                        needs_configure = true;
-                    }
-                }
-                let desired_bounds = fullscreen_size.or(output_bounds);
-                if state.bounds != desired_bounds {
-                    state.bounds = desired_bounds;
-                    needs_configure = true;
-                }
-            } else {
-                if state.states.contains(xdg_toplevel::State::Fullscreen) {
-                    state.states.unset(xdg_toplevel::State::Fullscreen);
-                    needs_configure = true;
-                }
-                if state.states.contains(xdg_toplevel::State::TiledLeft) {
-                    state.states.unset(xdg_toplevel::State::TiledLeft);
-                    needs_configure = true;
-                }
-                if state.states.contains(xdg_toplevel::State::TiledRight) {
-                    state.states.unset(xdg_toplevel::State::TiledRight);
-                    needs_configure = true;
-                }
-                if state.states.contains(xdg_toplevel::State::TiledTop) {
-                    state.states.unset(xdg_toplevel::State::TiledTop);
-                    needs_configure = true;
-                }
-                if state.states.contains(xdg_toplevel::State::TiledBottom) {
-                    state.states.unset(xdg_toplevel::State::TiledBottom);
-                    needs_configure = true;
-                }
-                if state.size.is_some() {
-                    state.size = None;
-                    needs_configure = true;
-                }
-                if state.bounds != output_bounds {
-                    state.bounds = output_bounds;
-                    needs_configure = true;
-                }
-            }
-        });
-        let sent_serial = if needs_configure && toplevel.is_initial_configure_sent() {
-            toplevel.send_pending_configure()
-        } else {
-            None
-        };
-        sent_serial
     }
 
     pub fn refresh_foreign_toplevel(&mut self) {

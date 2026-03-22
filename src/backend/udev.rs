@@ -1,5 +1,7 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::Path;
 use std::sync::Mutex;
 use std::sync::OnceLock;
@@ -20,12 +22,13 @@ use smithay::{
         egl::{EGLDevice, EGLDisplay},
         libinput::{LibinputInputBackend, LibinputSessionInterface},
         renderer::{
-            Bind, ExportMem, Frame, ImportAll, ImportDma, ImportMem, ImportMemWl, Offscreen,
-            Renderer,
+            ImportAll, ImportDma, ImportMem, ImportMemWl, Renderer, RendererSuper,
             element::{
-                AsRenderElements, Element, Id, Kind, default_primary_scanout_output_compare,
+                AsRenderElements, Element, Id, Kind, RenderElement, UnderlyingStorage,
+                default_primary_scanout_output_compare,
                 memory::{MemoryRenderBuffer, MemoryRenderBufferRenderElement},
-                surface::WaylandSurfaceRenderElement,
+                surface::{WaylandSurfaceRenderElement, render_elements_from_surface_tree},
+                texture::TextureRenderElement,
                 utils::{
                     ConstrainAlign, ConstrainScaleBehavior, CropRenderElement,
                     RelocateRenderElement, RescaleRenderElement, constrain_as_render_elements,
@@ -33,7 +36,7 @@ use smithay::{
             },
             gles::GlesRenderer,
             multigpu::{GpuManager, MultiRenderer, gbm::GbmGlesBackend},
-            utils::draw_render_elements,
+            utils::{CommitCounter, DamageSet, OpaqueRegions, with_renderer_surface_state},
         },
         session::{Event as SessionEvent, Session, libseat::LibSeatSession},
         udev::{UdevBackend, UdevEvent, all_gpus, primary_gpu},
@@ -59,7 +62,9 @@ use smithay::{
         wayland_protocols::wp::presentation_time::server::wp_presentation_feedback,
         wayland_server::{backend::GlobalId, protocol::wl_surface::WlSurface},
     },
-    utils::{DeviceFd, IsAlive, Point, Rectangle, Scale, Size, Transform},
+    utils::{
+        Buffer as BufferCoords, DeviceFd, IsAlive, Physical, Point, Rectangle, Scale, Transform,
+    },
     wayland::{
         compositor,
         dmabuf::{DmabufFeedbackBuilder, DmabufState},
@@ -125,23 +130,75 @@ fn force_full_redraw() -> bool {
     })
 }
 
+fn render_trace_line(line: impl AsRef<str>) {
+    static TRACE_ENABLED: OnceLock<bool> = OnceLock::new();
+    static TRACE_INIT: OnceLock<()> = OnceLock::new();
+    static TRACE_LINES: OnceLock<Mutex<usize>> = OnceLock::new();
+    const TRACE_PATH: &str = "/tmp/raven-render-trace.log";
+    const TRACE_MAX_LINES: usize = 4000;
+
+    if !*TRACE_ENABLED.get_or_init(|| {
+        std::env::var_os("RAVEN_RENDER_TRACE")
+            .map(|value| {
+                let value = value.to_string_lossy().to_ascii_lowercase();
+                matches!(value.as_str(), "1" | "true" | "yes" | "on")
+            })
+            .unwrap_or(false)
+    }) {
+        return;
+    }
+
+    TRACE_INIT.get_or_init(|| {
+        let _ = std::fs::write(TRACE_PATH, "");
+    });
+
+    let counter = TRACE_LINES.get_or_init(|| Mutex::new(0));
+    let Ok(mut count) = counter.lock() else {
+        return;
+    };
+    if *count >= TRACE_MAX_LINES {
+        return;
+    }
+    *count += 1;
+
+    let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(TRACE_PATH)
+    else {
+        return;
+    };
+    let _ = writeln!(file, "{}", line.as_ref());
+}
+
+fn trace_rect_logical(label: &str, rect: Rectangle<i32, smithay::utils::Logical>) -> String {
+    format!(
+        "{label}={}x{}@{},{}",
+        rect.size.w, rect.size.h, rect.loc.x, rect.loc.y
+    )
+}
+
+fn trace_rect_physical(label: &str, rect: Rectangle<i32, Physical>) -> String {
+    format!(
+        "{label}={}x{}@{},{}",
+        rect.size.w, rect.size.h, rect.loc.x, rect.loc.y
+    )
+}
+
+fn trace_src_buffer(label: &str, rect: Rectangle<f64, BufferCoords>) -> String {
+    format!(
+        "{label}={:.2}x{:.2}@{:.2},{:.2}",
+        rect.size.w, rect.size.h, rect.loc.x, rect.loc.y
+    )
+}
+
 fn scanout_rejection_reason(
     state: &Raven,
     output: &Output,
     fullscreen_on_output: bool,
-    transition_clip_active: bool,
-    fullscreen_geometry_animation_active: bool,
 ) -> Option<&'static str> {
     if !fullscreen_on_output {
-        return Some("fullscreen-not-ready");
-    }
-
-    if fullscreen_geometry_animation_active {
-        return Some("fullscreen-geometry-animation-active");
-    }
-
-    if transition_clip_active {
-        return Some("fullscreen-transition-active");
+        return Some("fullscreen-not-active");
     }
 
     let Some(output_geo) = state.space.output_geometry(output) else {
@@ -183,11 +240,720 @@ smithay::backend::renderer::element::render_elements! {
 }
 
 smithay::backend::renderer::element::render_elements! {
-    pub UdevCompositeRenderElement<R, E> where R: ImportAll + ImportMem;
+    pub UdevCompositeRenderElement<R, E> where R: ImportAll + ImportMem + Renderer;
     Base=UdevRenderElement<R, E>,
-    Cropped=CropRenderElement<UdevRenderElement<R, E>>,
-    Animated=CropRenderElement<RelocateRenderElement<RescaleRenderElement<UdevRenderElement<R, E>>>>,
-    AnimatedWindow=CropRenderElement<RelocateRenderElement<RescaleRenderElement<WaylandSurfaceRenderElement<R>>>>,
+    CorrectedBase=CorrectedWaylandSurfaceRenderElement<R>,
+    CorrectedTexture=TextureRenderElement<R::TextureId>,
+    ConstrainedWindow=CropRenderElement<RelocateRenderElement<RescaleRenderElement<WaylandSurfaceRenderElement<R>>>>,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+struct AssignedWindowRect {
+    window: Window,
+    surface_id: WlSurface,
+    surface_ids: HashSet<Id>,
+    is_fullscreen: bool,
+    assigned_logical: Rectangle<i32, smithay::utils::Logical>,
+    assigned_physical: Rectangle<i32, smithay::utils::Physical>,
+    reported_logical_size: smithay::utils::Size<i32, smithay::utils::Logical>,
+    reported_physical_size: smithay::utils::Size<i32, smithay::utils::Physical>,
+    raw_root_logical: Rectangle<i32, smithay::utils::Logical>,
+    raw_root_physical: Rectangle<i32, smithay::utils::Physical>,
+    render_origin_logical: Point<i32, smithay::utils::Logical>,
+    render_origin_physical: Point<i32, smithay::utils::Physical>,
+}
+
+impl AssignedWindowRect {
+    fn needs_correction(&self) -> bool {
+        self.assigned_logical.loc != self.raw_root_logical.loc
+            || self.assigned_logical.size != self.raw_root_logical.size
+            || self.assigned_logical.size != self.reported_logical_size
+            || self.raw_root_logical.size != self.reported_logical_size
+    }
+}
+
+#[derive(Debug)]
+struct CorrectedWaylandSurfaceRenderElement<R: smithay::backend::renderer::Renderer> {
+    inner: WaylandSurfaceRenderElement<R>,
+    src_override: Option<Rectangle<f64, BufferCoords>>,
+    geometry_override: Option<Rectangle<i32, Physical>>,
+}
+
+impl<R> Element for CorrectedWaylandSurfaceRenderElement<R>
+where
+    R: smithay::backend::renderer::Renderer + ImportAll,
+{
+    fn id(&self) -> &Id {
+        self.inner.id()
+    }
+
+    fn current_commit(&self) -> CommitCounter {
+        self.inner.current_commit()
+    }
+
+    fn location(&self, scale: Scale<f64>) -> Point<i32, Physical> {
+        self.geometry_override
+            .map(|geometry| geometry.loc)
+            .unwrap_or_else(|| self.inner.location(scale))
+    }
+
+    fn src(&self) -> Rectangle<f64, BufferCoords> {
+        self.src_override.unwrap_or_else(|| self.inner.src())
+    }
+
+    fn transform(&self) -> Transform {
+        self.inner.transform()
+    }
+
+    fn geometry(&self, scale: Scale<f64>) -> Rectangle<i32, Physical> {
+        self.geometry_override
+            .unwrap_or_else(|| self.inner.geometry(scale))
+    }
+
+    fn damage_since(
+        &self,
+        scale: Scale<f64>,
+        commit: Option<CommitCounter>,
+    ) -> DamageSet<i32, Physical> {
+        let source_geometry = self.inner.geometry(scale);
+        let damage = self.inner.damage_since(scale, commit);
+        let Some(target_geometry) = self.geometry_override else {
+            if self.src_override.is_some() {
+                return std::iter::once(source_geometry).collect();
+            }
+            return damage;
+        };
+
+        if self.src_override.is_some() || source_geometry != target_geometry {
+            return [source_geometry, target_geometry].into_iter().collect();
+        }
+
+        remap_damage_or_regions(damage, source_geometry, target_geometry, true)
+    }
+
+    fn opaque_regions(&self, scale: Scale<f64>) -> OpaqueRegions<i32, Physical> {
+        let opaque_regions = self.inner.opaque_regions(scale);
+        if self.src_override.is_some()
+            && let Some(target_geometry) = self.geometry_override
+        {
+            if opaque_regions.is_empty() {
+                return opaque_regions;
+            }
+            return std::iter::once(target_geometry).collect();
+        }
+
+        let Some(target_geometry) = self.geometry_override else {
+            return opaque_regions;
+        };
+        let source_geometry = self.inner.geometry(scale);
+        remap_damage_or_regions(opaque_regions, source_geometry, target_geometry, false)
+    }
+
+    fn alpha(&self) -> f32 {
+        self.inner.alpha()
+    }
+
+    fn kind(&self) -> Kind {
+        self.inner.kind()
+    }
+}
+
+impl<R> RenderElement<R> for CorrectedWaylandSurfaceRenderElement<R>
+where
+    R: smithay::backend::renderer::Renderer + ImportAll,
+    R::TextureId: smithay::backend::renderer::Texture + 'static,
+{
+    fn draw(
+        &self,
+        frame: &mut R::Frame<'_, '_>,
+        src: Rectangle<f64, BufferCoords>,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        opaque_regions: &[Rectangle<i32, Physical>],
+    ) -> Result<(), R::Error> {
+        self.inner.draw(frame, src, dst, damage, opaque_regions)
+    }
+
+    fn underlying_storage(&self, renderer: &mut R) -> Option<UnderlyingStorage<'_>> {
+        self.inner.underlying_storage(renderer)
+    }
+}
+
+fn remap_damage_or_regions<C>(
+    rects: C,
+    source_geometry: Rectangle<i32, Physical>,
+    target_geometry: Rectangle<i32, Physical>,
+    round_up: bool,
+) -> C
+where
+    C: IntoIterator<Item = Rectangle<i32, Physical>> + FromIterator<Rectangle<i32, Physical>>,
+{
+    if source_geometry.size.w <= 0
+        || source_geometry.size.h <= 0
+        || source_geometry.size == target_geometry.size
+    {
+        return rects;
+    }
+
+    let scale_x = target_geometry.size.w as f64 / source_geometry.size.w as f64;
+    let scale_y = target_geometry.size.h as f64 / source_geometry.size.h as f64;
+
+    rects
+        .into_iter()
+        .map(|rect| {
+            let relative_loc = rect.loc - source_geometry.loc;
+            let mapped = Rectangle::new(
+                Point::<f64, Physical>::from((
+                    target_geometry.loc.x as f64 + relative_loc.x as f64 * scale_x,
+                    target_geometry.loc.y as f64 + relative_loc.y as f64 * scale_y,
+                )),
+                smithay::utils::Size::<f64, Physical>::from((
+                    rect.size.w as f64 * scale_x,
+                    rect.size.h as f64 * scale_y,
+                )),
+            );
+            if round_up {
+                mapped.to_i32_up()
+            } else {
+                mapped.to_i32_round()
+            }
+        })
+        .collect()
+}
+
+fn corrected_surface_src_for_visible_geometry<R>(
+    element: &WaylandSurfaceRenderElement<R>,
+    visible_geometry: Rectangle<i32, Physical>,
+    output_scale: Scale<f64>,
+) -> Option<Rectangle<f64, BufferCoords>>
+where
+    R: smithay::backend::renderer::Renderer + ImportAll,
+{
+    let element_geometry = element.geometry(output_scale);
+    let intersection = element_geometry.intersection(visible_geometry)?;
+    if intersection == element_geometry {
+        return None;
+    }
+
+    let mut element_relative_intersection = intersection;
+    element_relative_intersection.loc -= element_geometry.loc;
+    let src = element.src();
+    let transform = element.transform();
+    let physical_to_buffer_scale = src.size
+        / transform
+            .invert()
+            .transform_size(element_geometry.size)
+            .to_f64();
+
+    let mut cropped_src = element_relative_intersection
+        .to_f64()
+        .to_logical(1.0)
+        .to_buffer(
+            physical_to_buffer_scale,
+            transform,
+            &element_geometry.size.to_f64().to_logical(1.0),
+        );
+    cropped_src.loc += src.loc;
+    Some(cropped_src)
+}
+
+fn corrected_surface_src_for_projection(
+    src: Rectangle<f64, BufferCoords>,
+    source_bounds: Rectangle<f64, BufferCoords>,
+    projected_size: smithay::utils::Size<i32, Physical>,
+    expected_size: smithay::utils::Size<i32, Physical>,
+) -> Rectangle<f64, BufferCoords> {
+    if expected_size.w <= 0 || expected_size.h <= 0 || projected_size == expected_size {
+        return src;
+    }
+
+    let scale_x = projected_size.w as f64 / expected_size.w as f64;
+    let scale_y = projected_size.h as f64 / expected_size.h as f64;
+    let scaled_size = smithay::utils::Size::<f64, BufferCoords>::from((
+        src.size.w * scale_x,
+        src.size.h * scale_y,
+    ));
+    let delta_w = scaled_size.w - src.size.w;
+    let delta_h = scaled_size.h - src.size.h;
+    let min_loc = source_bounds.loc;
+    let max_loc = Point::<f64, BufferCoords>::from((
+        (source_bounds.loc.x + source_bounds.size.w - scaled_size.w).max(source_bounds.loc.x),
+        (source_bounds.loc.y + source_bounds.size.h - scaled_size.h).max(source_bounds.loc.y),
+    ));
+    let centered_loc = Point::<f64, BufferCoords>::from((
+        (src.loc.x - delta_w / 2.0).clamp(min_loc.x, max_loc.x),
+        (src.loc.y - delta_h / 2.0).clamp(min_loc.y, max_loc.y),
+    ));
+
+    Rectangle::new(centered_loc, scaled_size)
+}
+
+fn corrected_surface_src_for_projection_logical(
+    src: Rectangle<f64, smithay::utils::Logical>,
+    source_bounds: Rectangle<f64, smithay::utils::Logical>,
+    projected_size: smithay::utils::Size<i32, smithay::utils::Logical>,
+    expected_size: smithay::utils::Size<i32, smithay::utils::Logical>,
+) -> Rectangle<f64, smithay::utils::Logical> {
+    if expected_size.w <= 0 || expected_size.h <= 0 || projected_size == expected_size {
+        return src;
+    }
+
+    let scale_x = projected_size.w as f64 / expected_size.w as f64;
+    let scale_y = projected_size.h as f64 / expected_size.h as f64;
+    let scaled_size = smithay::utils::Size::<f64, smithay::utils::Logical>::from((
+        src.size.w * scale_x,
+        src.size.h * scale_y,
+    ));
+    let delta_w = scaled_size.w - src.size.w;
+    let delta_h = scaled_size.h - src.size.h;
+    let min_loc = source_bounds.loc;
+    let max_loc = Point::<f64, smithay::utils::Logical>::from((
+        (source_bounds.loc.x + source_bounds.size.w - scaled_size.w).max(source_bounds.loc.x),
+        (source_bounds.loc.y + source_bounds.size.h - scaled_size.h).max(source_bounds.loc.y),
+    ));
+    let centered_loc = Point::<f64, smithay::utils::Logical>::from((
+        (src.loc.x - delta_w / 2.0).clamp(min_loc.x, max_loc.x),
+        (src.loc.y - delta_h / 2.0).clamp(min_loc.y, max_loc.y),
+    ));
+
+    Rectangle::new(centered_loc, scaled_size)
+}
+
+fn corrected_root_target_rect_logical(
+    assignment: &AssignedWindowRect,
+) -> Rectangle<i32, smithay::utils::Logical> {
+    if assignment.is_fullscreen {
+        return assignment.assigned_logical;
+    }
+
+    let raw_root_size = assignment.raw_root_logical.size;
+    let reported_size = assignment.reported_logical_size;
+    if reported_size.w <= 0
+        || reported_size.h <= 0
+        || raw_root_size.w > reported_size.w - 1
+        || raw_root_size.h > reported_size.h - 1
+    {
+        return assignment.assigned_logical;
+    }
+
+    let scale_x = assignment.assigned_logical.size.w as f64 / reported_size.w as f64;
+    let scale_y = assignment.assigned_logical.size.h as f64 / reported_size.h as f64;
+    let correction = Point::<f64, smithay::utils::Logical>::from((
+        ((reported_size.w - raw_root_size.w) as f64 / 2.0).max(0.0) * scale_x,
+        ((reported_size.h - raw_root_size.h) as f64 / 2.0).max(0.0) * scale_y,
+    ))
+    .to_i32_round();
+    let size = smithay::utils::Size::<f64, smithay::utils::Logical>::from((
+        raw_root_size.w as f64 * scale_x,
+        raw_root_size.h as f64 * scale_y,
+    ))
+    .to_i32_round();
+
+    Rectangle::new(assignment.assigned_logical.loc + correction, size)
+}
+
+fn corrected_root_target_rect(assignment: &AssignedWindowRect) -> Rectangle<i32, Physical> {
+    let logical_rect = corrected_root_target_rect_logical(assignment);
+    Rectangle::new(
+        logical_rect
+            .loc
+            .to_f64()
+            .to_physical(output_scale_from_logical_rects(
+                assignment.assigned_logical,
+                assignment.assigned_physical,
+            ))
+            .to_i32_round(),
+        logical_rect
+            .size
+            .to_f64()
+            .to_physical(output_scale_from_logical_rects(
+                assignment.assigned_logical,
+                assignment.assigned_physical,
+            ))
+            .to_i32_round(),
+    )
+}
+
+fn output_scale_from_logical_rects(
+    logical: Rectangle<i32, smithay::utils::Logical>,
+    physical: Rectangle<i32, smithay::utils::Physical>,
+) -> Scale<f64> {
+    let scale_x = if logical.size.w > 0 {
+        physical.size.w as f64 / logical.size.w as f64
+    } else {
+        1.0
+    };
+    let scale_y = if logical.size.h > 0 {
+        physical.size.h as f64 / logical.size.h as f64
+    } else {
+        1.0
+    };
+    Scale::from((scale_x, scale_y))
+}
+
+fn corrected_root_texture_element<'render, 'frame>(
+    renderer: &'render mut UdevRenderer<'frame>,
+    assignment: &AssignedWindowRect,
+    root_element: &WaylandSurfaceRenderElement<UdevRenderer<'frame>>,
+) -> Option<TextureRenderElement<<UdevRenderer<'frame> as RendererSuper>::TextureId>> {
+    let target_logical = corrected_root_target_rect_logical(assignment);
+    let projection_expected_size =
+        if assignment.raw_root_logical.size != assignment.reported_logical_size {
+            assignment.raw_root_logical.size
+        } else {
+            assignment.reported_logical_size
+        };
+    let root_surface_rect =
+        Rectangle::new(assignment.raw_root_logical.loc, root_element.view().dst);
+    let visible_rect = root_surface_rect.intersection(Rectangle::new(
+        assignment.assigned_logical.loc,
+        assignment.reported_logical_size,
+    ))?;
+    let local_visible_rect =
+        Rectangle::new(visible_rect.loc - root_surface_rect.loc, visible_rect.size);
+    let view = root_element.view();
+    let scale_x = if view.src.size.w > 0.0 {
+        view.dst.w as f64 / view.src.size.w
+    } else {
+        1.0
+    };
+    let scale_y = if view.src.size.h > 0.0 {
+        view.dst.h as f64 / view.src.size.h
+    } else {
+        1.0
+    };
+    let visible_src = Rectangle::new(
+        Point::<f64, smithay::utils::Logical>::from((
+            view.src.loc.x + local_visible_rect.loc.x as f64 / scale_x,
+            view.src.loc.y + local_visible_rect.loc.y as f64 / scale_y,
+        )),
+        smithay::utils::Size::<f64, smithay::utils::Logical>::from((
+            local_visible_rect.size.w as f64 / scale_x,
+            local_visible_rect.size.h as f64 / scale_y,
+        )),
+    );
+    let corrected_src = corrected_surface_src_for_projection_logical(
+        visible_src,
+        view.src,
+        target_logical.size,
+        projection_expected_size,
+    );
+
+    with_renderer_surface_state(&assignment.surface_id, |state| {
+        let texture = state.texture(renderer.context_id())?.clone();
+        let opaque_regions = state.opaque_regions().and_then(|regions| {
+            let buffer_size = state.buffer_size()?;
+            Some(
+                regions
+                    .iter()
+                    .map(|region| {
+                        region.to_buffer(
+                            state.buffer_scale(),
+                            state.buffer_transform(),
+                            &buffer_size,
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        });
+
+        render_trace_line(format!(
+            "root_path=custom {} {} {} {} expected={}x{} src={:.2}x{:.2}@{:.2},{:.2} opaque={}",
+            trace_rect_logical("assigned", assignment.assigned_logical),
+            trace_rect_logical("raw_root", assignment.raw_root_logical),
+            trace_rect_logical("target", target_logical),
+            trace_rect_physical("assigned_phys", assignment.assigned_physical),
+            projection_expected_size.w,
+            projection_expected_size.h,
+            corrected_src.size.w,
+            corrected_src.size.h,
+            corrected_src.loc.x,
+            corrected_src.loc.y,
+            opaque_regions.is_some(),
+        ));
+
+        Some(TextureRenderElement::from_texture_with_damage(
+            root_element.id().clone(),
+            renderer.context_id(),
+            target_logical
+                .loc
+                .to_f64()
+                .to_physical(output_scale_from_logical_rects(
+                    assignment.assigned_logical,
+                    assignment.assigned_physical,
+                )),
+            texture,
+            state.buffer_scale(),
+            state.buffer_transform(),
+            Some(root_element.alpha()),
+            Some(corrected_src),
+            Some(target_logical.size),
+            opaque_regions,
+            state.damage(),
+            root_element.kind(),
+        ))
+    })
+    .flatten()
+}
+
+fn translate_geometry_between_rects(
+    geometry: Rectangle<i32, Physical>,
+    source_rect: Rectangle<i32, Physical>,
+    target_rect: Rectangle<i32, Physical>,
+) -> Rectangle<i32, Physical> {
+    let relative_loc = geometry.loc - source_rect.loc;
+    Rectangle::new(target_rect.loc + relative_loc, geometry.size)
+}
+
+fn window_assignment_for_output(
+    state: &Raven,
+    output_geo: Rectangle<i32, smithay::utils::Logical>,
+    output_scale: Scale<f64>,
+    window: &Window,
+) -> Option<AssignedWindowRect> {
+    let toplevel = window.toplevel()?;
+    let surface_id = toplevel.wl_surface().clone();
+    let assigned_logical = state.window_visual_or_assigned_rect(window)?;
+    let render_origin_logical = assigned_logical.loc - window.geometry().loc;
+    let raw_root_size =
+        with_renderer_surface_state(&surface_id, |renderer_state| renderer_state.surface_size())
+            .flatten()
+            .unwrap_or(window.geometry().size);
+    let reported_logical_size = state
+        .committed_reported_size_for_window(window)
+        .unwrap_or(raw_root_size);
+
+    let mut surface_ids = HashSet::new();
+    window.with_surfaces(|wl_surface, _| {
+        surface_ids.insert(Id::from_wayland_resource(wl_surface));
+    });
+    if surface_ids.is_empty() {
+        return None;
+    }
+
+    let assigned_physical = Rectangle::new(
+        (assigned_logical.loc - output_geo.loc)
+            .to_f64()
+            .to_physical(output_scale)
+            .to_i32_round(),
+        assigned_logical
+            .size
+            .to_f64()
+            .to_physical(output_scale)
+            .to_i32_round(),
+    );
+    let reported_physical_size = reported_logical_size
+        .to_f64()
+        .to_physical(output_scale)
+        .to_i32_round();
+    let raw_root_logical = Rectangle::new(render_origin_logical, raw_root_size);
+    let raw_root_physical = Rectangle::new(
+        (raw_root_logical.loc - output_geo.loc)
+            .to_f64()
+            .to_physical(output_scale)
+            .to_i32_round(),
+        raw_root_logical
+            .size
+            .to_f64()
+            .to_physical(output_scale)
+            .to_i32_round(),
+    );
+    let render_origin_physical = raw_root_physical.loc;
+
+    Some(AssignedWindowRect {
+        window: window.clone(),
+        surface_id,
+        surface_ids,
+        is_fullscreen: state.window_effective_fullscreen_state(window),
+        assigned_logical,
+        assigned_physical,
+        reported_logical_size,
+        reported_physical_size,
+        raw_root_logical,
+        raw_root_physical,
+        render_origin_logical,
+        render_origin_physical,
+    })
+}
+
+fn assigned_window_render_elements<'render, 'frame>(
+    renderer: &'render mut UdevRenderer<'frame>,
+    assignment: &AssignedWindowRect,
+    output_scale: Scale<f64>,
+) -> Vec<
+    UdevCompositeRenderElement<
+        UdevRenderer<'frame>,
+        WaylandSurfaceRenderElement<UdevRenderer<'frame>>,
+    >,
+> {
+    let Some(toplevel) = assignment.window.toplevel() else {
+        return Vec::new();
+    };
+
+    let root_surface = toplevel.wl_surface();
+    if !assignment.is_fullscreen {
+        return render_elements_from_surface_tree::<
+            _,
+            WaylandSurfaceRenderElement<UdevRenderer<'frame>>,
+        >(
+            renderer,
+            root_surface,
+            assignment.render_origin_physical,
+            output_scale,
+            1.0,
+            Kind::Unspecified,
+        )
+        .into_iter()
+        .map(|element| {
+            UdevCompositeRenderElement::from(CorrectedWaylandSurfaceRenderElement {
+                inner: element,
+                src_override: None,
+                geometry_override: None,
+            })
+        })
+        .collect();
+    }
+
+    if assignment.is_fullscreen && assignment.needs_correction() {
+        return constrain_as_render_elements::<
+            UdevRenderer<'frame>,
+            Window,
+            UdevCompositeRenderElement<
+                UdevRenderer<'frame>,
+                WaylandSurfaceRenderElement<UdevRenderer<'frame>>,
+            >,
+        >(
+            &assignment.window,
+            renderer,
+            assignment.render_origin_physical,
+            1.0,
+            assignment.assigned_physical,
+            assignment.raw_root_physical,
+            ConstrainScaleBehavior::Stretch,
+            ConstrainAlign::TOP_LEFT,
+            output_scale,
+        )
+        .collect();
+    }
+
+    if !assignment.needs_correction() {
+        render_trace_line(format!(
+            "window_path=passthrough {} {} expected={}x{}",
+            trace_rect_logical("assigned", assignment.assigned_logical),
+            trace_rect_logical("raw_root", assignment.raw_root_logical),
+            assignment.reported_logical_size.w,
+            assignment.reported_logical_size.h,
+        ));
+        return render_elements_from_surface_tree::<
+            _,
+            WaylandSurfaceRenderElement<UdevRenderer<'frame>>,
+        >(
+            renderer,
+            root_surface,
+            assignment.render_origin_physical,
+            output_scale,
+            1.0,
+            Kind::Unspecified,
+        )
+        .into_iter()
+        .map(|element| {
+            UdevCompositeRenderElement::from(CorrectedWaylandSurfaceRenderElement {
+                inner: element,
+                src_override: None,
+                geometry_override: None,
+            })
+        })
+        .collect();
+    }
+
+    let root_id = Id::from_wayland_resource(&assignment.surface_id);
+    let reported_physical_rect = Rectangle::new(
+        assignment.assigned_physical.loc,
+        assignment.reported_physical_size,
+    );
+    let reported_tree_rect = Rectangle::new(
+        assignment.raw_root_physical.loc,
+        assignment.reported_physical_size,
+    );
+    let root_target_rect = corrected_root_target_rect(assignment);
+    let projection_expected_size =
+        if assignment.raw_root_physical.size != assignment.reported_physical_size {
+            assignment.raw_root_physical.size
+        } else {
+            assignment.reported_physical_size
+        };
+    render_elements_from_surface_tree::<_, WaylandSurfaceRenderElement<UdevRenderer<'frame>>>(
+        renderer,
+        root_surface,
+        assignment.render_origin_physical,
+        output_scale,
+        1.0,
+        Kind::Unspecified,
+    )
+    .into_iter()
+    .map(|element| {
+        let is_root_surface = element.id() == &root_id;
+        let element_geometry = element.geometry(output_scale);
+        let root_src_override = if is_root_surface {
+            let base_src = element.src();
+            let visible_src = corrected_surface_src_for_visible_geometry(
+                &element,
+                reported_physical_rect,
+                output_scale,
+            )
+            .unwrap_or(base_src);
+            Some(corrected_surface_src_for_projection(
+                visible_src,
+                base_src,
+                root_target_rect.size,
+                projection_expected_size,
+            ))
+        } else {
+            None
+        };
+        if is_root_surface
+            && let Some(texture_element) =
+                corrected_root_texture_element(renderer, assignment, &element)
+        {
+            return UdevCompositeRenderElement::from(texture_element);
+        }
+
+        let geometry_override = if is_root_surface {
+            render_trace_line(format!(
+                "root_path=wrapped {} {} {} {} {}",
+                trace_rect_logical("assigned", assignment.assigned_logical),
+                trace_rect_logical("raw_root", assignment.raw_root_logical),
+                trace_rect_physical("target_phys", root_target_rect),
+                root_src_override
+                    .map(|src| trace_src_buffer("src", src))
+                    .unwrap_or_else(|| "src=none".to_string()),
+                trace_rect_physical("elem_phys", element_geometry),
+            ));
+            Some(root_target_rect)
+        } else if reported_tree_rect.size != root_target_rect.size {
+            let translated_geometry = translate_geometry_between_rects(
+                element_geometry,
+                assignment.raw_root_physical,
+                root_target_rect,
+            );
+            render_trace_line(format!(
+                "child_path=translated {} {} {}",
+                trace_rect_physical("source_elem", element_geometry),
+                trace_rect_physical("raw_root", assignment.raw_root_physical),
+                trace_rect_physical("target_elem", translated_geometry),
+            ));
+            Some(translated_geometry)
+        } else {
+            None
+        };
+        UdevCompositeRenderElement::from(CorrectedWaylandSurfaceRenderElement {
+            inner: element,
+            src_override: root_src_override,
+            geometry_override,
+        })
+    })
+    .collect()
 }
 
 /// Per-GPU device state
@@ -1046,125 +1812,6 @@ fn device_removed(state: &mut Raven, node: DrmNode) {
     }
 }
 
-fn collect_window_surface_ids(window: &Window) -> HashSet<Id> {
-    let mut ids = HashSet::new();
-    window.with_surfaces(|wl_surface, _| {
-        ids.insert(Id::from_wayland_resource(wl_surface));
-    });
-    ids
-}
-
-fn capture_fullscreen_exit_snapshot(
-    request: &crate::state::PendingFullscreenExitSnapshotRequest,
-    window: &Window,
-    renderer: &mut GlesRenderer,
-    output_scale: Scale<f64>,
-) -> Result<MemoryRenderBuffer, ()> {
-    let snapshot_size = request
-        .snapshot_rect
-        .size
-        .to_f64()
-        .to_physical(output_scale)
-        .to_i32_round();
-    if snapshot_size.w <= 0 || snapshot_size.h <= 0 {
-        tracing::warn!(output = %request.output_name, "fullscreen-exit snapshot capture has invalid size");
-        return Err(());
-    }
-
-    let buffer_size = snapshot_size.to_logical(1).to_buffer(1, Transform::Normal);
-    let capture_rect = Rectangle::from_size(snapshot_size);
-    let snapshot_elements: Vec<
-        UdevCompositeRenderElement<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>,
-    > = constrain_as_render_elements::<
-        GlesRenderer,
-        Window,
-        UdevCompositeRenderElement<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>,
-    >(
-        &window,
-        renderer,
-        Point::<i32, smithay::utils::Physical>::from((0, 0)),
-        1.0,
-        capture_rect,
-        capture_rect,
-        ConstrainScaleBehavior::CutOff,
-        ConstrainAlign::TOP_LEFT,
-        output_scale,
-    )
-    .collect();
-
-    if snapshot_elements.is_empty() {
-        tracing::warn!(output = %request.output_name, "fullscreen-exit snapshot capture produced no elements");
-        return Err(());
-    }
-
-    let mut offscreen = match renderer.create_buffer(Fourcc::Argb8888, buffer_size) {
-        Ok(buffer) => buffer,
-        Err(err) => {
-            tracing::warn!(output = %request.output_name, ?err, "fullscreen-exit snapshot offscreen allocation failed");
-            return Err(());
-        }
-    };
-
-    let mut target = match renderer.bind(&mut offscreen) {
-        Ok(target) => target,
-        Err(err) => {
-            tracing::warn!(output = %request.output_name, ?err, "fullscreen-exit snapshot bind failed");
-            return Err(());
-        }
-    };
-
-    let damage = [Rectangle::from_size(snapshot_size)];
-    let mut frame = match renderer.render(&mut target, snapshot_size, Transform::Normal) {
-        Ok(frame) => frame,
-        Err(err) => {
-            tracing::warn!(output = %request.output_name, ?err, "fullscreen-exit snapshot frame creation failed");
-            return Err(());
-        }
-    };
-
-    if let Err(err) = frame.clear([0.0, 0.0, 0.0, 0.0].into(), &damage) {
-        tracing::warn!(output = %request.output_name, ?err, "fullscreen-exit snapshot clear failed");
-        return Err(());
-    }
-
-    if let Err(err) =
-        draw_render_elements::<GlesRenderer, _, _>(&mut frame, Scale::from(1.0), &snapshot_elements, &damage)
-    {
-        tracing::warn!(output = %request.output_name, ?err, "fullscreen-exit snapshot draw failed");
-        return Err(());
-    }
-    drop(frame);
-    drop(target);
-
-    let mapping = match renderer.copy_texture(
-        &offscreen,
-        Rectangle::from_size(buffer_size),
-        Fourcc::Argb8888,
-    ) {
-        Ok(mapping) => mapping,
-        Err(err) => {
-            tracing::warn!(output = %request.output_name, ?err, "fullscreen-exit snapshot copy failed");
-            return Err(());
-        }
-    };
-    let bytes = match renderer.map_texture(&mapping) {
-        Ok(bytes) => bytes,
-        Err(err) => {
-            tracing::warn!(output = %request.output_name, ?err, "fullscreen-exit snapshot map failed");
-            return Err(());
-        }
-    };
-
-    Ok(MemoryRenderBuffer::from_slice(
-        bytes,
-        Fourcc::Argb8888,
-        buffer_size,
-        1,
-        Transform::Normal,
-        None,
-    ))
-}
-
 /// Render a surface for the given device and CRTC
 fn render_surface(state: &mut Raven, node: DrmNode, crtc: crtc::Handle) {
     state.flush_interactive_frame_updates();
@@ -1179,99 +1826,35 @@ fn render_surface(state: &mut Raven, node: DrmNode, crtc: crtc::Handle) {
         };
         surface_data.output.clone()
     };
-    let fullscreen_geometry_animation_windows =
-        state.active_fullscreen_geometry_animation_windows_for_output(&output);
-    let fullscreen_geometry_animation_active = !fullscreen_geometry_animation_windows.is_empty();
     let fullscreen_requested_on_output = state.output_has_fullscreen_window(&output);
-    let fullscreen_ready_on_output = state.output_has_ready_fullscreen_window(&output);
-    let transition_full_redraw = state.take_fullscreen_transition_redraw_for_output(&output);
-    let transition_clip_active =
-        fullscreen_requested_on_output && (!fullscreen_ready_on_output || transition_full_redraw);
 
     if fullscreen_requested_on_output {
         if !scanout_enabled() {
             state.record_scanout_rejection(&output, "scanout-disabled");
-        } else if let Some(reason) = scanout_rejection_reason(
-            state,
-            &output,
-            fullscreen_ready_on_output,
-            transition_clip_active,
-            fullscreen_geometry_animation_active,
-        ) {
+        } else if let Some(reason) =
+            scanout_rejection_reason(state, &output, fullscreen_requested_on_output)
+        {
             state.record_scanout_rejection(&output, reason);
         }
     }
 
     let output_scale = Scale::from(output.current_scale().fractional_scale());
     let output_geo = state.space.output_geometry(&output);
-    let pending_fullscreen_exit_snapshot_request =
-        state.pending_fullscreen_exit_snapshot_request_for_output(&output);
-    let pending_fullscreen_exit_snapshot_window = pending_fullscreen_exit_snapshot_request
-        .as_ref()
-        .and_then(|request| state.window_for_surface(&request.surface));
-    let active_fullscreen_exit_snapshot = state.active_fullscreen_exit_snapshot_for_output(&output);
-    let active_fullscreen_exit_snapshot_window = active_fullscreen_exit_snapshot
-        .as_ref()
-        .and_then(|snapshot| state.window_for_surface(&snapshot.surface));
-    struct FullscreenAnimationEntry {
-        window: Window,
-        ids: HashSet<Id>,
-        reference_rect: Rectangle<i32, smithay::utils::Physical>,
-        current_rect: Rectangle<i32, smithay::utils::Physical>,
-    }
-    struct FullscreenClipEntry {
-        window: Window,
-        ids: HashSet<Id>,
-        reference_rect: Rectangle<i32, smithay::utils::Physical>,
-        clip_rect: Rectangle<i32, smithay::utils::Physical>,
-    }
-    struct FullscreenSnapshotEntry {
-        ids: HashSet<Id>,
-        buffer: MemoryRenderBuffer,
-        physical_loc: Point<i32, smithay::utils::Physical>,
-        logical_size: Size<i32, smithay::utils::Logical>,
-    }
-    let mut fullscreen_animation_entries: Vec<FullscreenAnimationEntry> = Vec::new();
-    if let Some(output_geo) = output_geo {
-        for (surface, reference_logical, current_logical) in fullscreen_geometry_animation_windows {
-            let Some(window) = state.window_for_surface(&surface) else {
-                continue;
-            };
-            let mut ids = HashSet::new();
-            window.with_surfaces(|wl_surface, _| {
-                ids.insert(Id::from_wayland_resource(wl_surface));
-            });
-            if ids.is_empty() {
-                continue;
-            }
-            let reference_physical = Rectangle::new(
-                (reference_logical.loc - output_geo.loc)
-                    .to_f64()
-                    .to_physical(output_scale)
-                    .to_i32_round(),
-                reference_logical
-                    .size
-                    .to_f64()
-                    .to_physical(output_scale)
-                    .to_i32_round(),
-            );
-            let current_physical = Rectangle::new(
-                (current_logical.loc - output_geo.loc)
-                    .to_f64()
-                    .to_physical(output_scale)
-                    .to_i32_round(),
-                current_logical
-                    .size
-                    .to_f64()
-                    .to_physical(output_scale)
-                    .to_i32_round(),
-            );
-            fullscreen_animation_entries.push(FullscreenAnimationEntry {
-                window,
-                ids,
-                reference_rect: reference_physical,
-                current_rect: current_physical,
-            });
+    let window_assignments: Vec<AssignedWindowRect> = output_geo
+        .map(|output_geo| {
+            state
+                .space
+                .elements_for_output(&output)
+                .filter_map(|window| {
+                    window_assignment_for_output(state, output_geo, output_scale, window)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut window_assignment_indices = HashMap::new();
+    for (index, assignment) in window_assignments.iter().enumerate() {
+        for id in &assignment.surface_ids {
+            window_assignment_indices.insert(id.clone(), index);
         }
     }
 
@@ -1335,30 +1918,11 @@ fn render_surface(state: &mut Raven, node: DrmNode, crtc: crtc::Handle) {
             return;
         }
     };
-    let captured_fullscreen_exit_snapshot =
-        if active_fullscreen_exit_snapshot.is_none() {
-            if let (Some(request), Some(window)) = (
-                pending_fullscreen_exit_snapshot_request.as_ref(),
-                pending_fullscreen_exit_snapshot_window.as_ref(),
-            ) {
-                capture_fullscreen_exit_snapshot(request, window, renderer.as_mut(), output_scale).ok()
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
     // Collect render elements from the space (windows + layer surfaces).
     //
-    // Full niri-style ordering on ready fullscreen:
-    // overlay > windows > top > bottom/background.
-    // Normal ordering remains the default from smithay space_render_elements.
-    if transition_full_redraw {
-        // One-shot full repaint when fullscreen becomes ready on this output. This avoids
-        // transient bottom-edge artifacts without adding per-frame fullscreen repaint cost.
-        surface_data.backdrop.touch();
-    }
+    // Fullscreen ownership only affects ordering. Every mapped window is rendered through the
+    // same compositor-assigned rect pipeline below, regardless of whether it is tiled, floating,
+    // fullscreen, or in a fullscreen visual handoff.
     let mut space_elements =
         match space_render_elements(&mut renderer, [&state.space], &output, 1.0) {
             Ok(elements) => elements,
@@ -1418,260 +1982,47 @@ fn render_surface(state: &mut Raven, node: DrmNode, crtc: crtc::Handle) {
         reordered.extend(lower_layer_elements);
         space_elements = reordered;
     }
-    let fullscreen_snapshot_entry = active_fullscreen_exit_snapshot.as_ref().and_then(|snapshot| {
-        let output_geo = output_geo?;
-        let window = active_fullscreen_exit_snapshot_window.as_ref()?;
-        let ids = collect_window_surface_ids(&window);
-        if ids.is_empty() {
-            return None;
-        }
-        Some(FullscreenSnapshotEntry {
-            ids,
-            buffer: snapshot.buffer.clone(),
-            physical_loc: (snapshot.snapshot_rect.loc - output_geo.loc)
-                .to_f64()
-                .to_physical(output_scale)
-                .to_i32_round(),
-            logical_size: snapshot.snapshot_rect.size,
-        })
-    });
-    let fullscreen_clip_entry = if transition_clip_active && fullscreen_snapshot_entry.is_none() {
-        state
-            .fullscreen_windows
-            .iter()
-            .find(|window| {
-                state
-                    .space
-                    .outputs_for_element(window)
-                    .iter()
-                    .any(|candidate| candidate == &output)
-            })
-            .and_then(|window| {
-                let output_geo = output_geo?;
-                let reference_bbox = state.space.element_bbox(window).or_else(|| {
-                    let loc = state.space.element_location(window)?;
-                    let size = state
-                        .space
-                        .element_geometry(window)
-                        .unwrap_or_else(|| window.geometry())
-                        .size;
-                    Some(Rectangle::new(
-                        loc,
-                        Size::from((size.w.max(1), size.h.max(1))),
-                    ))
-                })?;
-                // Use the frozen clip rect captured at fullscreen entry to prevent intermediate
-                // subsurface repositioning from escaping the expected fullscreen bounds.
-                let clip_bbox = window
-                    .toplevel()
-                    .and_then(|t| state.fullscreen_transition_clips.get(t.wl_surface()).copied())
-                    .unwrap_or(reference_bbox);
-                let mut ids = HashSet::new();
-                window.with_surfaces(|wl_surface, _| {
-                    ids.insert(Id::from_wayland_resource(wl_surface));
-                });
-                if ids.is_empty() {
-                    return None;
-                }
-                Some(FullscreenClipEntry {
-                    window: window.clone(),
-                    ids,
-                    reference_rect: Rectangle::new(
-                        (reference_bbox.loc - output_geo.loc)
-                            .to_f64()
-                            .to_physical(output_scale)
-                            .to_i32_round(),
-                        reference_bbox
-                            .size
-                            .to_f64()
-                            .to_physical(output_scale)
-                            .to_i32_round(),
-                    ),
-                    clip_rect: Rectangle::new(
-                        (clip_bbox.loc - output_geo.loc)
-                            .to_f64()
-                            .to_physical(output_scale)
-                            .to_i32_round(),
-                        clip_bbox
-                            .size
-                            .to_f64()
-                            .to_physical(output_scale)
-                            .to_i32_round(),
-                    ),
-                })
-            })
-    } else {
-        None
-    };
-    let fullscreen_clip_is_animated = fullscreen_clip_entry.as_ref().is_some_and(|clip_entry| {
-        fullscreen_animation_entries
-            .iter()
-            .any(|entry| entry.ids.iter().any(|id| clip_entry.ids.contains(id)))
-    });
-    let mut space_elements_converted: Vec<
+    let space_elements_converted: Vec<
         UdevCompositeRenderElement<UdevRenderer<'_>, WaylandSurfaceRenderElement<UdevRenderer<'_>>>,
-    > = Vec::new();
-    let mut rendered_animation_entries = vec![false; fullscreen_animation_entries.len()];
-    let mut rendered_fullscreen_snapshot = false;
-    let mut rendered_fullscreen_clip = false;
-    for element in space_elements {
-        let is_window_element = matches!(element, SpaceRenderElements::Element(_));
-        let base = UdevRenderElement::from(element);
+    > = {
+        let mut converted: Vec<
+            UdevCompositeRenderElement<
+                UdevRenderer<'_>,
+                WaylandSurfaceRenderElement<UdevRenderer<'_>>,
+            >,
+        > = Vec::new();
+        let mut rendered_assigned_windows = HashSet::new();
 
-        if is_window_element
-            && let Some(entry) = fullscreen_snapshot_entry.as_ref()
-            && entry.ids.contains(base.id())
-        {
-            if !rendered_fullscreen_snapshot {
-                space_elements_converted.retain(|element| !entry.ids.contains(element.id()));
-                if let Ok(snapshot_element) = MemoryRenderBufferRenderElement::from_buffer(
-                    &mut renderer,
-                    entry.physical_loc.to_f64(),
-                    &entry.buffer,
-                    None,
-                    None,
-                    Some(entry.logical_size),
-                    Kind::Unspecified,
-                ) {
-                    space_elements_converted
-                        .push(UdevCompositeRenderElement::from(UdevRenderElement::from(snapshot_element)));
+        for element in space_elements {
+            let is_window_element = matches!(element, SpaceRenderElements::Element(_));
+            let base = UdevRenderElement::from(element);
+
+            if let Some(assignment_index) = window_assignment_indices.get(base.id()).copied()
+                && rendered_assigned_windows.contains(&assignment_index)
+            {
+                continue;
+            }
+
+            if is_window_element
+                && let Some(assignment_index) = window_assignment_indices.get(base.id()).copied()
+            {
+                let assignment = &window_assignments[assignment_index];
+                if rendered_assigned_windows.insert(assignment_index) {
+                    converted.retain(|element| !assignment.surface_ids.contains(element.id()));
+                    converted.extend(assigned_window_render_elements(
+                        &mut renderer,
+                        assignment,
+                        output_scale,
+                    ));
                 }
-                rendered_fullscreen_snapshot = true;
+                continue;
             }
-            continue;
+
+            converted.push(UdevCompositeRenderElement::from(base));
         }
 
-        if is_window_element
-            && let Some(entry_index) = fullscreen_animation_entries
-                .iter()
-                .position(|entry| entry.ids.contains(base.id()))
-        {
-            if !rendered_animation_entries[entry_index] {
-                let entry = &fullscreen_animation_entries[entry_index];
-                space_elements_converted.retain(|element| !entry.ids.contains(element.id()));
-                let animated_iter = constrain_as_render_elements::<
-                    UdevRenderer<'_>,
-                    Window,
-                    UdevCompositeRenderElement<UdevRenderer<'_>, WaylandSurfaceRenderElement<UdevRenderer<'_>>>,
-                >(
-                    &entry.window,
-                    &mut renderer,
-                    entry.reference_rect.loc,
-                    1.0,
-                    entry.current_rect,
-                    entry.reference_rect,
-                    ConstrainScaleBehavior::CutOff,
-                    ConstrainAlign::TOP_LEFT,
-                    output_scale,
-                );
-                space_elements_converted.extend(animated_iter);
-                rendered_animation_entries[entry_index] = true;
-            }
-            continue;
-        }
-
-        if transition_clip_active
-            && is_window_element
-            && !fullscreen_clip_is_animated
-            && let Some(entry) = fullscreen_clip_entry.as_ref()
-            && entry.ids.contains(base.id())
-        {
-            if !rendered_fullscreen_clip {
-                space_elements_converted.retain(|element| !entry.ids.contains(element.id()));
-                let clipped_iter = constrain_as_render_elements::<
-                    UdevRenderer<'_>,
-                    Window,
-                    UdevCompositeRenderElement<UdevRenderer<'_>, WaylandSurfaceRenderElement<UdevRenderer<'_>>>,
-                >(
-                    &entry.window,
-                    &mut renderer,
-                    entry.reference_rect.loc,
-                    1.0,
-                    entry.clip_rect,
-                    entry.reference_rect,
-                    ConstrainScaleBehavior::CutOff,
-                    ConstrainAlign::TOP_LEFT,
-                    output_scale,
-                );
-                space_elements_converted.extend(clipped_iter);
-                rendered_fullscreen_clip = true;
-            }
-            continue;
-        }
-        space_elements_converted.push(UdevCompositeRenderElement::from(base));
-    }
-
-    if !rendered_fullscreen_snapshot
-        && let Some(entry) = fullscreen_snapshot_entry.as_ref()
-    {
-        space_elements_converted.retain(|element| !entry.ids.contains(element.id()));
-        if let Ok(snapshot_element) = MemoryRenderBufferRenderElement::from_buffer(
-            &mut renderer,
-            entry.physical_loc.to_f64(),
-            &entry.buffer,
-            None,
-            None,
-            Some(entry.logical_size),
-            Kind::Unspecified,
-        ) {
-            space_elements_converted
-                .push(UdevCompositeRenderElement::from(UdevRenderElement::from(snapshot_element)));
-        }
-    }
-
-    // Fallback path: if an animated window never appeared in the collected elements this frame,
-    // synthesize the full window tree directly so GTK/Qt subsurfaces still stay constrained.
-    for (entry_index, entry) in fullscreen_animation_entries.iter().enumerate() {
-        if rendered_animation_entries[entry_index] {
-            continue;
-        }
-        if fullscreen_snapshot_entry.as_ref().is_some_and(|snapshot| {
-            entry.ids.iter().any(|id| snapshot.ids.contains(id))
-        }) {
-            continue;
-        }
-        space_elements_converted.retain(|element| !entry.ids.contains(element.id()));
-        let fallback_iter = constrain_as_render_elements::<
-            UdevRenderer<'_>,
-            Window,
-            UdevCompositeRenderElement<UdevRenderer<'_>, WaylandSurfaceRenderElement<UdevRenderer<'_>>>,
-        >(
-            &entry.window,
-            &mut renderer,
-            entry.reference_rect.loc,
-            1.0,
-            entry.current_rect,
-            entry.reference_rect,
-            ConstrainScaleBehavior::CutOff,
-            ConstrainAlign::TOP_LEFT,
-            output_scale,
-        );
-        space_elements_converted.extend(fallback_iter);
-    }
-
-    if transition_clip_active
-        && !fullscreen_clip_is_animated
-        && !rendered_fullscreen_clip
-        && let Some(entry) = fullscreen_clip_entry.as_ref()
-    {
-        space_elements_converted.retain(|element| !entry.ids.contains(element.id()));
-        let clipped_iter = constrain_as_render_elements::<
-            UdevRenderer<'_>,
-            Window,
-            UdevCompositeRenderElement<UdevRenderer<'_>, WaylandSurfaceRenderElement<UdevRenderer<'_>>>,
-        >(
-            &entry.window,
-            &mut renderer,
-            entry.reference_rect.loc,
-            1.0,
-            entry.clip_rect,
-            entry.reference_rect,
-            ConstrainScaleBehavior::CutOff,
-            ConstrainAlign::TOP_LEFT,
-            output_scale,
-        );
-        space_elements_converted.extend(clipped_iter);
-    }
+        converted
+    };
 
     // Render order is front-to-back, so cursor elements must come first.
     let mut elements: Vec<
@@ -1820,29 +2171,6 @@ fn render_surface(state: &mut Raven, node: DrmNode, crtc: crtc::Handle) {
 
             state.space.refresh();
             state.display_handle.flush_clients().unwrap();
-
-            if active_fullscreen_exit_snapshot.is_none()
-                && let Some(request) = pending_fullscreen_exit_snapshot_request.as_ref()
-            {
-                if let Some(snapshot_buffer) = captured_fullscreen_exit_snapshot.clone() {
-                    if !state.activate_fullscreen_exit_snapshot_for_output(
-                        &request.output_name,
-                        snapshot_buffer,
-                    ) {
-                        tracing::warn!(
-                            output = %request.output_name,
-                            "fullscreen-exit snapshot activation failed"
-                        );
-                        let _ = state.fallback_begin_fullscreen_exit_without_snapshot_for_output(
-                            &request.output_name,
-                        );
-                    }
-                } else {
-                    let _ = state.fallback_begin_fullscreen_exit_without_snapshot_for_output(
-                        &request.output_name,
-                    );
-                }
-            }
         }
         Err(e) => {
             tracing::error!("Failed to render frame: {e:?}");
@@ -1850,35 +2178,7 @@ fn render_surface(state: &mut Raven, node: DrmNode, crtc: crtc::Handle) {
             let _ = surface_data;
             let _ = device;
             let _ = udev;
-
-            if active_fullscreen_exit_snapshot.is_none()
-                && let Some(request) = pending_fullscreen_exit_snapshot_request.as_ref()
-            {
-                if let Some(snapshot_buffer) = captured_fullscreen_exit_snapshot {
-                    if !state.activate_fullscreen_exit_snapshot_for_output(
-                        &request.output_name,
-                        snapshot_buffer,
-                    ) {
-                        tracing::warn!(
-                            output = %request.output_name,
-                            "fullscreen-exit snapshot activation failed"
-                        );
-                        let _ = state.fallback_begin_fullscreen_exit_without_snapshot_for_output(
-                            &request.output_name,
-                        );
-                    }
-                } else {
-                    let _ = state.fallback_begin_fullscreen_exit_without_snapshot_for_output(
-                        &request.output_name,
-                    );
-                }
-            }
         }
-    }
-
-    // Keep redrawing while geometry animations are active so motion stays smooth.
-    if fullscreen_geometry_animation_active {
-        queue_redraw_for_output(state, &output);
     }
 }
 

@@ -179,6 +179,7 @@ impl PointerGrab<Raven> for ResizeSurfaceGrab {
                 state.size = Some(self.last_window_size);
             });
 
+            data.sync_reported_size_from_pending_state(&self.window, Some(self.last_window_size));
             xdg.send_pending_configure();
 
             ResizeSurfaceState::with(xdg.wl_surface(), |state| {

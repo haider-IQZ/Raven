@@ -14,10 +14,7 @@ use smithay::{
         pointer::{CursorImageStatus, Focus, PointerHandle},
     },
     output::Output,
-    reexports::{
-        wayland_protocols::xdg::shell::server::xdg_toplevel,
-        wayland_server::{Resource, protocol::wl_surface::WlSurface},
-    },
+    reexports::wayland_server::{Resource, protocol::wl_surface::WlSurface},
     utils::{Logical, Point, SERIAL_COUNTER},
     wayland::{
         compositor::with_states,
@@ -218,27 +215,17 @@ impl ForeignToplevelHandler for Raven {
     fn set_fullscreen(
         &mut self,
         wl_surface: WlSurface,
-        _wl_output: Option<smithay::reexports::wayland_server::protocol::wl_output::WlOutput>,
+        wl_output: Option<smithay::reexports::wayland_server::protocol::wl_output::WlOutput>,
     ) {
         let Some(window) = self.window_for_surface(&wl_surface) else {
             return;
         };
-        let Some(toplevel) = window.toplevel() else {
-            return;
-        };
+        let requested_output = wl_output.as_ref().and_then(Output::from_resource);
 
         self.set_window_floating(&window, false);
         self.clear_floating_recenter_for_surface(&wl_surface);
         if !self.is_window_mapped(&window) {
-            // Follow niri's approach: keep fullscreen intent pending until mapped.
-            self.queue_pending_unmapped_fullscreen_for_surface(&wl_surface);
-            toplevel.with_pending_state(|state| {
-                state.states.set(xdg_toplevel::State::Fullscreen);
-                state.states.unset(xdg_toplevel::State::Maximized);
-            });
-            if toplevel.is_initial_configure_sent() {
-                toplevel.send_pending_configure();
-            }
+            self.request_fullscreen_enter_on_output(&window, requested_output);
             return;
         }
         self.clear_pending_unmapped_fullscreen_for_surface(&wl_surface);
@@ -252,7 +239,7 @@ impl ForeignToplevelHandler for Raven {
             return;
         }
 
-        if self.enter_fullscreen_window(&window) {
+        if self.request_fullscreen_enter_on_output(&window, requested_output) {
             self.space.raise_element(&window, true);
             if let Err(err) = self.apply_layout() {
                 tracing::warn!("failed to apply layout after foreign toplevel fullscreen: {err}");
@@ -264,26 +251,14 @@ impl ForeignToplevelHandler for Raven {
         let Some(window) = self.window_for_surface(&wl_surface) else {
             return;
         };
-        let Some(toplevel) = window.toplevel() else {
-            return;
-        };
 
         self.clear_pending_unmapped_fullscreen_for_surface(&wl_surface);
         if !self.is_window_mapped(&window) {
-            let restore_maximized = self.has_pending_unmapped_maximized_for_surface(&wl_surface);
-            toplevel.with_pending_state(|state| {
-                state.states.unset(xdg_toplevel::State::Fullscreen);
-                if restore_maximized {
-                    state.states.set(xdg_toplevel::State::Maximized);
-                }
-            });
-            if toplevel.is_initial_configure_sent() {
-                toplevel.send_pending_configure();
-            }
+            self.set_window_fullscreen_state(&window, false);
             return;
         }
 
-        if self.exit_fullscreen_window(&window) {
+        if self.request_fullscreen_exit(&window) {
             if let Err(err) = self.apply_layout() {
                 tracing::warn!("failed to apply layout after foreign toplevel unfullscreen: {err}");
             }
@@ -305,6 +280,9 @@ impl ForeignToplevelHandler for Raven {
         self.set_window_maximized_state(&window, true);
         if self.is_window_mapped(&window) {
             self.raise_window_preserving_layer(&window);
+            if let Err(err) = self.apply_layout() {
+                tracing::warn!("failed to apply layout after foreign toplevel maximize: {err}");
+            }
         }
     }
 

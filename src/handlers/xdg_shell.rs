@@ -7,6 +7,7 @@ use smithay::{
         Seat,
         pointer::{Focus, GrabStartData as PointerGrabStartData},
     },
+    output::Output,
     reexports::{
         wayland_protocols::xdg::{
             decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as DecorationMode,
@@ -90,7 +91,7 @@ impl XdgShellHandler for Raven {
         // top-left placeholder frame in some clients before tiling/full layout applies.
         // The compositor commit path maps once the surface is truly mapped.
         if rules.fullscreen {
-            self.enter_fullscreen_window(&window);
+            self.request_fullscreen_enter_on_output(&window, None);
         }
         if !defer_initial_resolution {
             tracing::debug!("new_toplevel: step=apply_layout:start");
@@ -211,6 +212,9 @@ impl XdgShellHandler for Raven {
         self.set_window_maximized_state(&window, true);
         if self.is_window_mapped(&window) {
             self.space.raise_element(&window, true);
+            if let Err(err) = self.apply_layout() {
+                tracing::warn!("failed to apply layout after xdg maximize request: {err}");
+            }
         }
     }
 
@@ -234,7 +238,7 @@ impl XdgShellHandler for Raven {
     fn fullscreen_request(
         &mut self,
         surface: ToplevelSurface,
-        _wl_output: Option<wl_output::WlOutput>,
+        wl_output: Option<wl_output::WlOutput>,
     ) {
         let Some(window) = self.window_for_surface(surface.wl_surface()) else {
             if surface.is_initial_configure_sent() {
@@ -242,31 +246,21 @@ impl XdgShellHandler for Raven {
             }
             return;
         };
+        let requested_output = wl_output.as_ref().and_then(Output::from_resource);
 
         self.set_window_floating(&window, false);
         self.clear_floating_recenter_for_surface(surface.wl_surface());
         if !self.is_window_mapped(&window) {
-            // Defer compositor-side fullscreen bookkeeping until first real map commit.
-            self.queue_pending_unmapped_fullscreen_for_surface(surface.wl_surface());
-            surface.with_pending_state(|state| {
-                state.states.set(xdg_toplevel::State::Fullscreen);
-                state.states.unset(xdg_toplevel::State::Maximized);
-            });
-            if surface.is_initial_configure_sent() {
-                surface.send_configure();
-            }
+            self.request_fullscreen_enter_on_output(&window, requested_output);
             return;
         }
         self.clear_pending_unmapped_fullscreen_for_surface(surface.wl_surface());
 
-        if self.enter_fullscreen_window(&window) {
+        if self.request_fullscreen_enter_on_output(&window, requested_output) {
             self.space.raise_element(&window, true);
             if let Err(err) = self.apply_layout() {
                 tracing::warn!("failed to apply layout after xdg fullscreen request: {err}");
             }
-        } else {
-            // xdg-shell fullscreen requests should still receive a configure response.
-            self.set_window_fullscreen_state(&window, true);
         }
     }
 
@@ -280,21 +274,11 @@ impl XdgShellHandler for Raven {
 
         self.clear_pending_unmapped_fullscreen_for_surface(surface.wl_surface());
         if !self.is_window_mapped(&window) {
-            let restore_maximized =
-                self.has_pending_unmapped_maximized_for_surface(surface.wl_surface());
-            surface.with_pending_state(|state| {
-                state.states.unset(xdg_toplevel::State::Fullscreen);
-                if restore_maximized {
-                    state.states.set(xdg_toplevel::State::Maximized);
-                }
-            });
-            if surface.is_initial_configure_sent() {
-                surface.send_configure();
-            }
+            self.set_window_fullscreen_state(&window, false);
             return;
         }
 
-        if self.exit_fullscreen_window(&window) {
+        if self.request_fullscreen_exit(&window) {
             if let Err(err) = self.apply_layout() {
                 tracing::warn!("failed to apply layout after xdg unfullscreen request: {err}");
             }
@@ -338,7 +322,7 @@ impl XdgShellHandler for Raven {
         }
 
         let outputs = self.space.outputs_for_element(&window);
-        self.space.unmap_elem(&window);
+        self.unmap_window(&window);
         self.remove_window_from_workspaces(&window);
 
         if let Err(err) = self.apply_layout() {

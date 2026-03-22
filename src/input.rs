@@ -5,7 +5,7 @@ use crate::{
         move_grab::MoveGrab,
         resize_grab::{ResizeEdge, ResizeSurfaceGrab},
     },
-    state::Raven,
+    state::{PointContents, Raven},
 };
 use smithay::{
     backend::input::{
@@ -13,13 +13,17 @@ use smithay::{
         KeyState, KeyboardKeyEvent, MouseButton, PointerAxisEvent, PointerButtonEvent,
         PointerMotionEvent,
     },
-    desktop::{WindowSurfaceType, layer_map_for_output},
+    desktop::{Window, WindowSurfaceType, layer_map_for_output},
     input::{
         keyboard::{FilterResult, Keysym, ModifiersState},
         pointer::{
             AxisFrame, ButtonEvent, Focus, GrabStartData as PointerGrabStartData, MotionEvent,
-            RelativeMotionEvent,
+            PointerHandle, RelativeMotionEvent,
         },
+    },
+    reexports::{
+        wayland_protocols::xdg::shell::server::xdg_toplevel,
+        wayland_server::protocol::wl_surface::WlSurface,
     },
     utils::{Logical, Point, Rectangle, SERIAL_COUNTER, Serial},
     wayland::{
@@ -30,6 +34,280 @@ use smithay::{
 };
 
 impl Raven {
+    pub fn window_for_surface(&self, surface: &WlSurface) -> Option<Window> {
+        self.workspace_windows()
+            .find(|window| {
+                window
+                    .toplevel()
+                    .is_some_and(|tl| tl.wl_surface() == surface)
+            })
+            .cloned()
+            .or_else(|| {
+                self.space
+                    .elements()
+                    .find(|window| {
+                        window
+                            .toplevel()
+                            .is_some_and(|tl| tl.wl_surface() == surface)
+                    })
+                    .cloned()
+            })
+    }
+
+    pub fn window_under_pointer(&self) -> Option<(Window, Point<i32, Logical>)> {
+        self.space
+            .element_under(self.pointer_location)
+            .map(|(window, point)| (window.clone(), point))
+    }
+
+    pub fn contents_under(&self, position: Point<f64, Logical>) -> PointContents {
+        let Some(output) = self.space.output_under(position).next() else {
+            return PointContents::default();
+        };
+        let Some(output_geo) = self.space.output_geometry(output) else {
+            return PointContents::default();
+        };
+
+        let layer_map = layer_map_for_output(output);
+        let position_within_output = position - output_geo.loc.to_f64();
+        let fullscreen_on_output = self.output_has_fullscreen_window(output);
+
+        let layer_surface_under = |layer: WlrLayer, popup: bool| -> Option<PointContents> {
+            layer_map.layers_on(layer).rev().find_map(|layer_surface| {
+                let layer_geo = layer_map.layer_geometry(layer_surface)?;
+                let surface_type = (if popup {
+                    WindowSurfaceType::POPUP
+                } else {
+                    WindowSurfaceType::TOPLEVEL
+                }) | WindowSurfaceType::SUBSURFACE;
+
+                layer_surface
+                    .surface_under(
+                        position_within_output - layer_geo.loc.to_f64(),
+                        surface_type,
+                    )
+                    .map(|(surface, local_pos)| PointContents {
+                        output: Some(output.clone()),
+                        surface: Some((
+                            surface,
+                            output_geo.loc.to_f64() + layer_geo.loc.to_f64() + local_pos.to_f64(),
+                        )),
+                        window: None,
+                        layer: Some(layer_surface.wl_surface().clone()),
+                    })
+            })
+        };
+
+        let window_under = || -> Option<PointContents> {
+            self.space
+                .element_under(position)
+                .and_then(|(window, render_location)| {
+                    window
+                        .surface_under(position - render_location.to_f64(), WindowSurfaceType::ALL)
+                        .map(|(surface, local_pos)| PointContents {
+                            output: Some(output.clone()),
+                            surface: Some((surface, (local_pos + render_location).to_f64())),
+                            window: Some(window.clone()),
+                            layer: None,
+                        })
+                })
+        };
+
+        if fullscreen_on_output {
+            layer_surface_under(WlrLayer::Overlay, true)
+                .or_else(|| layer_surface_under(WlrLayer::Overlay, false))
+                .or_else(window_under)
+                .or_else(|| layer_surface_under(WlrLayer::Top, true))
+                .or_else(|| layer_surface_under(WlrLayer::Top, false))
+                .or_else(|| layer_surface_under(WlrLayer::Bottom, true))
+                .or_else(|| layer_surface_under(WlrLayer::Background, true))
+                .or_else(|| layer_surface_under(WlrLayer::Bottom, false))
+                .or_else(|| layer_surface_under(WlrLayer::Background, false))
+                .unwrap_or_else(|| PointContents {
+                    output: Some(output.clone()),
+                    surface: None,
+                    window: None,
+                    layer: None,
+                })
+        } else {
+            layer_surface_under(WlrLayer::Overlay, true)
+                .or_else(|| layer_surface_under(WlrLayer::Overlay, false))
+                .or_else(|| layer_surface_under(WlrLayer::Top, true))
+                .or_else(|| layer_surface_under(WlrLayer::Top, false))
+                .or_else(window_under)
+                .or_else(|| layer_surface_under(WlrLayer::Bottom, true))
+                .or_else(|| layer_surface_under(WlrLayer::Background, true))
+                .or_else(|| layer_surface_under(WlrLayer::Bottom, false))
+                .or_else(|| layer_surface_under(WlrLayer::Background, false))
+                .unwrap_or_else(|| PointContents {
+                    output: Some(output.clone()),
+                    surface: None,
+                    window: None,
+                    layer: None,
+                })
+        }
+    }
+
+    pub fn update_pointer_contents(&mut self, time_msec: u32) -> bool {
+        let pointer = self.pointer();
+        let location = pointer.current_location();
+        self.pointer_location = location;
+        let under = self.contents_under(location);
+        if self.pointer_contents == under {
+            return false;
+        }
+
+        self.pointer_contents.clone_from(&under);
+
+        pointer.motion(
+            self,
+            under.surface,
+            &MotionEvent {
+                location,
+                serial: SERIAL_COUNTER.next_serial(),
+                time: time_msec,
+            },
+        );
+        self.maybe_activate_pointer_constraint();
+
+        true
+    }
+
+    pub fn refresh_pointer_contents(&mut self) -> bool {
+        let time_msec = self.start_time.elapsed().as_millis() as u32;
+        if !self.update_pointer_contents(time_msec) {
+            return false;
+        }
+
+        self.pointer().frame(self);
+        self.queue_redraw_for_pointer_output();
+        true
+    }
+
+    pub fn queue_redraw_for_pointer_output(&mut self) {
+        let output = self.pointer_contents.output.clone().or_else(|| {
+            self.space
+                .output_under(self.pointer_location)
+                .next()
+                .cloned()
+        });
+
+        if let Some(output) = output {
+            crate::backend::udev::queue_redraw_for_output(self, &output);
+        } else {
+            crate::backend::udev::queue_redraw_all(self);
+        }
+    }
+
+    pub fn maybe_activate_pointer_constraint(&self) {
+        let Some((surface, surface_loc)) = &self.pointer_contents.surface else {
+            return;
+        };
+
+        let pointer = self.pointer();
+        if Some(surface) != pointer.current_focus().as_ref() {
+            return;
+        }
+
+        smithay::wayland::pointer_constraints::with_pointer_constraint(
+            surface,
+            &pointer,
+            |constraint| {
+                let Some(constraint) = constraint else { return };
+
+                if constraint.is_active() {
+                    return;
+                }
+
+                if let Some(region) = constraint.region() {
+                    let pointer_pos = pointer.current_location();
+                    let pos_within_surface = pointer_pos - *surface_loc;
+                    if !region.contains(pos_within_surface.to_i32_round()) {
+                        return;
+                    }
+                }
+
+                constraint.activate();
+            },
+        );
+    }
+
+    pub fn pointer(&self) -> PointerHandle<Self> {
+        self.seat.get_pointer().expect("pointer not initialized")
+    }
+
+    pub fn sync_window_activation(&self, focused_window: Option<&Window>) {
+        let windows: Vec<Window> = self.space.elements().cloned().collect();
+        for window in windows {
+            let is_focused = focused_window.is_some_and(|focused| focused == &window);
+            if let Some(toplevel) = window.toplevel() {
+                toplevel.with_pending_state(|state| {
+                    if is_focused {
+                        state.states.set(xdg_toplevel::State::Activated);
+                    } else {
+                        state.states.unset(xdg_toplevel::State::Activated);
+                    }
+                });
+                if toplevel.is_initial_configure_sent() {
+                    toplevel.send_pending_configure();
+                }
+            }
+        }
+    }
+
+    pub fn set_keyboard_focus(&mut self, target: Option<WlSurface>, serial: Serial) {
+        let current_focus = self
+            .seat
+            .get_keyboard()
+            .and_then(|keyboard| keyboard.current_focus());
+        if current_focus.as_ref() == target.as_ref() {
+            return;
+        }
+
+        let focused_window = target
+            .as_ref()
+            .and_then(|surface| self.window_for_surface(surface));
+        if let Some(window) = focused_window.as_ref()
+            && self.is_window_mapped(window)
+        {
+            self.raise_window_preserving_layer(window);
+        }
+        self.sync_window_activation(focused_window.as_ref());
+
+        if let Some(keyboard) = self.seat.get_keyboard() {
+            keyboard.set_focus(self, target, serial);
+        }
+    }
+
+    pub fn refocus_visible_window(&mut self) {
+        if let Some(focused_surface) = self
+            .seat
+            .get_keyboard()
+            .and_then(|keyboard| keyboard.current_focus())
+            && let Some(window) = self.window_for_surface(&focused_surface)
+            && self.is_window_mapped(&window)
+        {
+            self.sync_window_activation(Some(&window));
+            return;
+        }
+
+        let serial = SERIAL_COUNTER.next_serial();
+        let pointer_target = self.window_under_pointer().and_then(|(window, _)| {
+            window
+                .toplevel()
+                .map(|toplevel| toplevel.wl_surface().clone())
+        });
+
+        let fallback_target = self.space.elements().last().and_then(|window| {
+            window
+                .toplevel()
+                .map(|toplevel| toplevel.wl_surface().clone())
+        });
+
+        let target = pointer_target.or(fallback_target);
+        self.set_keyboard_focus(target, serial);
+    }
+
     fn queue_pointer_redraw_throttled(&mut self, event_time_msec: u32) {
         // Avoid flooding redraw requests during high-rate mouse motion.
         // 8ms ~= 125 FPS, good enough for cursor smoothness while reducing stalls.
