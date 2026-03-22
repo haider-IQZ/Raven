@@ -2007,6 +2007,10 @@ fn render_surface(state: &mut Raven, node: DrmNode, crtc: crtc::Handle) {
                 && let Some(assignment_index) = window_assignment_indices.get(base.id()).copied()
             {
                 let assignment = &window_assignments[assignment_index];
+                if !assignment.is_fullscreen {
+                    converted.push(UdevCompositeRenderElement::from(base));
+                    continue;
+                }
                 if rendered_assigned_windows.insert(assignment_index) {
                     converted.retain(|element| !assignment.surface_ids.contains(element.id()));
                     converted.extend(assigned_window_render_elements(

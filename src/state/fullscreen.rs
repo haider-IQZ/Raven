@@ -1,7 +1,54 @@
 use super::*;
 use bitflags::bitflags;
-use smithay::output::Output;
 use smithay::backend::renderer::utils::with_renderer_surface_state;
+use smithay::output::Output;
+use std::{
+    fs::OpenOptions,
+    io::Write,
+    sync::{Mutex, OnceLock},
+};
+
+fn fullscreen_trace_line(line: impl AsRef<str>) {
+    static TRACE_ENABLED: OnceLock<bool> = OnceLock::new();
+    static TRACE_INIT: OnceLock<()> = OnceLock::new();
+    static TRACE_LINES: OnceLock<Mutex<usize>> = OnceLock::new();
+    const TRACE_PATH: &str = "/tmp/raven-fullscreen-trace.log";
+    const TRACE_MAX_LINES: usize = 1000;
+
+    if !*TRACE_ENABLED.get_or_init(|| {
+        std::env::var_os("RAVEN_FULLSCREEN_TRACE")
+            .map(|value| {
+                let value = value.to_string_lossy().to_ascii_lowercase();
+                matches!(value.as_str(), "1" | "true" | "yes" | "on")
+            })
+            .unwrap_or(false)
+    }) {
+        return;
+    }
+
+    TRACE_INIT.get_or_init(|| {
+        let _ = std::fs::write(TRACE_PATH, "");
+    });
+
+    let counter = TRACE_LINES.get_or_init(|| Mutex::new(0));
+    let Ok(mut count) = counter.lock() else {
+        return;
+    };
+    if *count >= TRACE_MAX_LINES {
+        return;
+    }
+    *count += 1;
+
+    let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(TRACE_PATH)
+    else {
+        return;
+    };
+
+    let _ = writeln!(file, "{}", line.as_ref());
+}
 
 bitflags! {
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -22,6 +69,8 @@ pub(super) struct FullscreenSlot {
 pub(super) struct FullscreenRestoreState {
     pub(super) rect: Option<Rectangle<i32, Logical>>,
     pub(super) maximized: bool,
+    pub(super) geometry: Rectangle<i32, Logical>,
+    pub(super) bbox: Rectangle<i32, Logical>,
 }
 
 #[derive(Clone, Debug)]
@@ -222,7 +271,17 @@ impl Raven {
         let restore_state = FullscreenRestoreState {
             rect: restore_rect,
             maximized: self.window_is_marked_maximized(window),
+            geometry: window.geometry(),
+            bbox: window.bbox(),
         };
+        fullscreen_trace_line(format!(
+            "remember_restore rect={restore_rect:?} element_loc={:?} element_geo={:?} element_bbox={:?} window_geo={:?} window_bbox={:?}",
+            self.space.element_location(window),
+            self.space.element_geometry(window),
+            self.space.element_bbox(window),
+            restore_state.geometry,
+            restore_state.bbox,
+        ));
         self.fullscreen
             .restore_state_by_surface
             .insert(surface_id, restore_state);
@@ -270,6 +329,16 @@ impl Raven {
             self.map_window_to_rect(window, target_rect, false);
         }
 
+        fullscreen_trace_line(format!(
+            "finalize_exit target_rect={:?} element_loc={:?} element_geo={:?} element_bbox={:?} window_geo={:?} window_bbox={:?}",
+            self.fullscreen_restore_target_rect(window),
+            self.space.element_location(window),
+            self.space.element_geometry(window),
+            self.space.element_bbox(window),
+            window.geometry(),
+            window.bbox(),
+        ));
+
         self.debug_assert_state_invariants("finalize_fullscreen_exit_visual_state");
         true
     }
@@ -294,6 +363,43 @@ impl Raven {
         window: &Window,
         transition: &PendingFullscreenTransition,
     ) -> bool {
+        if let PendingFullscreenTransition::Exit = transition
+            && let Some(surface_id) = Self::window_surface_id(window)
+            && let Some(restore_state) = self.fullscreen.restore_state_by_surface.get(&surface_id)
+        {
+            let current_geometry = window.geometry();
+            let geometry_size_matches =
+                Self::sizes_match_target(current_geometry.size, restore_state.geometry.size);
+            let geometry_loc_matches = current_geometry.loc == restore_state.geometry.loc;
+            let current_bbox = window.bbox();
+            let bbox_size_matches =
+                Self::sizes_match_target(current_bbox.size, restore_state.bbox.size);
+            let bbox_loc_matches = current_bbox.loc == restore_state.bbox.loc;
+            fullscreen_trace_line(format!(
+                "exit_ready_check target_rect={:?} restore_rect={:?} element_loc={:?} element_geo={:?} element_bbox={:?} current_geo={:?} restore_geo={:?} current_bbox={:?} restore_bbox={:?} geometry_size_matches={} geometry_loc_matches={} bbox_size_matches={} bbox_loc_matches={}",
+                self.pending_fullscreen_transition_target_rect(window, transition),
+                restore_state.rect,
+                self.space.element_location(window),
+                self.space.element_geometry(window),
+                self.space.element_bbox(window),
+                current_geometry,
+                restore_state.geometry,
+                current_bbox,
+                restore_state.bbox,
+                geometry_size_matches,
+                geometry_loc_matches,
+                bbox_size_matches,
+                bbox_loc_matches,
+            ));
+            if !geometry_size_matches
+                || !geometry_loc_matches
+                || !bbox_size_matches
+                || !bbox_loc_matches
+            {
+                return false;
+            }
+        }
+
         let Some(target_rect) = self.pending_fullscreen_transition_target_rect(window, transition)
         else {
             return true;

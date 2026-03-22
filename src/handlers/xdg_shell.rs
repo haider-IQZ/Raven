@@ -282,9 +282,6 @@ impl XdgShellHandler for Raven {
             if let Err(err) = self.apply_layout() {
                 tracing::warn!("failed to apply layout after xdg unfullscreen request: {err}");
             }
-        } else {
-            // Mirror fullscreen_request behavior: always respond with a configure.
-            self.set_window_fullscreen_state(&window, false);
         }
     }
 
