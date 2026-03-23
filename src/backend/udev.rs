@@ -697,13 +697,34 @@ fn corrected_root_texture_element<'render, 'frame>(
     .flatten()
 }
 
-fn translate_geometry_between_rects(
+fn remap_geometry_between_rects(
     geometry: Rectangle<i32, Physical>,
     source_rect: Rectangle<i32, Physical>,
     target_rect: Rectangle<i32, Physical>,
 ) -> Rectangle<i32, Physical> {
+    if source_rect.size.w <= 0
+        || source_rect.size.h <= 0
+        || source_rect.size == target_rect.size
+    {
+        let relative_loc = geometry.loc - source_rect.loc;
+        return Rectangle::new(target_rect.loc + relative_loc, geometry.size);
+    }
+
     let relative_loc = geometry.loc - source_rect.loc;
-    Rectangle::new(target_rect.loc + relative_loc, geometry.size)
+    let scale_x = target_rect.size.w as f64 / source_rect.size.w as f64;
+    let scale_y = target_rect.size.h as f64 / source_rect.size.h as f64;
+    Rectangle::new(
+        Point::<f64, Physical>::from((
+            target_rect.loc.x as f64 + relative_loc.x as f64 * scale_x,
+            target_rect.loc.y as f64 + relative_loc.y as f64 * scale_y,
+        ))
+        .to_i32_round(),
+        smithay::utils::Size::<f64, Physical>::from((
+            geometry.size.w as f64 * scale_x,
+            geometry.size.h as f64 * scale_y,
+        ))
+        .to_i32_round(),
+    )
 }
 
 fn window_assignment_for_output(
@@ -792,51 +813,9 @@ fn assigned_window_render_elements<'render, 'frame>(
     };
 
     let root_surface = toplevel.wl_surface();
-    if !assignment.is_fullscreen {
-        return render_elements_from_surface_tree::<
-            _,
-            WaylandSurfaceRenderElement<UdevRenderer<'frame>>,
-        >(
-            renderer,
-            root_surface,
-            assignment.render_origin_physical,
-            output_scale,
-            1.0,
-            Kind::Unspecified,
-        )
-        .into_iter()
-        .map(|element| {
-            UdevCompositeRenderElement::from(CorrectedWaylandSurfaceRenderElement {
-                inner: element,
-                src_override: None,
-                geometry_override: None,
-            })
-        })
-        .collect();
-    }
-
-    if assignment.is_fullscreen && assignment.needs_correction() {
-        return constrain_as_render_elements::<
-            UdevRenderer<'frame>,
-            Window,
-            UdevCompositeRenderElement<
-                UdevRenderer<'frame>,
-                WaylandSurfaceRenderElement<UdevRenderer<'frame>>,
-            >,
-        >(
-            &assignment.window,
-            renderer,
-            assignment.render_origin_physical,
-            1.0,
-            assignment.assigned_physical,
-            assignment.raw_root_physical,
-            ConstrainScaleBehavior::Stretch,
-            ConstrainAlign::TOP_LEFT,
-            output_scale,
-        )
-        .collect();
-    }
-
+    // Use the fast path only when the client's committed/root geometry already matches the
+    // compositor-assigned rect. Mismatch cases, especially around first map, need the generic
+    // correction path below even for non-fullscreen windows.
     if !assignment.needs_correction() {
         render_trace_line(format!(
             "window_path=passthrough {} {} expected={}x{}",
@@ -864,6 +843,28 @@ fn assigned_window_render_elements<'render, 'frame>(
                 geometry_override: None,
             })
         })
+        .collect();
+    }
+
+    if assignment.is_fullscreen {
+        return constrain_as_render_elements::<
+            UdevRenderer<'frame>,
+            Window,
+            UdevCompositeRenderElement<
+                UdevRenderer<'frame>,
+                WaylandSurfaceRenderElement<UdevRenderer<'frame>>,
+            >,
+        >(
+            &assignment.window,
+            renderer,
+            assignment.render_origin_physical,
+            1.0,
+            assignment.assigned_physical,
+            assignment.raw_root_physical,
+            ConstrainScaleBehavior::Stretch,
+            ConstrainAlign::TOP_LEFT,
+            output_scale,
+        )
         .collect();
     }
 
@@ -932,18 +933,18 @@ fn assigned_window_render_elements<'render, 'frame>(
             ));
             Some(root_target_rect)
         } else if reported_tree_rect.size != root_target_rect.size {
-            let translated_geometry = translate_geometry_between_rects(
+            let remapped_geometry = remap_geometry_between_rects(
                 element_geometry,
                 assignment.raw_root_physical,
                 root_target_rect,
             );
             render_trace_line(format!(
-                "child_path=translated {} {} {}",
+                "child_path=remapped {} {} {}",
                 trace_rect_physical("source_elem", element_geometry),
                 trace_rect_physical("raw_root", assignment.raw_root_physical),
-                trace_rect_physical("target_elem", translated_geometry),
+                trace_rect_physical("target_elem", remapped_geometry),
             ));
-            Some(translated_geometry)
+            Some(remapped_geometry)
         } else {
             None
         };
@@ -1994,20 +1995,13 @@ fn render_surface(state: &mut Raven, node: DrmNode, crtc: crtc::Handle) {
         let mut rendered_assigned_windows = HashSet::new();
 
         for element in space_elements {
-            let is_window_element = matches!(element, SpaceRenderElements::Element(_));
             let base = UdevRenderElement::from(element);
 
-            if let Some(assignment_index) = window_assignment_indices.get(base.id()).copied()
-                && rendered_assigned_windows.contains(&assignment_index)
-            {
-                continue;
-            }
-
-            if is_window_element
-                && let Some(assignment_index) = window_assignment_indices.get(base.id()).copied()
-            {
+            if let Some(assignment_index) = window_assignment_indices.get(base.id()).copied() {
                 let assignment = &window_assignments[assignment_index];
-                if !assignment.is_fullscreen {
+                let needs_assigned_render_path =
+                    assignment.is_fullscreen || assignment.needs_correction();
+                if !needs_assigned_render_path {
                     converted.push(UdevCompositeRenderElement::from(base));
                     continue;
                 }
