@@ -47,6 +47,7 @@ use std::{
     io::Write,
     os::fd::AsRawFd,
     os::unix::net::{UnixListener, UnixStream},
+    os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
@@ -1508,107 +1509,62 @@ impl Raven {
         self.spawn_command(&self.config.launcher);
     }
 
-    fn infer_command_program(command: &str) -> Option<&str> {
-        let mut saw_env = false;
-        for token in command.split_whitespace() {
-            if token.is_empty() {
-                continue;
-            }
-
-            if !saw_env && token == "env" {
-                saw_env = true;
-                continue;
-            }
-
-            if token.contains('=') && !token.starts_with('/') && !token.starts_with("./") {
-                continue;
-            }
-
-            let program = token.rsplit('/').next().unwrap_or(token);
-            return Some(program);
-        }
-
-        None
-    }
-
-    fn apply_no_csd_spawn_overrides(&self, command: &str) -> String {
-        let trimmed = command.trim();
-        if trimmed.is_empty() || !self.config.no_csd {
-            return trimmed.to_owned();
-        }
-
-        let lower = trimmed.to_ascii_lowercase();
-        let Some(program) = Self::infer_command_program(trimmed) else {
-            return trimmed.to_owned();
+    /// Canonical session environment — the single source of truth for what apps see,
+    /// regardless of who launched them (Raven spawn, fuzzel/waybar, dbus activation).
+    ///
+    /// Empty values mean "neutralize": they scrub inherited values from foreign
+    /// sessions instead of forcing a toolkit backend. Toolkits autodetect Wayland
+    /// fine once WAYLAND_DISPLAY is present; forcing per-toolkit variables is what
+    /// historically broke Steam/Proton X11 fallback.
+    ///
+    /// Consumed by both [`Self::apply_wayland_child_env`] (direct children) and
+    /// [`Self::sync_activation_environment`] (dbus/systemd publication), so the two
+    /// paths can never drift apart again.
+    fn session_env_vars(&self) -> Vec<(&'static str, String)> {
+        let chromium_sync_flags = if self.chromium_explicit_sync_enabled() {
+            "--enable-features=WaylandLinuxDrmSyncobj"
+        } else {
+            "--disable-features=WaylandLinuxDrmSyncobj"
         };
 
-        match program {
-            "alacritty" => {
-                if lower.contains("window.decorations=") {
-                    trimmed.to_owned()
-                } else {
-                    format!("{trimmed} -o window.decorations=None")
-                }
-            }
-            "kitty" => {
-                if lower.contains("hide_window_decorations") {
-                    trimmed.to_owned()
-                } else {
-                    format!("{trimmed} -o hide_window_decorations=yes")
-                }
-            }
-            "wezterm" => {
-                if lower.contains("window_decorations=") {
-                    trimmed.to_owned()
-                } else {
-                    format!("{trimmed} --config window_decorations=NONE")
-                }
-            }
-            _ => trimmed.to_owned(),
-        }
-    }
+        let mut vars = vec![
+            (
+                "WAYLAND_DISPLAY",
+                self.socket_name.to_string_lossy().into_owned(),
+            ),
+            ("XDG_SESSION_TYPE", "wayland".to_owned()),
+            ("XDG_CURRENT_DESKTOP", "raven".to_owned()),
+            ("XDG_SESSION_DESKTOP", "raven".to_owned()),
+            ("GDK_BACKEND", String::new()),
+            ("QT_QPA_PLATFORM", String::new()),
+            ("SDL_VIDEODRIVER", String::new()),
+            ("MOZ_ENABLE_WAYLAND", String::new()),
+            ("MOZ_DBUS_REMOTE", String::new()),
+            // Chromium/Electron native Wayland selection for every launcher path:
+            // - NIXOS_OZONE_WL drives the NixOS binary wrapper
+            // - ELECTRON_OZONE_PLATFORM_HINT drives Electron >= 28
+            // - CHROMIUM_FLAGS / BRAVE_USER_FLAGS cover distro launcher scripts
+            // Steam is unaffected (it is not Ozone/Chromium-based; games run via Proton).
+            ("NIXOS_OZONE_WL", "1".to_owned()),
+            ("ELECTRON_OZONE_PLATFORM_HINT", "wayland".to_owned()),
+            ("CHROMIUM_FLAGS", chromium_sync_flags.to_owned()),
+            ("BRAVE_USER_FLAGS", chromium_sync_flags.to_owned()),
+        ];
 
-    fn apply_wayland_browser_spawn_overrides(&self, command: &str) -> String {
-        let trimmed = command.trim();
-        if trimmed.is_empty() {
-            return trimmed.to_owned();
-        }
-
-        let lower = trimmed.to_ascii_lowercase();
-        let Some(program) = Self::infer_command_program(trimmed) else {
-            return trimmed.to_owned();
-        };
-
-        let is_chromium_family = matches!(
-            program,
-            "brave"
-                | "brave-browser"
-                | "chromium"
-                | "chromium-browser"
-                | "google-chrome"
-                | "chrome"
-                | "microsoft-edge"
-        );
-
-        if !is_chromium_family {
-            return trimmed.to_owned();
+        let xwayland_display = self.config.xwayland.display.trim();
+        if self.config.xwayland.enabled && !xwayland_display.is_empty() {
+            vars.push(("DISPLAY", xwayland_display.to_owned()));
+        } else {
+            vars.push(("DISPLAY", String::new()));
         }
 
-        let mut out = trimmed.to_owned();
-        if !lower.contains("--ozone-platform=") && !lower.contains("--ozone-platform-hint=") {
-            out.push_str(" --ozone-platform=wayland");
+        if self.config.no_csd {
+            vars.push(("QT_WAYLAND_DISABLE_WINDOWDECORATION", "1".to_owned()));
+        } else {
+            vars.push(("QT_WAYLAND_DISABLE_WINDOWDECORATION", String::new()));
         }
 
-        // Select Chromium sync mode based on compositor capability and env overrides.
-        if !lower.contains("waylandlinuxdrmsyncobj") {
-            if self.chromium_explicit_sync_enabled() {
-                out.push_str(" --enable-features=WaylandLinuxDrmSyncobj");
-            } else {
-                out.push_str(" --disable-features=WaylandLinuxDrmSyncobj");
-            }
-        }
-
-        out
+        vars
     }
 
     fn chromium_explicit_sync_enabled(&self) -> bool {
@@ -1636,76 +1592,43 @@ impl Raven {
     }
 
     fn apply_wayland_child_env(&self, cmd: &mut Command) {
-        cmd.env("WAYLAND_DISPLAY", &self.socket_name);
+        // Direct children get exactly the environment published to the rest of the
+        // session — launching an app via keybind vs fuzzel must not change behavior.
+        for (key, value) in self.session_env_vars() {
+            if value.is_empty() {
+                cmd.env_remove(key);
+            } else {
+                cmd.env(key, value);
+            }
+        }
         if let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR") {
             cmd.env("XDG_RUNTIME_DIR", runtime_dir);
         }
-        cmd.env("XDG_SESSION_TYPE", "wayland");
-        cmd.env("XDG_CURRENT_DESKTOP", "raven");
-        cmd.env("XDG_SESSION_DESKTOP", "raven");
-        // Keep child env neutral so apps that require X11 (Steam/Proton/game launchers)
-        // can still select Xwayland via DISPLAY instead of being forced onto native Wayland.
-        cmd.env_remove("MOZ_ENABLE_WAYLAND");
-        cmd.env_remove("MOZ_DBUS_REMOTE");
-        cmd.env_remove("QT_QPA_PLATFORM");
-        cmd.env_remove("SDL_VIDEODRIVER");
-        cmd.env_remove("NIXOS_OZONE_WL");
-        cmd.env_remove("OZONE_PLATFORM");
-        cmd.env_remove("OZONE_PLATFORM_HINT");
-        cmd.env_remove("ELECTRON_OZONE_PLATFORM_HINT");
-        cmd.env_remove("CHROMIUM_FLAGS");
-        cmd.env_remove("BRAVE_USER_FLAGS");
-        if self.config.no_csd {
-            cmd.env("QT_WAYLAND_DISABLE_WINDOWDECORATION", "1");
-        } else {
-            cmd.env_remove("QT_WAYLAND_DISABLE_WINDOWDECORATION");
+        // Scrub leftovers from foreign compositors / helper daemons so apps do not
+        // try to talk to a Hyprland/Sway session or a stale swww instance.
+        for key in [
+            "HYPRLAND_INSTANCE_SIGNATURE",
+            "HYPRLAND_CMD",
+            "SWAYSOCK",
+            "SWWW_SOCKET",
+            "SWWW_DAEMON_SOCKET",
+            "SWWW_NAMESPACE",
+            // Legacy ozone selectors that would fight the canonical values above.
+            "OZONE_PLATFORM",
+            "OZONE_PLATFORM_HINT",
+        ] {
+            cmd.env_remove(key);
         }
-        let xwayland_display = self.config.xwayland.display.trim();
-        if self.config.xwayland.enabled && !xwayland_display.is_empty() {
-            cmd.env("DISPLAY", xwayland_display);
-        } else {
-            cmd.env_remove("DISPLAY");
-        }
-        cmd.env_remove("HYPRLAND_INSTANCE_SIGNATURE");
-        cmd.env_remove("HYPRLAND_CMD");
-        cmd.env_remove("SWAYSOCK");
-        cmd.env_remove("SWWW_SOCKET");
-        cmd.env_remove("SWWW_DAEMON_SOCKET");
-        cmd.env_remove("SWWW_NAMESPACE");
     }
 
     pub(crate) fn sync_activation_environment(&self) {
-        let chromium_sync_flags = if self.chromium_explicit_sync_enabled() {
-            "--enable-features=WaylandLinuxDrmSyncobj"
-        } else {
-            "--disable-features=WaylandLinuxDrmSyncobj"
-        };
-        let mut env_kv = vec![
-            format!("WAYLAND_DISPLAY={}", self.socket_name.to_string_lossy()),
-            "XDG_CURRENT_DESKTOP=raven".to_owned(),
-            "XDG_SESSION_TYPE=wayland".to_owned(),
-            "XDG_SESSION_DESKTOP=raven".to_owned(),
-            "GDK_BACKEND=".to_owned(),
-            "QT_QPA_PLATFORM=".to_owned(),
-            "SDL_VIDEODRIVER=".to_owned(),
-            "MOZ_ENABLE_WAYLAND=".to_owned(),
-            "MOZ_DBUS_REMOTE=".to_owned(),
-            format!("CHROMIUM_FLAGS={chromium_sync_flags}"),
-            format!("BRAVE_USER_FLAGS={chromium_sync_flags}"),
-        ];
-
-        let xwayland_display = self.config.xwayland.display.trim();
-        if self.config.xwayland.enabled && !xwayland_display.is_empty() {
-            env_kv.push(format!("DISPLAY={xwayland_display}"));
-        } else {
-            env_kv.push("DISPLAY=".to_owned());
-        }
-
-        if self.config.no_csd {
-            env_kv.push("QT_WAYLAND_DISABLE_WINDOWDECORATION=1".to_owned());
-        } else {
-            env_kv.push("QT_WAYLAND_DISABLE_WINDOWDECORATION=".to_owned());
-        }
+        // Publish every entry; empty values neutralize session-wide because
+        // dbus-update-activation-environment has no unset operation.
+        let env_kv: Vec<String> = self
+            .session_env_vars()
+            .into_iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect();
 
         let mut dbus_args = vec!["--systemd".to_owned()];
         dbus_args.extend(env_kv.iter().cloned());
@@ -1729,27 +1652,24 @@ impl Raven {
             }
         }
 
-        let mut systemd_env_kv = vec![
-            format!("WAYLAND_DISPLAY={}", self.socket_name.to_string_lossy()),
-            "XDG_CURRENT_DESKTOP=raven".to_owned(),
-            "XDG_SESSION_TYPE=wayland".to_owned(),
-            "XDG_SESSION_DESKTOP=raven".to_owned(),
-            format!("CHROMIUM_FLAGS={chromium_sync_flags}"),
-            format!("BRAVE_USER_FLAGS={chromium_sync_flags}"),
-        ];
-        if self.config.xwayland.enabled && !xwayland_display.is_empty() {
-            systemd_env_kv.push(format!("DISPLAY={xwayland_display}"));
-        }
-        if self.config.no_csd {
-            systemd_env_kv.push("QT_WAYLAND_DISABLE_WINDOWDECORATION=1".to_owned());
-        } else {
-            systemd_env_kv.push("QT_WAYLAND_DISABLE_WINDOWDECORATION=".to_owned());
-        }
+        // Set non-empty values; unset everything else so stale entries from
+        // previous sessions/compositors cannot linger.
+        let all_vars = self.session_env_vars();
+        let systemd_set: Vec<String> = all_vars
+            .iter()
+            .filter(|(_, value)| !value.is_empty())
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect();
+        let systemd_unset: Vec<String> = all_vars
+            .iter()
+            .filter(|(_, value)| value.is_empty())
+            .map(|(key, _)| (*key).to_owned())
+            .collect();
 
         match Command::new("systemctl")
             .arg("--user")
             .arg("set-environment")
-            .args(&systemd_env_kv)
+            .args(&systemd_set)
             .output()
         {
             Ok(output) if output.status.success() => {
@@ -1771,13 +1691,7 @@ impl Raven {
         match Command::new("systemctl")
             .arg("--user")
             .arg("unset-environment")
-            .args([
-                "GDK_BACKEND",
-                "QT_QPA_PLATFORM",
-                "SDL_VIDEODRIVER",
-                "MOZ_ENABLE_WAYLAND",
-                "MOZ_DBUS_REMOTE",
-            ])
+            .args(&systemd_unset)
             .output()
         {
             Ok(output) if output.status.success() => {
@@ -1796,31 +1710,6 @@ impl Raven {
             }
         }
 
-        if !self.config.xwayland.enabled || xwayland_display.is_empty() {
-            match Command::new("systemctl")
-                .arg("--user")
-                .arg("unset-environment")
-                .arg("DISPLAY")
-                .output()
-            {
-                Ok(output) if output.status.success() => {
-                    tracing::info!("cleared DISPLAY from systemctl --user environment");
-                }
-                Ok(output) => {
-                    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-                    tracing::warn!(
-                        status = ?output.status.code(),
-                        stderr,
-                        "failed to clear DISPLAY via systemctl --user unset-environment"
-                    );
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        "failed to execute systemctl --user unset-environment DISPLAY: {err}"
-                    );
-                }
-            }
-        }
     }
 
     pub fn spawn_command(&self, command: &str) {
@@ -2199,6 +2088,8 @@ org.freedesktop.impl.portal.Secret=gnome-keyring;\n"
             .stdin(Stdio::null())
             .stdout(stdout)
             .stderr(stderr);
+        // Own process group so signals aimed at the compositor never reach it.
+        cmd.process_group(0);
         self.apply_wayland_child_env(&mut cmd);
         // Match niri: xwayland-satellite itself should not run with DISPLAY set.
         cmd.env_remove("DISPLAY");

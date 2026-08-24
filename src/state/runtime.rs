@@ -1,3 +1,4 @@
+use std::os::unix::process::CommandExt;
 use std::process::Command;
 
 use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as XdgDecorationMode;
@@ -11,14 +12,17 @@ pub(super) fn spawn_command(state: &Raven, command: &str) {
         return;
     }
 
-    let command = state.apply_no_csd_spawn_overrides(command);
-    let command = state.apply_wayland_browser_spawn_overrides(&command);
     let mut cmd = Command::new("sh");
-    cmd.arg("-c").arg(&command);
+    cmd.arg("-c").arg(command.trim());
+    // Own process group: children must not receive signals sent to the
+    // compositor's group (e.g. Ctrl+C while running nested). The Child handle is
+    // intentionally dropped; std reaps exited children automatically.
+    cmd.process_group(0);
     state.apply_wayland_child_env(&mut cmd);
 
-    if let Err(err) = cmd.spawn() {
-        tracing::warn!(command = %command, "failed to spawn command: {err}");
+    match cmd.spawn() {
+        Ok(child) => tracing::info!(command = %command, pid = child.id(), "spawned child process"),
+        Err(err) => tracing::warn!(command = %command, "failed to spawn command: {err}"),
     }
 }
 

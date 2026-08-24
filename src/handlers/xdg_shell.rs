@@ -1,7 +1,8 @@
 use smithay::{
     delegate_kde_decoration, delegate_xdg_decoration, delegate_xdg_shell,
     desktop::{
-        PopupKind, PopupManager, Space, Window, find_popup_root_surface, get_popup_toplevel_coords,
+        PopupKeyboardGrab, PopupKind, PopupManager, PopupPointerGrab, PopupUngrabStrategy, Space,
+        Window, find_popup_root_surface, get_popup_toplevel_coords,
     },
     input::{
         Seat,
@@ -117,7 +118,47 @@ impl XdgShellHandler for Raven {
         }
     }
 
-    fn grab(&mut self, _surface: PopupSurface, _seat: wl_seat::WlSeat, _serial: Serial) {}
+    fn grab(&mut self, surface: PopupSurface, seat: wl_seat::WlSeat, serial: Serial) {
+        // Install the explicit popup grab the client requested. Without this the
+        // context menu never owns input: clicks outside go to other surfaces instead
+        // of dismissing it and keyboard navigation/Esc never reach the menu.
+        let Some(seat) = Seat::from_resource(&seat) else {
+            return;
+        };
+        let kind = PopupKind::Xdg(surface);
+        let Ok(root) = find_popup_root_surface(&kind) else {
+            return;
+        };
+
+        match self.popups.grab_popup(root, kind, &seat, serial) {
+            Ok(mut popup_grab) => {
+                if let Some(keyboard) = seat.get_keyboard() {
+                    if keyboard.is_grabbed()
+                        && !(keyboard.has_grab(serial)
+                            || keyboard.has_grab(popup_grab.previous_serial().unwrap_or(serial)))
+                    {
+                        popup_grab.ungrab(PopupUngrabStrategy::All);
+                        return;
+                    }
+                    keyboard.set_focus(self, popup_grab.current_grab(), serial);
+                    keyboard.set_grab(self, PopupKeyboardGrab::new(&popup_grab), serial);
+                }
+                if let Some(pointer) = seat.get_pointer() {
+                    if pointer.is_grabbed()
+                        && !(pointer.has_grab(serial)
+                            || pointer.has_grab(
+                                popup_grab.previous_serial().unwrap_or_else(|| popup_grab.serial()),
+                            ))
+                    {
+                        popup_grab.ungrab(PopupUngrabStrategy::All);
+                        return;
+                    }
+                    pointer.set_grab(self, PopupPointerGrab::new(&popup_grab), serial, Focus::Keep);
+                }
+            }
+            Err(err) => tracing::warn!(error = ?err, "failed to grab popup"),
+        }
+    }
 
     // TODO: Test this when you implement resize request
     // as it should be able to trigger this as well.
