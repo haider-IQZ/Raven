@@ -42,7 +42,7 @@ use smithay::{
         udev::{UdevBackend, UdevEvent, all_gpus, primary_gpu},
     },
     desktop::{
-        Window, layer_map_for_output,
+        PopupManager, Window, layer_map_for_output,
         space::{SpaceRenderElements, space_render_elements},
         utils::{
             OutputPresentationFeedback, surface_presentation_feedback_flags_from_states,
@@ -66,7 +66,7 @@ use smithay::{
         Buffer as BufferCoords, DeviceFd, IsAlive, Physical, Point, Rectangle, Scale, Transform,
     },
     wayland::{
-        compositor,
+        compositor::{self, TraversalAction},
         dmabuf::{DmabufFeedbackBuilder, DmabufState},
         drm_syncobj::{DrmSyncobjState, supports_syncobj_eventfd},
         presentation::Refresh,
@@ -266,10 +266,20 @@ struct AssignedWindowRect {
 
 impl AssignedWindowRect {
     fn needs_correction(&self) -> bool {
+        // Sizes differing by ±1px are fractional-scale rounding artifacts between the
+        // configured logical size and the committed buffer; treating them as mismatches
+        // keeps windows stuck in the corrective render path forever.
+        fn size_close(
+            a: smithay::utils::Size<i32, smithay::utils::Logical>,
+            b: smithay::utils::Size<i32, smithay::utils::Logical>,
+        ) -> bool {
+            (a.w - b.w).abs() <= 1 && (a.h - b.h).abs() <= 1
+        }
+
         self.assigned_logical.loc != self.raw_root_logical.loc
-            || self.assigned_logical.size != self.raw_root_logical.size
-            || self.assigned_logical.size != self.reported_logical_size
-            || self.raw_root_logical.size != self.reported_logical_size
+            || !size_close(self.assigned_logical.size, self.raw_root_logical.size)
+            || !size_close(self.assigned_logical.size, self.reported_logical_size)
+            || !size_close(self.raw_root_logical.size, self.reported_logical_size)
     }
 }
 
@@ -529,11 +539,12 @@ fn corrected_root_target_rect_logical(
 
     let raw_root_size = assignment.raw_root_logical.size;
     let reported_size = assignment.reported_logical_size;
-    if reported_size.w <= 0
-        || reported_size.h <= 0
-        || raw_root_size.w > reported_size.w - 1
-        || raw_root_size.h > reported_size.h - 1
-    {
+    // A sub-2px shortfall between the committed size and the rendered root is
+    // fractional-scale rounding noise, not a real projection request; shrinking and
+    // centering for it makes the window render visibly inset from all four sides.
+    let delta_w = reported_size.w - raw_root_size.w;
+    let delta_h = reported_size.h - raw_root_size.h;
+    if reported_size.w <= 0 || reported_size.h <= 0 || (delta_w < 2 && delta_h < 2) {
         return assignment.assigned_logical;
     }
 
@@ -2006,12 +2017,46 @@ fn render_surface(state: &mut Raven, node: DrmNode, crtc: crtc::Handle) {
                     continue;
                 }
                 if rendered_assigned_windows.insert(assignment_index) {
-                    converted.retain(|element| !assignment.surface_ids.contains(element.id()));
+                    // The corrected path renders only the window's root surface tree, so
+                    // popup elements coming from smithay's stream must be lifted out and
+                    // re-stacked ABOVE the corrected root: frames draw front-to-back, and
+                    // plainly retaining them lets the repainted window paint over its own
+                    // context menus (invisible but still hit-tested).
+                    let mut popup_surface_ids = HashSet::new();
+                    if let Some(root) = assignment.window.toplevel().map(|t| t.wl_surface().clone())
+                    {
+                        for (popup, _) in PopupManager::popups_for_surface(&root) {
+                            let popup_root = popup.wl_surface().clone();
+                            compositor::with_surface_tree_downward(
+                                &popup_root,
+                                (),
+                                |_, _, _| TraversalAction::DoChildren(()),
+                                |surface, _, _: &()| {
+                                    popup_surface_ids.insert(Id::from_wayland_resource(surface));
+                                },
+                                |_, _, _| true,
+                            );
+                        }
+                    }
+                    let mut displaced_popups = Vec::new();
+                    let mut retained = Vec::with_capacity(converted.len());
+                    for element in converted.drain(..) {
+                        if assignment.surface_ids.contains(element.id()) {
+                            continue;
+                        }
+                        if popup_surface_ids.contains(element.id()) {
+                            displaced_popups.push(element);
+                            continue;
+                        }
+                        retained.push(element);
+                    }
+                    converted = retained;
                     converted.extend(assigned_window_render_elements(
                         &mut renderer,
                         assignment,
                         output_scale,
                     ));
+                    converted.extend(displaced_popups);
                 }
                 continue;
             }
