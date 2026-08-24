@@ -130,10 +130,17 @@ fn force_full_redraw() -> bool {
     })
 }
 
-fn correction_disabled() -> bool {
-    static DISABLED: OnceLock<bool> = OnceLock::new();
-    *DISABLED.get_or_init(|| {
-        std::env::var_os("RAVEN_DISABLE_CORRECTION")
+/// Non-toplevel-window corrective rendering (shrink/center/projection of regular
+/// tiled & floating windows whose committed size drifts from the assigned rect).
+///
+/// Defaults OFF: CSD shadow margins kept windows latched into this path forever,
+/// which cropped content at the edges and buried context menus. Fullscreen
+/// windows keep their dedicated pipeline regardless of this gate.
+/// Escape hatch: RAVEN_ENABLE_WINDOW_CORRECTION=1 restores the old behavior.
+fn window_correction_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("RAVEN_ENABLE_WINDOW_CORRECTION")
             .map(|value| {
                 let value = value.to_string_lossy().to_ascii_lowercase();
                 matches!(value.as_str(), "1" | "true" | "yes" | "on")
@@ -142,10 +149,10 @@ fn correction_disabled() -> bool {
     })
 }
 
-fn force_theme_cursor() -> bool {
-    static FORCED: OnceLock<bool> = OnceLock::new();
-    *FORCED.get_or_init(|| {
-        std::env::var_os("RAVEN_FORCE_THEME_CURSOR")
+fn client_cursors_allowed() -> bool {
+    static ALLOWED: OnceLock<bool> = OnceLock::new();
+    *ALLOWED.get_or_init(|| {
+        std::env::var_os("RAVEN_ALLOW_CLIENT_CURSOR")
             .map(|value| {
                 let value = value.to_string_lossy().to_ascii_lowercase();
                 matches!(value.as_str(), "1" | "true" | "yes" | "on")
@@ -2034,8 +2041,8 @@ fn render_surface(state: &mut Raven, node: DrmNode, crtc: crtc::Handle) {
 
             if let Some(assignment_index) = window_assignment_indices.get(base.id()).copied() {
                 let assignment = &window_assignments[assignment_index];
-                let needs_assigned_render_path = !correction_disabled()
-                    && (assignment.is_fullscreen || assignment.needs_correction());
+                let needs_assigned_render_path = assignment.is_fullscreen
+                    || (window_correction_enabled() && assignment.needs_correction());
                 if !needs_assigned_render_path {
                     converted.push(UdevCompositeRenderElement::from(base));
                     continue;
@@ -2126,11 +2133,12 @@ fn render_surface(state: &mut Raven, node: DrmNode, crtc: crtc::Handle) {
 
         let mut pointer_element = PointerElement::default();
         pointer_element.set_buffer(pointer_image);
-        // Diagnostic gate: ignore client-provided cursor surfaces and always draw the
-        // compositor theme cursor, to isolate size/lag issues coming from the
-        // wl_pointer.set_cursor path.
+        // Draw the compositor theme cursor instead of client-submitted cursor
+        // surfaces: some clients ship oversized buffers and refresh them lazily,
+        // which rendered as a huge, low-fps pointer over those windows.
+        // Escape hatch: RAVEN_ALLOW_CLIENT_CURSOR=1 honors wl_pointer.set_cursor.
         let mut cursor_status = state.cursor_status.clone();
-        if force_theme_cursor() && matches!(cursor_status, CursorImageStatus::Surface(_)) {
+        if !client_cursors_allowed() && matches!(cursor_status, CursorImageStatus::Surface(_)) {
             cursor_status = CursorImageStatus::default_named();
         }
         pointer_element.set_status(cursor_status);
