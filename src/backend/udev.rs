@@ -130,6 +130,18 @@ fn force_full_redraw() -> bool {
     })
 }
 
+fn correction_disabled() -> bool {
+    static DISABLED: OnceLock<bool> = OnceLock::new();
+    *DISABLED.get_or_init(|| {
+        std::env::var_os("RAVEN_DISABLE_CORRECTION")
+            .map(|value| {
+                let value = value.to_string_lossy().to_ascii_lowercase();
+                matches!(value.as_str(), "1" | "true" | "yes" | "on")
+            })
+            .unwrap_or(false)
+    })
+}
+
 fn render_trace_line(line: impl AsRef<str>) {
     static TRACE_ENABLED: OnceLock<bool> = OnceLock::new();
     static TRACE_INIT: OnceLock<()> = OnceLock::new();
@@ -2010,8 +2022,8 @@ fn render_surface(state: &mut Raven, node: DrmNode, crtc: crtc::Handle) {
 
             if let Some(assignment_index) = window_assignment_indices.get(base.id()).copied() {
                 let assignment = &window_assignments[assignment_index];
-                let needs_assigned_render_path =
-                    assignment.is_fullscreen || assignment.needs_correction();
+                let needs_assigned_render_path = !correction_disabled()
+                    && (assignment.is_fullscreen || assignment.needs_correction());
                 if !needs_assigned_render_path {
                     converted.push(UdevCompositeRenderElement::from(base));
                     continue;
