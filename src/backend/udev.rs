@@ -2051,12 +2051,15 @@ fn render_surface(state: &mut Raven, node: DrmNode, crtc: crtc::Handle) {
                         retained.push(element);
                     }
                     converted = retained;
+                    // Popups must sit ABOVE their window: frames draw front-to-back
+                    // (index 0 = topmost), so they go back right before the corrected
+                    // root, mirroring smithay's native [popups, surface-tree] order.
+                    converted.extend(displaced_popups);
                     converted.extend(assigned_window_render_elements(
                         &mut renderer,
                         assignment,
                         output_scale,
                     ));
-                    converted.extend(displaced_popups);
                 }
                 continue;
             }
