@@ -142,6 +142,18 @@ fn correction_disabled() -> bool {
     })
 }
 
+fn force_theme_cursor() -> bool {
+    static FORCED: OnceLock<bool> = OnceLock::new();
+    *FORCED.get_or_init(|| {
+        std::env::var_os("RAVEN_FORCE_THEME_CURSOR")
+            .map(|value| {
+                let value = value.to_string_lossy().to_ascii_lowercase();
+                matches!(value.as_str(), "1" | "true" | "yes" | "on")
+            })
+            .unwrap_or(false)
+    })
+}
+
 fn render_trace_line(line: impl AsRef<str>) {
     static TRACE_ENABLED: OnceLock<bool> = OnceLock::new();
     static TRACE_INIT: OnceLock<()> = OnceLock::new();
@@ -2114,7 +2126,14 @@ fn render_surface(state: &mut Raven, node: DrmNode, crtc: crtc::Handle) {
 
         let mut pointer_element = PointerElement::default();
         pointer_element.set_buffer(pointer_image);
-        pointer_element.set_status(state.cursor_status.clone());
+        // Diagnostic gate: ignore client-provided cursor surfaces and always draw the
+        // compositor theme cursor, to isolate size/lag issues coming from the
+        // wl_pointer.set_cursor path.
+        let mut cursor_status = state.cursor_status.clone();
+        if force_theme_cursor() && matches!(cursor_status, CursorImageStatus::Surface(_)) {
+            cursor_status = CursorImageStatus::default_named();
+        }
+        pointer_element.set_status(cursor_status);
 
         let pointer_elements: Vec<PointerRenderElement<UdevRenderer<'_>>> = pointer_element
             .render_elements(
