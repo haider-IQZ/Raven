@@ -42,7 +42,7 @@ use smithay::{
         udev::{UdevBackend, UdevEvent, all_gpus, primary_gpu},
     },
     desktop::{
-        Window, layer_map_for_output,
+        PopupManager, Window, layer_map_for_output,
         space::{SpaceRenderElements, space_render_elements},
         utils::{
             OutputPresentationFeedback, surface_presentation_feedback_flags_from_states,
@@ -66,7 +66,7 @@ use smithay::{
         Buffer as BufferCoords, DeviceFd, IsAlive, Physical, Point, Rectangle, Scale, Transform,
     },
     wayland::{
-        compositor,
+        compositor::{self, TraversalAction},
         dmabuf::{DmabufFeedbackBuilder, DmabufState},
         drm_syncobj::{DrmSyncobjState, supports_syncobj_eventfd},
         presentation::Refresh,
@@ -122,6 +122,37 @@ fn force_full_redraw() -> bool {
     static FORCE_FULL_REDRAW: OnceLock<bool> = OnceLock::new();
     *FORCE_FULL_REDRAW.get_or_init(|| {
         std::env::var_os("RAVEN_FORCE_FULL_REDRAW")
+            .map(|value| {
+                let value = value.to_string_lossy().to_ascii_lowercase();
+                matches!(value.as_str(), "1" | "true" | "yes" | "on")
+            })
+            .unwrap_or(false)
+    })
+}
+
+/// Non-toplevel-window corrective rendering (shrink/center/projection of regular
+/// tiled & floating windows whose committed size drifts from the assigned rect).
+///
+/// Defaults OFF: CSD shadow margins kept windows latched into this path forever,
+/// which cropped content at the edges and buried context menus. Fullscreen
+/// windows keep their dedicated pipeline regardless of this gate.
+/// Escape hatch: RAVEN_ENABLE_WINDOW_CORRECTION=1 restores the old behavior.
+fn window_correction_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("RAVEN_ENABLE_WINDOW_CORRECTION")
+            .map(|value| {
+                let value = value.to_string_lossy().to_ascii_lowercase();
+                matches!(value.as_str(), "1" | "true" | "yes" | "on")
+            })
+            .unwrap_or(false)
+    })
+}
+
+fn client_cursors_allowed() -> bool {
+    static ALLOWED: OnceLock<bool> = OnceLock::new();
+    *ALLOWED.get_or_init(|| {
+        std::env::var_os("RAVEN_ALLOW_CLIENT_CURSOR")
             .map(|value| {
                 let value = value.to_string_lossy().to_ascii_lowercase();
                 matches!(value.as_str(), "1" | "true" | "yes" | "on")
@@ -266,10 +297,20 @@ struct AssignedWindowRect {
 
 impl AssignedWindowRect {
     fn needs_correction(&self) -> bool {
+        // Sizes differing by ±1px are fractional-scale rounding artifacts between the
+        // configured logical size and the committed buffer; treating them as mismatches
+        // keeps windows stuck in the corrective render path forever.
+        fn size_close(
+            a: smithay::utils::Size<i32, smithay::utils::Logical>,
+            b: smithay::utils::Size<i32, smithay::utils::Logical>,
+        ) -> bool {
+            (a.w - b.w).abs() <= 1 && (a.h - b.h).abs() <= 1
+        }
+
         self.assigned_logical.loc != self.raw_root_logical.loc
-            || self.assigned_logical.size != self.raw_root_logical.size
-            || self.assigned_logical.size != self.reported_logical_size
-            || self.raw_root_logical.size != self.reported_logical_size
+            || !size_close(self.assigned_logical.size, self.raw_root_logical.size)
+            || !size_close(self.assigned_logical.size, self.reported_logical_size)
+            || !size_close(self.raw_root_logical.size, self.reported_logical_size)
     }
 }
 
@@ -529,11 +570,12 @@ fn corrected_root_target_rect_logical(
 
     let raw_root_size = assignment.raw_root_logical.size;
     let reported_size = assignment.reported_logical_size;
-    if reported_size.w <= 0
-        || reported_size.h <= 0
-        || raw_root_size.w > reported_size.w - 1
-        || raw_root_size.h > reported_size.h - 1
-    {
+    // A sub-2px shortfall between the committed size and the rendered root is
+    // fractional-scale rounding noise, not a real projection request; shrinking and
+    // centering for it makes the window render visibly inset from all four sides.
+    let delta_w = reported_size.w - raw_root_size.w;
+    let delta_h = reported_size.h - raw_root_size.h;
+    if reported_size.w <= 0 || reported_size.h <= 0 || (delta_w < 2 && delta_h < 2) {
         return assignment.assigned_logical;
     }
 
@@ -1999,14 +2041,51 @@ fn render_surface(state: &mut Raven, node: DrmNode, crtc: crtc::Handle) {
 
             if let Some(assignment_index) = window_assignment_indices.get(base.id()).copied() {
                 let assignment = &window_assignments[assignment_index];
-                let needs_assigned_render_path =
-                    assignment.is_fullscreen || assignment.needs_correction();
+                let needs_assigned_render_path = assignment.is_fullscreen
+                    || (window_correction_enabled() && assignment.needs_correction());
                 if !needs_assigned_render_path {
                     converted.push(UdevCompositeRenderElement::from(base));
                     continue;
                 }
                 if rendered_assigned_windows.insert(assignment_index) {
-                    converted.retain(|element| !assignment.surface_ids.contains(element.id()));
+                    // The corrected path renders only the window's root surface tree, so
+                    // popup elements coming from smithay's stream must be lifted out and
+                    // re-stacked ABOVE the corrected root: frames draw front-to-back, and
+                    // plainly retaining them lets the repainted window paint over its own
+                    // context menus (invisible but still hit-tested).
+                    let mut popup_surface_ids = HashSet::new();
+                    if let Some(root) = assignment.window.toplevel().map(|t| t.wl_surface().clone())
+                    {
+                        for (popup, _) in PopupManager::popups_for_surface(&root) {
+                            let popup_root = popup.wl_surface().clone();
+                            compositor::with_surface_tree_downward(
+                                &popup_root,
+                                (),
+                                |_, _, _| TraversalAction::DoChildren(()),
+                                |surface, _, _: &()| {
+                                    popup_surface_ids.insert(Id::from_wayland_resource(surface));
+                                },
+                                |_, _, _| true,
+                            );
+                        }
+                    }
+                    let mut displaced_popups = Vec::new();
+                    let mut retained = Vec::with_capacity(converted.len());
+                    for element in converted.drain(..) {
+                        if assignment.surface_ids.contains(element.id()) {
+                            continue;
+                        }
+                        if popup_surface_ids.contains(element.id()) {
+                            displaced_popups.push(element);
+                            continue;
+                        }
+                        retained.push(element);
+                    }
+                    converted = retained;
+                    // Popups must sit ABOVE their window: frames draw front-to-back
+                    // (index 0 = topmost), so they go back right before the corrected
+                    // root, mirroring smithay's native [popups, surface-tree] order.
+                    converted.extend(displaced_popups);
                     converted.extend(assigned_window_render_elements(
                         &mut renderer,
                         assignment,
@@ -2054,7 +2133,15 @@ fn render_surface(state: &mut Raven, node: DrmNode, crtc: crtc::Handle) {
 
         let mut pointer_element = PointerElement::default();
         pointer_element.set_buffer(pointer_image);
-        pointer_element.set_status(state.cursor_status.clone());
+        // Draw the compositor theme cursor instead of client-submitted cursor
+        // surfaces: some clients ship oversized buffers and refresh them lazily,
+        // which rendered as a huge, low-fps pointer over those windows.
+        // Escape hatch: RAVEN_ALLOW_CLIENT_CURSOR=1 honors wl_pointer.set_cursor.
+        let mut cursor_status = state.cursor_status.clone();
+        if !client_cursors_allowed() && matches!(cursor_status, CursorImageStatus::Surface(_)) {
+            cursor_status = CursorImageStatus::default_named();
+        }
+        pointer_element.set_status(cursor_status);
 
         let pointer_elements: Vec<PointerRenderElement<UdevRenderer<'_>>> = pointer_element
             .render_elements(
